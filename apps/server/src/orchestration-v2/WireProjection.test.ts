@@ -713,7 +713,7 @@ describe("orchestration V2 wire projection", () => {
       expect(emptyWorkflow?.agentCount).toBe(1_000);
       expect(emptyWorkflow).not.toHaveProperty("changedAgentIndices");
 
-      // A delta naming > 200 changed indices is still bounded to 200 rows.
+      // A delta naming > 200 changed indices becomes a bounded replacement so no row stays stale.
       const hugeDelta = projectDomainEventForWire({
         ...rawEvent,
         id: EventId.make("wf-delta-huge"),
@@ -725,7 +725,7 @@ describe("orchestration V2 wire projection", () => {
       const hugeWorkflow =
         hugeDelta.type === "subagent.updated" ? hugeDelta.payload.workflow : undefined;
       expect(hugeWorkflow?.agents).toHaveLength(200);
-      expect(hugeWorkflow?.agentsDelta).toBe(true);
+      expect(hugeWorkflow).not.toHaveProperty("agentsDelta");
       expect(hugeWorkflow?.agentCount).toBe(1_000);
       expect(hugeWorkflow).not.toHaveProperty("changedAgentIndices");
     });

@@ -176,7 +176,12 @@ function projectWorkflowForWire(
   allowDelta: boolean,
 ): OrchestrationV2SubagentWorkflow {
   const agentCount = Math.max(workflow.agentCount ?? 0, workflow.agents.length);
-  if (allowDelta && workflow.changedAgentIndices !== undefined) {
+  // A delta past the row cap would drop rows the client keeps stale, so send a replacement instead.
+  if (
+    allowDelta &&
+    workflow.changedAgentIndices !== undefined &&
+    workflow.changedAgentIndices.length <= MAX_WIRE_WORKFLOW_AGENTS
+  ) {
     const { changedAgentIndices, ...rest } = workflow;
     const agents = boundWorkflowAgentsForWire(
       selectChangedWorkflowAgents(workflow.agents, changedAgentIndices),
