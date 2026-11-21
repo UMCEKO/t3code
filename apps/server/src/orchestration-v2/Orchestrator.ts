@@ -63,8 +63,10 @@ import {
   type OrchestrationV2ThreadShellSnapshot,
   type OrchestrationV2StoredEvent,
   type OrchestrationV2Subagent,
+  type OrchestrationV2SubagentWorkflow,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
+  type OrchestrationV2WorkflowAgent,
   latestProviderTurnForAttempt,
   repositoryRewindCheckpoint,
   parseGoalCommand,
@@ -963,29 +965,110 @@ function legacyPullRequestLink(
 }
 
 const DELEGATED_RESULT_INLINE_BYTES = 16_000;
+const DELEGATED_WAKE_LABEL_MAX_BYTES = 512;
+
+function truncateUtf8Bytes(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let bytes = 0;
+  let endIndex = 0;
+  for (const ch of text) {
+    const chBytes = Buffer.byteLength(ch, "utf8");
+    if (bytes + chBytes > maxBytes) break;
+    bytes += chBytes;
+    endIndex += ch.length;
+  }
+  return text.slice(0, endIndex);
+}
+
+function fitWakeText(text: string, maxBytes: number): string {
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  if (maxBytes <= 3) return truncateUtf8Bytes(text, maxBytes);
+  return `${truncateUtf8Bytes(text, maxBytes - 3)}...`;
+}
+
+function boundedWakeLabel(
+  taskId: string,
+  task: OrchestrationV2Subagent | undefined,
+  maxBytes: number,
+): string {
+  const prefix = `Delegated task ${taskId}`;
+  // A follow-up gets a fresh task id; the child thread links it to the task delegate_task returned.
+  const thread = task?.childThreadId == null ? "" : ` in child thread ${task.childThreadId}`;
+  const status = task === undefined ? " reached a terminal state" : ` [${task.status}]`;
+  const suffix = `${thread}${status}`;
+  if (task?.title == null) {
+    return fitWakeText(`${prefix}${suffix}`, maxBytes);
+  }
+  const full = `${prefix} (${task.title})${suffix}`;
+  if (Buffer.byteLength(full, "utf8") <= maxBytes) return full;
+  const titleBudget =
+    maxBytes - Buffer.byteLength(prefix, "utf8") - Buffer.byteLength(suffix, "utf8") - 3;
+  const titlePart = titleBudget <= 0 ? "" : ` (${fitWakeText(task.title, titleBudget)})`;
+  return fitWakeText(`${prefix}${titlePart}${suffix}`, maxBytes);
+}
+
+function delegatedWakeFallbackAction(
+  taskId: string,
+  task: OrchestrationV2Subagent | undefined,
+): string {
+  if (task !== undefined && isAppOwnedWorkflowTask(task)) {
+    const runId = task.workflow?.runHandles?.runId;
+    return runId
+      ? `Use t3_workflow_status with runId ${runId} to read the result.`
+      : "Use t3_workflow_status to read the result.";
+  }
+  return `Use task_status with taskId ${taskId} to read the result.`;
+}
 
 function delegatedCompletionWakeDetail(
   taskIds: ReadonlyArray<string>,
   tasks: ReadonlyArray<OrchestrationV2Subagent>,
 ): string {
-  let remainingBytes = DELEGATED_RESULT_INLINE_BYTES;
-  return taskIds
-    .map((taskId) => {
-      const task = tasks.find((candidate) => candidate.id === taskId);
-      // A follow-up gets a fresh task id; the child thread links it to the task delegate_task returned.
-      const thread = task?.childThreadId == null ? "" : ` in child thread ${task.childThreadId}`;
-      const label = `Delegated task ${taskId}${task?.title == null ? "" : ` (${task.title})`}${thread}${task === undefined ? " reached a terminal state" : ` [${task.status}]`}`;
-      if (task?.result != null) {
-        const detail = `${label}:\n${task.result}`;
-        const bytes = Buffer.byteLength(detail);
-        if (bytes <= remainingBytes) {
-          remainingBytes -= bytes;
-          return detail;
-        }
+  if (taskIds.length === 0) return "";
+  const separator = "\n\n";
+  const separatorBytes = (taskIds.length - 1) * Buffer.byteLength(separator, "utf8");
+  const maxEntryFallbackBytes = Math.max(
+    0,
+    Math.floor((DELEGATED_RESULT_INLINE_BYTES - separatorBytes) / taskIds.length),
+  );
+  const entries = taskIds.map((taskId) => {
+    const task = tasks.find((candidate) => candidate.id === taskId);
+    const action = delegatedWakeFallbackAction(taskId, task);
+    const fallbackSuffix = `. ${action}`;
+    const suffixBytes = Buffer.byteLength(fallbackSuffix, "utf8");
+    const labelBudget = Math.min(
+      DELEGATED_WAKE_LABEL_MAX_BYTES,
+      Math.max(0, maxEntryFallbackBytes - suffixBytes),
+    );
+    const label = boundedWakeLabel(taskId, task, labelBudget);
+    const rawFallback = label.length > 0 ? `${label}${fallbackSuffix}` : action;
+    const fallback = fitWakeText(rawFallback, maxEntryFallbackBytes);
+    return {
+      task,
+      label,
+      fallback,
+      fallbackBytes: Buffer.byteLength(fallback, "utf8"),
+    };
+  });
+  let extraBytes = Math.max(
+    0,
+    DELEGATED_RESULT_INLINE_BYTES -
+      separatorBytes -
+      entries.reduce((sum, entry) => sum + entry.fallbackBytes, 0),
+  );
+  const lines = entries.map((entry) => {
+    if (entry.task?.result != null) {
+      const detail = `${entry.label}:\n${entry.task.result}`;
+      const delta = Buffer.byteLength(detail, "utf8") - entry.fallbackBytes;
+      if (delta <= extraBytes) {
+        extraBytes -= delta;
+        return detail;
       }
-      return `${label}. Use task_status with taskId ${taskId} to read the result.`;
-    })
-    .join("\n\n");
+    }
+    return entry.fallback;
+  });
+  return fitWakeText(lines.join(separator), DELEGATED_RESULT_INLINE_BYTES);
 }
 
 // Startup recovery settles whatever is still missed after this window.
@@ -995,9 +1078,6 @@ const parentTaskSyncRetry = Schedule.exponential("1 second").pipe(
   ),
   Schedule.upTo({ duration: Duration.hours(1) }),
 );
-
-const WORKFLOW_STOPPED_RESULT = "Stopped.";
-
 function isTerminalDelegatedTaskStatus(status: OrchestrationV2Subagent["status"]): boolean {
   return (
     status === "completed" ||
@@ -1017,6 +1097,47 @@ function isRunningAppOwnedWorkflowTask(
   task: Pick<OrchestrationV2Subagent, "origin" | "childThreadId" | "workflow" | "status">,
 ): boolean {
   return isAppOwnedWorkflowTask(task) && task.status === "running";
+}
+
+function workflowAgentsEqual(
+  left: OrchestrationV2WorkflowAgent,
+  right: OrchestrationV2WorkflowAgent,
+): boolean {
+  for (const key of Object.keys(left) as ReadonlyArray<keyof OrchestrationV2WorkflowAgent>) {
+    if (left[key] !== right[key]) return false;
+  }
+  for (const key of Object.keys(right) as ReadonlyArray<keyof OrchestrationV2WorkflowAgent>) {
+    if (left[key] !== right[key]) return false;
+  }
+  return true;
+}
+
+function diffWorkflowAgentIndices(
+  stored: ReadonlyArray<OrchestrationV2WorkflowAgent>,
+  incoming: ReadonlyArray<OrchestrationV2WorkflowAgent>,
+): ReadonlyArray<OrchestrationV2WorkflowAgent["index"]> {
+  const storedByIndex = new Map(stored.map((agent) => [agent.index, agent]));
+  const changed: Array<OrchestrationV2WorkflowAgent["index"]> = [];
+  for (const agent of incoming) {
+    const previous = storedByIndex.get(agent.index);
+    if (previous === undefined || !workflowAgentsEqual(previous, agent)) {
+      changed.push(agent.index);
+    }
+  }
+  return changed;
+}
+
+function mergeWorkflowUpdate(
+  stored: OrchestrationV2SubagentWorkflow | undefined,
+  incoming: OrchestrationV2SubagentWorkflow,
+): OrchestrationV2SubagentWorkflow {
+  const { changedAgentIndices: _ignoredChanged, agentsDelta: _ignoredDelta, ...rest } = incoming;
+  const stopRequestedAt = stored?.stopRequestedAt ?? rest.stopRequestedAt;
+  return {
+    ...rest,
+    ...(stopRequestedAt === undefined ? {} : { stopRequestedAt }),
+    changedAgentIndices: diffWorkflowAgentIndices(stored?.agents ?? [], incoming.agents),
+  };
 }
 
 function delegatedTaskTerminalStatus(
@@ -2517,6 +2638,68 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     return true;
   });
 
+  const owningWorkflowForChildThread = Effect.fn("Orchestrator.owningWorkflowForChildThread")(
+    function* (childThread: OrchestrationV2AppThread) {
+      const parentThreadId = childThread.lineage.parentThreadId;
+      if (childThread.lineage.relationshipToParent !== "subagent" || parentThreadId === null) {
+        return null;
+      }
+      const { thread: parentThread, subagents: childTasks } =
+        yield* projectionStore.getThreadRecords(parentThreadId, ["subagents"], {
+          subagentChildThreadIds: [childThread.id],
+        });
+      const parentNodeIds = Array.from(
+        new Set(
+          childTasks.flatMap((task) =>
+            task.origin === "app_owned" &&
+            task.childThreadId === childThread.id &&
+            task.parentNodeId !== null
+              ? [task.parentNodeId]
+              : [],
+          ),
+        ),
+      );
+      if (parentNodeIds.length === 0) return null;
+      const { subagents: parentTasks } = yield* projectionStore.getThreadRecords(
+        parentThreadId,
+        ["subagents"],
+        { subagentIds: parentNodeIds },
+      );
+      const workflowTask = parentTasks.find(isAppOwnedWorkflowTask);
+      if (workflowTask === undefined) return null;
+      return {
+        parentThread,
+        workflowTask,
+        admitting:
+          isRunningAppOwnedWorkflowTask(workflowTask) &&
+          workflowTask.workflow?.stopRequestedAt === undefined &&
+          parentThread.archivedAt === null &&
+          parentThread.deletedAt === null,
+      };
+    },
+  );
+
+  const ensureOwningWorkflowAdmitting = Effect.fn("Orchestrator.ensureOwningWorkflowAdmitting")(
+    function* (
+      command: Pick<OrchestrationV2ServerCommand, "commandId" | "type">,
+      childThread: OrchestrationV2AppThread,
+    ) {
+      const owningWorkflow = yield* owningWorkflowForChildThread(childThread).pipe(
+        mapDispatchError(command),
+      );
+      if (owningWorkflow !== null && !owningWorkflow.admitting) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause:
+            owningWorkflow.workflowTask.workflow?.stopRequestedAt !== undefined
+              ? `Owning workflow ${owningWorkflow.workflowTask.id} is stopping.`
+              : `Owning workflow ${owningWorkflow.workflowTask.id} is not running.`,
+        });
+      }
+    },
+  );
+
   const startNextQueuedRunOnce = Effect.fn("Orchestrator.startNextQueuedRun")(
     function* (
       threadId: ThreadId,
@@ -2536,6 +2719,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         projection.thread.deletedAt !== null ||
         projection.runs.some(isActiveRun)
       ) {
+        return;
+      }
+      const owningWorkflow = yield* owningWorkflowForChildThread(projection.thread);
+      if (owningWorkflow !== null && !owningWorkflow.admitting) {
         return;
       }
 
@@ -3670,7 +3857,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     for (const threadId of threadIds) {
       const resumedThread = yield* Effect.gen(function* () {
         if (!(yield* projectionStore.canStartQueuedRun(threadId))) return false;
-        yield* threadDispatch.withLock(threadId, startNextQueuedRun(threadId));
+        yield* withSubagentParentLock(
+          threadId,
+          threadDispatch.withLock(threadId, startNextQueuedRun(threadId)),
+        );
         return true;
       }).pipe(
         Effect.catch((cause) =>
@@ -7233,6 +7423,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }
         : undefined,
     );
+    if (command.dispatchMode.type === "queue_after_active") {
+      yield* ensureOwningWorkflowAdmitting(command, projection.thread);
+    }
     if (command.steerFollowUpOfRunId !== undefined) {
       const source = projection.runs.find((run) => run.id === command.steerFollowUpOfRunId);
       if (
@@ -7654,6 +7847,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       (dispatchMode.type === "steer_active" || dispatchMode.type === "restart_active")
     ) {
       dispatchMode = { type: "queue_after_active" };
+    }
+    if (
+      command.dispatchMode.type !== "queue_after_active" &&
+      dispatchMode.type === "queue_after_active"
+    ) {
+      yield* ensureOwningWorkflowAdmitting(command, projection.thread);
     }
     let queuedRunStop:
       | { readonly runId: RunId; readonly reason: string; readonly skipsHeldQueue?: true }
@@ -10006,6 +10205,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       const parentWorkflowRunning =
         parentWorkflow !== undefined &&
         isRunningAppOwnedWorkflowTask(parentWorkflow) &&
+        parentWorkflow.workflow?.stopRequestedAt === undefined &&
         parentProjection.thread.archivedAt === null &&
         parentProjection.thread.deletedAt === null;
       const parentRunActive =
@@ -10015,6 +10215,13 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         !parentRunActive &&
         parentRun !== undefined &&
         (yield* backgroundSubagentOutlivesRun(parentRun));
+      if (parentWorkflow?.workflow?.stopRequestedAt !== undefined) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Workflow ${parentWorkflow.id} is stopping.`,
+        });
+      }
       if (
         parentRun === undefined ||
         !(parentRunActive || parentWorkflowRunning || parentRunOutlivedByBackgroundSubagent)
@@ -10679,7 +10886,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         occurredAt: now,
         payload: {
           ...task,
-          workflow: command.workflow,
+          workflow: mergeWorkflowUpdate(task.workflow, command.workflow),
           ...(command.progress === undefined ? {} : { progress: command.progress }),
           updatedAt: now,
         },
@@ -10768,11 +10975,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       }
       if (isTerminalDelegatedTaskStatus(task.status)) return undefined;
       const now = yield* DateTime.now;
+      const nextWorkflow =
+        command.workflow === undefined
+          ? undefined
+          : mergeWorkflowUpdate(task.workflow, command.workflow);
       const updatedTask: OrchestrationV2Subagent = {
         ...task,
         status: command.status,
         result: command.result,
-        ...(command.workflow === undefined ? {} : { workflow: command.workflow }),
+        ...(nextWorkflow === undefined ? {} : { workflow: nextWorkflow }),
+        ...(command.disposeDelivery === true
+          ? { completionDelivery: { state: "disposed" as const, observedByRunId: null } }
+          : {}),
         completedAt: now,
         updatedAt: now,
       };
@@ -12397,6 +12611,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         cause: `Thread ${command.threadId} is not active.`,
       });
     }
+    yield* ensureOwningWorkflowAdmitting(command, projection.thread);
     const queuedRun = projection.runs.find((candidate) => candidate.id === command.queuedRunId);
     if (queuedRun === undefined || queuedRun.status !== "queued") {
       return yield* new OrchestratorDispatchError({
@@ -13972,23 +14187,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     }
     const runningWorkflows = subagents.filter(isRunningAppOwnedWorkflowTask);
     if (runningWorkflows.length > 0) {
-      const workflowIds = runningWorkflows.map((task) => task.id);
-      const { nodes, turnItems } = yield* projectionStore
-        .getThreadRecords(thread.id, ["nodes", "turnItems"], {
-          nodeIds: workflowIds,
-          turnItemNodeIds: workflowIds,
-          turnItemTypes: ["subagent"],
-        })
-        .pipe(mapDispatchError(input.command));
+      const stopRequestedAt = DateTime.toEpochMillis(input.now);
       for (const task of runningWorkflows) {
-        const cancelledTask: OrchestrationV2Subagent = {
-          ...task,
-          status: "cancelled",
-          result: WORKFLOW_STOPPED_RESULT,
-          completedAt: input.now,
-          updatedAt: input.now,
-          completionDelivery: { state: "disposed", observedByRunId: null },
-        };
+        if (task.workflow === undefined || task.workflow.stopRequestedAt !== undefined) continue;
         yield* emitEvent({
           type: "subagent.updated",
           threadId: thread.id,
@@ -13997,40 +14198,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           driver: task.driver,
           providerInstanceId: task.providerInstanceId,
           occurredAt: input.now,
-          payload: cancelledTask,
+          payload: {
+            ...task,
+            workflow: { ...task.workflow, stopRequestedAt },
+            updatedAt: input.now,
+          },
         });
-        const node = nodes.find((candidate) => candidate.id === task.id);
-        if (node !== undefined) {
-          yield* emitEvent({
-            type: "node.updated",
-            threadId: thread.id,
-            ...(node.runId === null ? {} : { runId: node.runId }),
-            nodeId: node.id,
-            driver: task.driver,
-            providerInstanceId: task.providerInstanceId,
-            occurredAt: input.now,
-            payload: { ...node, status: "cancelled", completedAt: input.now },
-          });
-        }
-        for (const item of turnItems) {
-          if (item.type !== "subagent" || item.subagentId !== task.id) continue;
-          yield* emitEvent({
-            type: "turn-item.updated",
-            threadId: thread.id,
-            ...(item.runId === null ? {} : { runId: item.runId }),
-            ...(item.nodeId === null ? {} : { nodeId: item.nodeId }),
-            driver: task.driver,
-            providerInstanceId: task.providerInstanceId,
-            occurredAt: input.now,
-            payload: {
-              ...item,
-              status: "cancelled",
-              result: WORKFLOW_STOPPED_RESULT,
-              completedAt: input.now,
-              updatedAt: input.now,
-            },
-          });
-        }
       }
     }
     // Each disposal reads the events the ones before it wrote.
@@ -16641,6 +16814,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
             cause: `Thread ${command.threadId} is not active.`,
           });
         }
+        yield* ensureOwningWorkflowAdmitting(command, projection.thread);
         const selectedRunId = command.type === "queued-run.start" ? command.runId : undefined;
         const selectedRun =
           selectedRunId === undefined
@@ -17146,6 +17320,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   // Follow-up intake and Stop serialize on the parent before taking the child lock.
   const withSubagentParentLock = <A, E, R>(threadId: ThreadId, dispatch: Effect.Effect<A, E, R>) =>
     appOwnedSubagentParentThreadId(threadId).pipe(
+      Effect.catchTags({ ProjectionStoreThreadNotFoundError: () => Effect.undefined }),
       Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })),
       Effect.flatMap((parentThreadId) =>
         parentThreadId === undefined ? dispatch : threadDispatch.withLock(parentThreadId, dispatch),
@@ -17199,12 +17374,18 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     if (message?.type === "message.dispatch")
       return yield* messageIntake.withLock(
         message.threadId,
-        mayStartSubagentFollowup(message)
+        mayStartSubagentFollowup(message) ||
+          message.dispatchMode.type === "queue_after_active" ||
+          message.outputSchema !== undefined
           ? withSubagentParentLock(message.threadId, dispatch)
           : dispatch,
       );
-    // Answering a message-mode question can also start a follow-up.
-    return yield* command.type === "runtime-request.respond"
+    // Answering a message-mode question or promoting a child queue serializes with the parent.
+    return yield* command.type === "runtime-request.respond" ||
+    command.type === "queue.resume" ||
+    command.type === "queued-run.start" ||
+    command.type === "queued-message.promote-to-steer" ||
+    command.type === "thread.runtime-mode.set"
       ? withSubagentParentLock(command.threadId, dispatch)
       : dispatch;
   });
@@ -17292,8 +17473,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               }),
             ),
           );
-        yield* threadDispatch
-          .withLock(
+        yield* withSubagentParentLock(
+          threadId,
+          threadDispatch.withLock(
             threadId,
             (run.status === "completed"
               ? releaseUnattendedHolds(threadId, run.id)
@@ -17313,12 +17495,12 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
                 }),
               ),
             ),
-          )
-          .pipe(
-            Effect.catchCause((cause) =>
-              Effect.logWarning("Failed to start the next queued V2 run", { threadId, cause }),
-            ),
-          );
+          ),
+        ).pipe(
+          Effect.catchCause((cause) =>
+            Effect.logWarning("Failed to start the next queued V2 run", { threadId, cause }),
+          ),
+        );
       }
       yield* updateDelegatedParentTask(threadId, run.id);
     },
@@ -17417,7 +17599,11 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
               );
             }
           },
-          (effect, stored) => threadDispatch.withLock(stored.event.threadId, effect),
+          (effect, stored) =>
+            withSubagentParentLock(
+              stored.event.threadId,
+              threadDispatch.withLock(stored.event.threadId, effect),
+            ),
           Effect.catchCause((cause) =>
             Effect.logWarning("Failed to deliver deferred steering", { cause }),
           ),
@@ -17559,7 +17745,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         Effect.forEach(
           threadIds,
           (threadId) =>
-            threadDispatch.withLock(threadId, requeueUnreadSteers(threadId)).pipe(
+            withSubagentParentLock(
+              threadId,
+              threadDispatch.withLock(threadId, requeueUnreadSteers(threadId)),
+            ).pipe(
               Effect.catchCause((cause) =>
                 Effect.logWarning("Failed to requeue an unread steer during recovery", {
                   threadId,

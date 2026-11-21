@@ -1011,6 +1011,18 @@ function preserveCompletionDelivery(
   return { ...next, completionDelivery: current.completionDelivery };
 }
 
+function stripTransientSubagentFields(subagent: OrchestrationV2Subagent): OrchestrationV2Subagent {
+  const workflow = subagent.workflow;
+  if (
+    workflow === undefined ||
+    (!Object.hasOwn(workflow, "changedAgentIndices") && !Object.hasOwn(workflow, "agentsDelta"))
+  ) {
+    return subagent;
+  }
+  const { changedAgentIndices: _changed, agentsDelta: _delta, ...persistedWorkflow } = workflow;
+  return { ...subagent, workflow: persistedWorkflow };
+}
+
 export function emptyProjection(
   event: Extract<OrchestrationV2DomainEvent, { readonly type: "thread.created" }>,
 ): OrchestrationV2ThreadProjection {
@@ -1145,9 +1157,11 @@ export function applyToProjection(
         ...base,
         subagents: upsertById(
           base.subagents,
-          preserveCompletionDelivery(
-            base.subagents.find((task) => task.id === event.payload.id),
-            event.payload,
+          stripTransientSubagentFields(
+            preserveCompletionDelivery(
+              base.subagents.find((task) => task.id === event.payload.id),
+              event.payload,
+            ),
           ),
         ),
       };
@@ -2757,7 +2771,8 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               break;
             }
             case "subagent.updated": {
-              const payloadJson = yield* encodeSubagentPayload(event.payload);
+              const storedSubagent = stripTransientSubagentFields(event.payload);
+              const payloadJson = yield* encodeSubagentPayload(storedSubagent);
               const payload = parseEncodedPayload(payloadJson);
               yield* sql`
               INSERT INTO orchestration_v2_projection_subagents (
@@ -6714,7 +6729,28 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 AND json_extract(payload_json, '$.queueHeld') IS NOT 1)
             AND NOT EXISTS (SELECT 1 FROM orchestration_v2_projection_runs
               WHERE thread_id = ${threadId}
-                AND status IN ('preparing', 'starting', 'running', 'waiting'))`;
+                AND status IN ('preparing', 'starting', 'running', 'waiting'))
+            AND NOT EXISTS (
+              SELECT 1
+              FROM orchestration_v2_projection_subagents AS child
+              JOIN orchestration_v2_projection_subagents AS workflow
+                ON workflow.thread_id = child.thread_id
+                AND workflow.subagent_id = child.parent_node_id
+              LEFT JOIN orchestration_v2_projection_threads AS parent
+                ON parent.thread_id = workflow.thread_id
+              WHERE child.child_thread_id = ${threadId}
+                AND child.origin = 'app_owned'
+                AND workflow.origin = 'app_owned'
+                AND workflow.child_thread_id IS NULL
+                AND json_type(workflow.payload_json, '$.workflow') = 'object'
+                AND (
+                  workflow.status <> 'running'
+                  OR json_extract(workflow.payload_json, '$.workflow.stopRequestedAt') IS NOT NULL
+                  OR parent.thread_id IS NULL
+                  OR parent.archived_at IS NOT NULL
+                  OR parent.deleted_at IS NOT NULL
+                )
+            )`;
             return rows.length > 0;
           }),
         )

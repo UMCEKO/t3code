@@ -1696,12 +1696,10 @@ const make = Effect.gen(function* () {
     );
     if (appOwnedWorkflowId !== undefined) {
       yield* dispatch({
-        type: "workflow.complete",
+        type: "workflow.stop-request",
         commandId: CommandId.make(`server:stop-workflow:${appOwnedWorkflowId}`),
         parentThreadId: input.threadId,
         taskId: appOwnedWorkflowId,
-        status: "cancelled",
-        result: "Stopped.",
       }).pipe(
         Effect.mapError((cause) =>
           cause._tag === "OrchestratorThreadAboveModeLimitError"
@@ -1782,12 +1780,10 @@ const make = Effect.gen(function* () {
           if (task.status !== "running") continue;
           const commandId = CommandId.make(`${input.commandId}:stop:${task.id}`);
           yield* (input.remoteDispatch ?? dispatch)({
-            type: "workflow.complete",
+            type: "workflow.stop-request",
             commandId,
             parentThreadId: input.threadId,
             taskId: task.id,
-            status: "cancelled",
-            result: "Stopped.",
           }).pipe(
             Effect.catch((error) =>
               Effect.logWarning("Unable to stop a delegated task", {

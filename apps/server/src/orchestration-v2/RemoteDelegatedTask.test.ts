@@ -904,92 +904,650 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
       }),
   );
 
-  it.effect("cancels running app-owned workflows via stopWorkflow and thread.stop", () =>
+  it.effect(
+    "requests stop on running app-owned workflows via stopWorkflow, stopDelegatedTasks, and thread.stop without completing early",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const threads = yield* ThreadManagementService.ThreadManagementService;
+        const offers = yield* Offers;
+
+        // stopWorkflow enforces mode limits, then records stopRequestedAt without completing early.
+        const parentA = yield* seedLiveParent("wf-stop-service");
+        const { taskId: workflowA } = yield* startWorkflow(parentA, "wf-stop-service");
+        const refused = yield* threads
+          .stopWorkflow({ threadId: parentA.threadId, subagentId: workflowA })
+          .pipe(
+            Effect.provideService(DispatchModeLimit, {
+              runtimeMode: "approval-required",
+              interactionMode: "plan",
+            }),
+            Effect.flip,
+          );
+        assert.equal(refused._tag, "OrchestrationV2StopWorkflowError");
+        assert.equal(refused.reason, "unavailable");
+
+        yield* threads.stopWorkflow({ threadId: parentA.threadId, subagentId: workflowA });
+        const stoppingA = yield* orchestrator.getThreadProjection(parentA.threadId);
+        const taskA = stoppingA.subagents.find((candidate) => candidate.id === workflowA);
+        assert.equal(taskA?.status, "running");
+        assert.equal(taskA?.result, null);
+        assert.isNumber(taskA?.workflow?.stopRequestedAt);
+        const firstStopRequestedAt = taskA?.workflow?.stopRequestedAt;
+        assert.equal(
+          stoppingA.nodes.find((candidate) => candidate.id === workflowA)?.status,
+          "running",
+        );
+        assert.equal(
+          stoppingA.turnItems.find(
+            (candidate) => candidate.type === "subagent" && candidate.subagentId === workflowA,
+          )?.status,
+          "running",
+        );
+
+        // Repeat stop-requests are idempotent and preserve the first timestamp.
+        yield* threads.stopWorkflow({ threadId: parentA.threadId, subagentId: workflowA });
+        const duplicateStop = yield* orchestrator.dispatch({
+          type: "workflow.stop-request",
+          commandId: CommandId.make("command:wf-stop-service:duplicate-stop"),
+          parentThreadId: parentA.threadId,
+          taskId: workflowA,
+        });
+        assert.lengthOf(duplicateStop.storedEvents, 0);
+
+        // Progress after stop-request preserves stored stopRequestedAt even when omitted in the snapshot.
+        const stoppingProgressWorkflow = {
+          ...sampleWorkflow,
+          agents: [{ index: 0, label: "Cancelling A", state: "failed" as const }],
+        };
+        yield* orchestrator.dispatch({
+          type: "workflow.progress",
+          commandId: CommandId.make("command:wf-stop-service:progress-while-stopping"),
+          parentThreadId: parentA.threadId,
+          taskId: workflowA,
+          workflow: stoppingProgressWorkflow,
+        });
+        const afterProgressA = (yield* orchestrator.getThreadProjection(
+          parentA.threadId,
+        )).subagents.find((candidate) => candidate.id === workflowA);
+        assert.equal(afterProgressA?.status, "running");
+        assert.equal(afterProgressA?.workflow?.stopRequestedAt, firstStopRequestedAt);
+
+        // Engine completion with disposeDelivery stores the final snapshot and plans no parent wake.
+        yield* completeParentRun(parentA.threadId, parentA.runId, "wf-stop-service");
+        yield* Ref.set(offers, []);
+        const finalStoppedWorkflow = {
+          ...sampleWorkflow,
+          agents: [{ index: 0, label: "Cancelling A", state: "failed" as const, durationMs: 42 }],
+          durationMs: 42,
+        };
+        yield* orchestrator.dispatch({
+          type: "workflow.complete",
+          commandId: CommandId.make("command:wf-stop-service:complete"),
+          parentThreadId: parentA.threadId,
+          taskId: workflowA,
+          status: "cancelled",
+          result: "Stopped.",
+          workflow: finalStoppedWorkflow,
+          disposeDelivery: true,
+        });
+        const stoppedA = yield* orchestrator.getThreadProjection(parentA.threadId);
+        const doneA = stoppedA.subagents.find((candidate) => candidate.id === workflowA);
+        assert.equal(doneA?.status, "cancelled");
+        assert.equal(doneA?.result, "Stopped.");
+        assert.deepEqual(doneA?.completionDelivery, { state: "disposed", observedByRunId: null });
+        assert.deepEqual(doneA?.workflow, {
+          ...finalStoppedWorkflow,
+          stopRequestedAt: firstStopRequestedAt,
+        });
+        assert.isUndefined(
+          stoppedA.runs.find((run) => run.id === parentA.runId)?.delegatedCompletion,
+        );
+        assert.equal(
+          stoppedA.nodes.find((candidate) => candidate.id === workflowA)?.status,
+          "cancelled",
+        );
+        assert.equal(
+          stoppedA.turnItems.find(
+            (candidate) => candidate.type === "subagent" && candidate.subagentId === workflowA,
+          )?.status,
+          "cancelled",
+        );
+        assert.lengthOf(yield* Ref.get(offers), 0);
+
+        const stopAfterComplete = yield* threads
+          .stopWorkflow({ threadId: parentA.threadId, subagentId: workflowA })
+          .pipe(Effect.flip);
+        assert.equal(stopAfterComplete._tag, "OrchestrationV2StopWorkflowError");
+        assert.equal(stopAfterComplete.reason, "not-running");
+
+        // thread.stop requests stop after parent run ended, leaves workflow running until complete, and wakes nobody.
+        const parentB = yield* seedLiveParent("wf-stop-thread-settled");
+        const { taskId: workflowB } = yield* startWorkflow(parentB, "wf-stop-thread-settled");
+        yield* completeParentRun(parentB.threadId, parentB.runId, "wf-stop-thread-settled");
+        yield* Ref.set(offers, []);
+
+        yield* orchestrator.dispatch({
+          type: "thread.stop",
+          commandId: CommandId.make("command:wf-stop-thread-settled:stop"),
+          threadId: parentB.threadId,
+        });
+        const stoppedB = yield* orchestrator.getThreadProjection(parentB.threadId);
+        const taskB = stoppedB.subagents.find((candidate) => candidate.id === workflowB);
+        assert.equal(taskB?.status, "running");
+        assert.equal(taskB?.result, null);
+        assert.isNumber(taskB?.workflow?.stopRequestedAt);
+        assert.deepEqual(taskB?.completionDelivery, { state: "disposed", observedByRunId: null });
+        assert.equal(
+          stoppedB.nodes.find((candidate) => candidate.id === workflowB)?.status,
+          "running",
+        );
+        const itemB = stoppedB.turnItems.find(
+          (candidate) => candidate.type === "subagent" && candidate.subagentId === workflowB,
+        );
+        assert.equal(itemB?.status, "running");
+        assert.lengthOf(yield* Ref.get(offers), 0);
+
+        // thread.stop while the parent run is live also requests stop without completing early.
+        const parentC = yield* seedLiveParent("wf-stop-thread-live");
+        const { taskId: workflowC } = yield* startWorkflow(parentC, "wf-stop-thread-live");
+        yield* Ref.set(offers, []);
+        yield* orchestrator.dispatch({
+          type: "thread.stop",
+          commandId: CommandId.make("command:wf-stop-thread-live:stop"),
+          threadId: parentC.threadId,
+        });
+        const stoppedC = yield* orchestrator.getThreadProjection(parentC.threadId);
+        const taskC = stoppedC.subagents.find((candidate) => candidate.id === workflowC);
+        assert.equal(taskC?.status, "running");
+        assert.equal(taskC?.result, null);
+        assert.isNumber(taskC?.workflow?.stopRequestedAt);
+        assert.deepEqual(taskC?.completionDelivery, { state: "disposed", observedByRunId: null });
+        assert.lengthOf(yield* Ref.get(offers), 0);
+
+        // stopDelegatedTasks dispatches workflow.stop-request and leaves the workflow running.
+        const parentD = yield* seedLiveParent("wf-stop-delegated-tasks");
+        const { taskId: workflowD } = yield* startWorkflow(parentD, "wf-stop-delegated-tasks");
+        yield* threads.stopDelegatedTasks({
+          threadId: parentD.threadId,
+          commandId: CommandId.make("command:wf-stop-delegated-tasks:stop"),
+        });
+        const taskD = (yield* orchestrator.getThreadProjection(parentD.threadId)).subagents.find(
+          (candidate) => candidate.id === workflowD,
+        );
+        assert.equal(taskD?.status, "running");
+        assert.isNumber(taskD?.workflow?.stopRequestedAt);
+      }),
+  );
+
+  it.effect("refuses delegated_task.request once workflow.stop-request is recorded", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
-      const threads = yield* ThreadManagementService.ThreadManagementService;
-      const offers = yield* Offers;
+      const parent = yield* seedLiveParent("wf-stop-admission");
+      const { taskId: workflowId } = yield* startWorkflow(parent, "wf-stop-admission");
+      yield* completeParentRun(parent.threadId, parent.runId, "wf-stop-admission");
 
-      // stopWorkflow enforces mode limits, then cancels an app-owned workflow without deadlocking.
-      const parentA = yield* seedLiveParent("wf-stop-service");
-      const { taskId: workflowA } = yield* startWorkflow(parentA, "wf-stop-service");
-      const refused = yield* threads
-        .stopWorkflow({ threadId: parentA.threadId, subagentId: workflowA })
-        .pipe(
-          Effect.provideService(DispatchModeLimit, {
-            runtimeMode: "approval-required",
-            interactionMode: "plan",
-          }),
-          Effect.flip,
-        );
-      assert.equal(refused._tag, "OrchestrationV2StopWorkflowError");
-      assert.equal(refused.reason, "unavailable");
+      yield* orchestrator.dispatch({
+        type: "workflow.stop-request",
+        commandId: CommandId.make("command:wf-stop-admission:stop"),
+        parentThreadId: parent.threadId,
+        taskId: workflowId,
+      });
 
-      yield* threads.stopWorkflow({ threadId: parentA.threadId, subagentId: workflowA });
-      const stoppedA = yield* orchestrator.getThreadProjection(parentA.threadId);
-      const taskA = stoppedA.subagents.find((candidate) => candidate.id === workflowA);
-      assert.equal(taskA?.status, "cancelled");
-      assert.equal(taskA?.result, "Stopped.");
-      assert.equal(
-        stoppedA.nodes.find((candidate) => candidate.id === workflowA)?.status,
-        "cancelled",
-      );
-      assert.equal(
-        stoppedA.turnItems.find(
-          (candidate) => candidate.type === "subagent" && candidate.subagentId === workflowA,
-        )?.status,
-        "cancelled",
-      );
-
-      const secondStop = yield* threads
-        .stopWorkflow({ threadId: parentA.threadId, subagentId: workflowA })
+      const rejected = yield* orchestrator
+        .dispatch({
+          type: "delegated_task.request",
+          createdBy: "agent",
+          creationSource: "mcp",
+          commandId: CommandId.make("command:wf-stop-admission:child"),
+          parentThreadId: parent.threadId,
+          parentRunId: parent.runId,
+          parentNodeId: workflowId,
+          task: "Must not start after stop-request.",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          completionWake: "never",
+        })
         .pipe(Effect.flip);
-      assert.equal(secondStop._tag, "OrchestrationV2StopWorkflowError");
-      assert.equal(secondStop.reason, "not-running");
-
-      // thread.stop cancels a running app-owned workflow after the parent run ended, without waking.
-      const parentB = yield* seedLiveParent("wf-stop-thread-settled");
-      const { taskId: workflowB } = yield* startWorkflow(parentB, "wf-stop-thread-settled");
-      yield* completeParentRun(parentB.threadId, parentB.runId, "wf-stop-thread-settled");
-      yield* Ref.set(offers, []);
-
-      yield* orchestrator.dispatch({
-        type: "thread.stop",
-        commandId: CommandId.make("command:wf-stop-thread-settled:stop"),
-        threadId: parentB.threadId,
-      });
-      const stoppedB = yield* orchestrator.getThreadProjection(parentB.threadId);
-      const taskB = stoppedB.subagents.find((candidate) => candidate.id === workflowB);
-      assert.equal(taskB?.status, "cancelled");
-      assert.equal(taskB?.result, "Stopped.");
-      assert.deepEqual(taskB?.completionDelivery, { state: "disposed", observedByRunId: null });
-      assert.equal(
-        stoppedB.nodes.find((candidate) => candidate.id === workflowB)?.status,
-        "cancelled",
-      );
-      const itemB = stoppedB.turnItems.find(
-        (candidate) => candidate.type === "subagent" && candidate.subagentId === workflowB,
-      );
-      assert.equal(itemB?.status, "cancelled");
-      assert.equal(itemB?.type === "subagent" ? itemB.result : undefined, "Stopped.");
-      assert.lengthOf(yield* Ref.get(offers), 0);
-
-      // thread.stop while the parent run is live also cancels the running workflow in the same command.
-      const parentC = yield* seedLiveParent("wf-stop-thread-live");
-      const { taskId: workflowC } = yield* startWorkflow(parentC, "wf-stop-thread-live");
-      yield* Ref.set(offers, []);
-      yield* orchestrator.dispatch({
-        type: "thread.stop",
-        commandId: CommandId.make("command:wf-stop-thread-live:stop"),
-        threadId: parentC.threadId,
-      });
-      const stoppedC = yield* orchestrator.getThreadProjection(parentC.threadId);
-      const taskC = stoppedC.subagents.find((candidate) => candidate.id === workflowC);
-      assert.equal(taskC?.status, "cancelled");
-      assert.equal(taskC?.result, "Stopped.");
-      assert.deepEqual(taskC?.completionDelivery, { state: "disposed", observedByRunId: null });
-      assert.lengthOf(yield* Ref.get(offers), 0);
+      assert.equal(rejected._tag, "OrchestratorDispatchError");
     }),
+  );
+
+  it.effect(
+    "refuses queued retry admission and queued retry promotion once the owning workflow is stopping or ended, leaving other threads unaffected",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const threads = yield* ThreadManagementService.ThreadManagementService;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const sink = yield* EventSink.EventSinkV2;
+        const projectId = ProjectId.make("project:remote-delegated-task");
+
+        const parent = yield* seedLiveParent("wf-retry-gate");
+        const { taskId: workflowId } = yield* startWorkflow(parent, "wf-retry-gate");
+
+        // Launch a workflow child and a non-workflow delegated child under the same parent.
+        yield* orchestrator.dispatch({
+          type: "delegated_task.request",
+          createdBy: "agent",
+          creationSource: "mcp",
+          commandId: CommandId.make("command:wf-retry-gate:wf-child"),
+          parentThreadId: parent.threadId,
+          parentRunId: parent.runId,
+          parentNodeId: workflowId,
+          task: "Workflow worker",
+          title: "Workflow worker",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          completionWake: "never",
+        });
+        yield* orchestrator.dispatch({
+          type: "delegated_task.request",
+          createdBy: "agent",
+          creationSource: "mcp",
+          commandId: CommandId.make("command:wf-retry-gate:plain-child"),
+          parentThreadId: parent.threadId,
+          parentRunId: parent.runId,
+          parentNodeId: parent.rootNodeId,
+          task: "Regular child",
+          title: "Regular child",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+        });
+
+        const parentProjection = yield* orchestrator.getThreadProjection(parent.threadId);
+        const wfChildTask = parentProjection.subagents.find(
+          (candidate) => candidate.parentNodeId === workflowId,
+        )!;
+        const wfChildThreadId = wfChildTask.childThreadId!;
+        const wfFirstRun = (yield* orchestrator.getThreadProjection(wfChildThreadId)).runs[0]!;
+        const plainChildTask = parentProjection.subagents.find(
+          (candidate) =>
+            candidate.parentNodeId === parent.rootNodeId && candidate.childThreadId !== null,
+        )!;
+        const plainChildThreadId = plainChildTask.childThreadId!;
+        const plainFirstRun = (yield* orchestrator.getThreadProjection(plainChildThreadId))
+          .runs[0]!;
+
+        // Queue a schema re-prompt behind the active run while the workflow is still running.
+        const queuedSend = yield* threads.sendToThread({
+          projectId,
+          commandId: CommandId.make("command:wf-retry-gate:queued-before-stop"),
+          threadId: wfChildThreadId,
+          senderThreadId: parent.threadId,
+          messageId: MessageId.make("message:wf-retry-gate:queued-before-stop"),
+          text: "Your result did not match the schema.",
+          attachments: [],
+          mode: "queue",
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+        assert.equal(queuedSend.run.status, "queued");
+        const queuedRunId = queuedSend.run.id;
+
+        // Request workflow stop: new queued retries must be refused.
+        yield* orchestrator.dispatch({
+          type: "workflow.stop-request",
+          commandId: CommandId.make("command:wf-retry-gate:stop-request"),
+          parentThreadId: parent.threadId,
+          taskId: workflowId,
+        });
+
+        const refusedAfterStopRequest = yield* threads
+          .sendToThread({
+            projectId,
+            commandId: CommandId.make("command:wf-retry-gate:send-after-stop-request"),
+            threadId: wfChildThreadId,
+            senderThreadId: parent.threadId,
+            messageId: MessageId.make("message:wf-retry-gate:send-after-stop-request"),
+            text: "Must be refused after stop-request.",
+            attachments: [],
+            mode: "queue",
+            createdBy: "agent",
+            creationSource: "mcp",
+          })
+          .pipe(Effect.flip);
+        assert.equal(refusedAfterStopRequest._tag, "OrchestratorDispatchError");
+
+        // Completing the active run must NOT promote the already-queued retry.
+        yield* completeChildRun(wfChildThreadId, wfFirstRun.id, "bad json", "wf-retry-gate-first");
+
+        assert.isFalse(yield* projectionStore.canStartQueuedRun(wfChildThreadId));
+        yield* orchestrator.resumeQueuedRuns;
+
+        const wfAfterFinish = yield* orchestrator.getThreadProjection(wfChildThreadId);
+        assert.equal(wfAfterFinish.runs.find((run) => run.id === queuedRunId)?.status, "queued");
+
+        const refusedQueueResume = yield* orchestrator
+          .dispatch({
+            type: "queue.resume",
+            commandId: CommandId.make("command:wf-retry-gate:queue-resume"),
+            threadId: wfChildThreadId,
+          })
+          .pipe(Effect.flip);
+        assert.equal(refusedQueueResume._tag, "OrchestratorDispatchError");
+
+        const refusedQueuedRunStart = yield* orchestrator
+          .dispatch({
+            type: "queued-run.start",
+            commandId: CommandId.make("command:wf-retry-gate:queued-run-start"),
+            threadId: wfChildThreadId,
+            runId: queuedRunId,
+          })
+          .pipe(Effect.flip);
+        assert.equal(refusedQueuedRunStart._tag, "OrchestratorDispatchError");
+
+        // Refusal continues after workflow.complete.
+        yield* orchestrator.dispatch({
+          type: "workflow.complete",
+          commandId: CommandId.make("command:wf-retry-gate:complete"),
+          parentThreadId: parent.threadId,
+          taskId: workflowId,
+          status: "cancelled",
+          result: "Stopped.",
+          disposeDelivery: true,
+        });
+        const refusedAfterComplete = yield* threads
+          .sendToThread({
+            projectId,
+            commandId: CommandId.make("command:wf-retry-gate:send-after-complete"),
+            threadId: wfChildThreadId,
+            senderThreadId: parent.threadId,
+            messageId: MessageId.make("message:wf-retry-gate:send-after-complete"),
+            text: "Must be refused after workflow complete.",
+            attachments: [],
+            mode: "queue",
+            createdBy: "agent",
+            creationSource: "mcp",
+          })
+          .pipe(Effect.flip);
+        assert.equal(refusedAfterComplete._tag, "OrchestratorDispatchError");
+        assert.isFalse(yield* projectionStore.canStartQueuedRun(wfChildThreadId));
+
+        // Non-workflow delegated children are unaffected by workflow stop/completion.
+        const plainQueued = yield* threads.sendToThread({
+          projectId,
+          commandId: CommandId.make("command:wf-retry-gate:plain-queued"),
+          threadId: plainChildThreadId,
+          senderThreadId: parent.threadId,
+          messageId: MessageId.make("message:wf-retry-gate:plain-queued"),
+          text: "Follow up on regular child.",
+          attachments: [],
+          mode: "queue",
+          createdBy: "agent",
+          creationSource: "mcp",
+        });
+        assert.equal(plainQueued.run.status, "queued");
+        const beforePlainComplete = yield* sink.latestSequence();
+        yield* completeChildRun(
+          plainChildThreadId,
+          plainFirstRun.id,
+          "done",
+          "wf-retry-gate-plain",
+        );
+        yield* sink.stream({ afterSequence: beforePlainComplete, eventType: "run.updated" }).pipe(
+          Stream.filter(
+            (stored) =>
+              stored.event.type === "run.updated" &&
+              stored.event.payload.id === plainQueued.run.id &&
+              stored.event.payload.status === "starting",
+          ),
+          Stream.take(1),
+          Stream.runDrain,
+        );
+        const plainAfter = yield* orchestrator.getThreadProjection(plainChildThreadId);
+        assert.equal(
+          plainAfter.runs.find((run) => run.id === plainQueued.run.id)?.status,
+          "starting",
+        );
+      }),
+  );
+
+  it.effect(
+    "uses t3_workflow_status with runId in large-wake fallback and bounds long workflow titles inside the inline allowance",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const parent = yield* seedLiveParent("wf-wake-fallback");
+        const longTitle = `Workflow ${"界".repeat(8_000)}`;
+        const runId = "wf_fallback_run_99";
+        const started = yield* orchestrator.dispatch({
+          type: "workflow.start",
+          commandId: CommandId.make("command:wf-wake-fallback:start"),
+          parentThreadId: parent.threadId,
+          parentRunId: parent.runId,
+          parentNodeId: parent.rootNodeId,
+          title: longTitle,
+          description: "Large workflow output test.",
+          modelSelection,
+          workflow: {
+            ...sampleWorkflow,
+            name: longTitle,
+            runHandles: {
+              ...sampleWorkflow.runHandles,
+              runId,
+            },
+          },
+        });
+        const taskEvent = started.storedEvents.find(
+          (stored) => stored.event.type === "subagent.updated",
+        );
+        const workflowId =
+          taskEvent?.event.type === "subagent.updated" ? taskEvent.event.payload.id : undefined;
+        assert.isDefined(workflowId);
+
+        yield* completeParentRun(parent.threadId, parent.runId, "wf-wake-fallback");
+        yield* orchestrator.dispatch({
+          type: "workflow.complete",
+          commandId: CommandId.make("command:wf-wake-fallback:complete"),
+          parentThreadId: parent.threadId,
+          taskId: workflowId!,
+          status: "completed",
+          result: "x".repeat(20_000),
+        });
+
+        const afterComplete = yield* orchestrator.getThreadProjection(parent.threadId);
+        const delivery = afterComplete.runs.find((run) => run.id === parent.runId)
+          ?.delegatedCompletion?.delivery;
+        assert.isDefined(delivery);
+
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("command:wf-wake-fallback:wake"),
+          threadId: parent.threadId,
+          messageId: delivery!.messageId,
+          text: "Workflow completed.",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "server",
+          delegatedCompletion: {
+            parentRunId: parent.runId,
+            generation: delivery!.generation,
+            taskIds: delivery!.taskIds,
+          },
+        });
+
+        const wakeMessage = (yield* orchestrator.getThreadProjection(
+          parent.threadId,
+        )).messages.find((message) => message.id === delivery!.messageId);
+        assert.isDefined(wakeMessage);
+        assert.isAtMost(Buffer.byteLength(wakeMessage!.text, "utf8"), 16_000);
+        assert.include(
+          wakeMessage!.text,
+          `Use t3_workflow_status with runId ${runId} to read the result.`,
+        );
+        assert.notInclude(wakeMessage!.text, "task_status");
+        assert.include(wakeMessage!.text, "...");
+
+        // Even with a short result, a very long workflow title is truncated inside the allowance.
+        const parentShort = yield* seedLiveParent("wf-wake-long-title-short-result");
+        const startedShort = yield* orchestrator.dispatch({
+          type: "workflow.start",
+          commandId: CommandId.make("command:wf-wake-short:start"),
+          parentThreadId: parentShort.threadId,
+          parentRunId: parentShort.runId,
+          parentNodeId: parentShort.rootNodeId,
+          title: longTitle,
+          description: "Short result with huge title.",
+          modelSelection,
+          workflow: {
+            ...sampleWorkflow,
+            name: longTitle,
+            runHandles: { ...sampleWorkflow.runHandles, runId: "wf_short_1" },
+          },
+        });
+        const shortTaskEvent = startedShort.storedEvents.find(
+          (stored) => stored.event.type === "subagent.updated",
+        );
+        const shortWorkflowId =
+          shortTaskEvent?.event.type === "subagent.updated"
+            ? shortTaskEvent.event.payload.id
+            : undefined;
+        yield* completeParentRun(parentShort.threadId, parentShort.runId, "wf-wake-short");
+        yield* orchestrator.dispatch({
+          type: "workflow.complete",
+          commandId: CommandId.make("command:wf-wake-short:complete"),
+          parentThreadId: parentShort.threadId,
+          taskId: shortWorkflowId!,
+          status: "completed",
+          result: "Compact workflow summary.",
+        });
+        const shortDelivery = (yield* orchestrator.getThreadProjection(
+          parentShort.threadId,
+        )).runs.find((run) => run.id === parentShort.runId)?.delegatedCompletion?.delivery;
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          commandId: CommandId.make("command:wf-wake-short:wake"),
+          threadId: parentShort.threadId,
+          messageId: shortDelivery!.messageId,
+          text: "Workflow completed.",
+          attachments: [],
+          dispatchMode: { type: "queue_after_active" },
+          createdBy: "agent",
+          creationSource: "server",
+          delegatedCompletion: {
+            parentRunId: parentShort.runId,
+            generation: shortDelivery!.generation,
+            taskIds: shortDelivery!.taskIds,
+          },
+        });
+        const shortWakeMessage = (yield* orchestrator.getThreadProjection(
+          parentShort.threadId,
+        )).messages.find((message) => message.id === shortDelivery!.messageId);
+        assert.isDefined(shortWakeMessage);
+        assert.isAtMost(Buffer.byteLength(shortWakeMessage!.text, "utf8"), 16_000);
+        assert.include(shortWakeMessage!.text, "Compact workflow summary.");
+      }),
+  );
+
+  it.effect(
+    "emits changedAgentIndices on workflow progress and completion events without persisting it on projections",
+    () =>
+      Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
+        const parent = yield* seedLiveParent("wf-changed-indices");
+        const { taskId: workflowId } = yield* startWorkflow(parent, "wf-changed-indices");
+
+        const initialAgents = [
+          { index: 0, label: "Check A", state: "running" as const },
+          { index: 1, label: "Check B", state: "running" as const },
+          { index: 2, label: "Check C", state: "queued" as const },
+        ];
+        const firstProgress = yield* orchestrator.dispatch({
+          type: "workflow.progress",
+          commandId: CommandId.make("command:wf-changed:1"),
+          parentThreadId: parent.threadId,
+          taskId: workflowId,
+          workflow: { ...sampleWorkflow, agents: initialAgents },
+        });
+        const firstEvent = firstProgress.storedEvents.find(
+          (stored) => stored.event.type === "subagent.updated",
+        );
+        assert.equal(firstEvent?.event.type, "subagent.updated");
+        if (firstEvent?.event.type === "subagent.updated") {
+          assert.deepEqual(firstEvent.event.payload.workflow?.changedAgentIndices, [0, 1, 2]);
+        }
+
+        // Changing only agent 1 emits changedAgentIndices: [1].
+        const updatedAgents = [
+          { index: 0, label: "Check A", state: "running" as const },
+          { index: 1, label: "Check B", state: "completed" as const, result: "ok" },
+          { index: 2, label: "Check C", state: "queued" as const },
+        ];
+        const secondProgress = yield* orchestrator.dispatch({
+          type: "workflow.progress",
+          commandId: CommandId.make("command:wf-changed:2"),
+          parentThreadId: parent.threadId,
+          taskId: workflowId,
+          workflow: { ...sampleWorkflow, agents: updatedAgents },
+        });
+        const secondEvent = secondProgress.storedEvents.find(
+          (stored) => stored.event.type === "subagent.updated",
+        );
+        assert.equal(secondEvent?.event.type, "subagent.updated");
+        if (secondEvent?.event.type === "subagent.updated") {
+          assert.deepEqual(secondEvent.event.payload.workflow?.changedAgentIndices, [1]);
+          const inMemory = ProjectionStore.applyToProjection(
+            yield* orchestrator.getThreadProjection(parent.threadId),
+            secondEvent.event,
+          );
+          const inMemoryWorkflow = inMemory.subagents.find(
+            (candidate) => candidate.id === workflowId,
+          )?.workflow;
+          assert.isDefined(inMemoryWorkflow);
+          assert.isFalse(Object.hasOwn(inMemoryWorkflow!, "changedAgentIndices"));
+        }
+
+        const storedAfterSecond = (yield* orchestrator.getThreadProjection(
+          parent.threadId,
+        )).subagents.find((candidate) => candidate.id === workflowId);
+        assert.isDefined(storedAfterSecond?.workflow);
+        assert.isFalse(Object.hasOwn(storedAfterSecond!.workflow!, "changedAgentIndices"));
+        assert.deepEqual(storedAfterSecond?.workflow?.agents, updatedAgents);
+
+        const recordsAfterSecond = (yield* projectionStore.getThreadRecords(
+          parent.threadId,
+          ["subagents"],
+          {
+            subagentIds: [workflowId],
+          },
+        )).subagents[0];
+        assert.isFalse(Object.hasOwn(recordsAfterSecond!.workflow!, "changedAgentIndices"));
+
+        // Completing while updating only agent 2 emits changedAgentIndices: [2], never stored.
+        const finalAgents = [
+          { index: 0, label: "Check A", state: "running" as const },
+          { index: 1, label: "Check B", state: "completed" as const, result: "ok" },
+          { index: 2, label: "Check C", state: "completed" as const },
+        ];
+        const completed = yield* orchestrator.dispatch({
+          type: "workflow.complete",
+          commandId: CommandId.make("command:wf-changed:complete"),
+          parentThreadId: parent.threadId,
+          taskId: workflowId,
+          status: "completed",
+          result: "Done.",
+          workflow: { ...sampleWorkflow, agents: finalAgents },
+        });
+        const completeEvent = completed.storedEvents.find(
+          (stored) => stored.event.type === "subagent.updated",
+        );
+        assert.equal(completeEvent?.event.type, "subagent.updated");
+        if (completeEvent?.event.type === "subagent.updated") {
+          assert.deepEqual(completeEvent.event.payload.workflow?.changedAgentIndices, [2]);
+        }
+        const storedAfterComplete = (yield* orchestrator.getThreadProjection(
+          parent.threadId,
+        )).subagents.find((candidate) => candidate.id === workflowId);
+        assert.isDefined(storedAfterComplete?.workflow);
+        assert.isFalse(Object.hasOwn(storedAfterComplete!.workflow!, "changedAgentIndices"));
+        assert.deepEqual(storedAfterComplete?.workflow?.agents, finalAgents);
+      }),
   );
 
   it.effect("forwards outputSchema from delegated_task.request to the child's first run", () =>
