@@ -3,6 +3,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   WORKFLOW_LIMITS,
   WORKFLOW_MESSAGE_LIMITS,
+  WORKFLOW_PROGRESS_LIMITS,
   WORKFLOW_WORKER_RESOURCE_LIMITS,
   WorkflowScriptError,
   parseWorkflowMeta,
@@ -11,6 +12,7 @@ import {
   type WorkflowAgentCall,
   type WorkflowHost,
 } from "./sandbox.ts";
+import { makeWorkflowProgressBudget } from "./sandboxWorker.ts";
 
 function makeScript(body: string, meta = `{ name: "test", description: "test workflow" }`): string {
   return `export const meta = ${meta};\n${body}`;
@@ -1147,6 +1149,73 @@ describe("sandbox", () => {
         agentStrProcess: { escaped: false, name: "EvalError" },
         argsProcess: { escaped: false, name: "EvalError" },
       });
+    });
+  });
+  describe("off-heap allocations and progress budgets", () => {
+    it("blocks allocators that live outside the worker heap", async () => {
+      for (const code of [
+        "return new ArrayBuffer(1e9);",
+        "return new Uint8Array(1e9);",
+        "return new SharedArrayBuffer(8);",
+        "return new WebAssembly.Memory({ initial: 1 });",
+        "return new DataView(new ArrayBuffer(8));",
+      ]) {
+        await expect(
+          runWorkflowScript({
+            script: makeScript(code),
+            args: undefined,
+            host: makeHost(),
+            concurrency: 1,
+          }),
+        ).rejects.toThrow(/not available in workflow scripts/);
+      }
+    });
+
+    it("rejects an oversized script before scanning it", () => {
+      const script = "x".repeat(WORKFLOW_MESSAGE_LIMITS.maxValueBytes + 1);
+      expect(() => parseWorkflowMeta(script)).toThrow(/exceeds the 4 MiB limit/);
+    });
+
+    it("fails the run once the log budget is spent, even when the script catches", async () => {
+      const script = makeScript(`
+        for (let i = 0; i <= ${WORKFLOW_PROGRESS_LIMITS.maxLogs}; i++) {
+          try { log("line " + i); } catch {}
+        }
+        return "done";
+      `);
+      await expect(
+        runWorkflowScript({ script, args: undefined, host: makeHost(), concurrency: 1 }),
+      ).rejects.toThrow(/logs at most/);
+    });
+
+    it("fails the run past the distinct phase budget", async () => {
+      const script = makeScript(`
+        for (let i = 0; i <= ${WORKFLOW_PROGRESS_LIMITS.maxPhaseTitles}; i++) {
+          try { phase("P" + i); } catch {}
+        }
+        return "done";
+      `);
+      await expect(
+        runWorkflowScript({ script, args: undefined, host: makeHost(), concurrency: 1 }),
+      ).rejects.toThrow(/distinct phases/);
+    });
+
+    it("enforces every progress budget in the host-side tracker", () => {
+      const limits = { maxLogs: 2, maxLogBytes: 10, maxPhaseTitles: 2, maxPhaseSwitches: 4 };
+      const logs = makeWorkflowProgressBudget(limits);
+      expect(logs.log("a")).toBeUndefined();
+      expect(logs.log("b")).toBeUndefined();
+      expect(logs.log("c")).toMatch(/logs at most 2/);
+      const bytes = makeWorkflowProgressBudget(limits);
+      expect(bytes.log("0123456789x")).toMatch(/exceeds the 4 MiB limit/);
+      const phases = makeWorkflowProgressBudget(limits);
+      expect(phases.phase("A")).toBeUndefined();
+      expect(phases.phase("B")).toBeUndefined();
+      expect(phases.phase("A")).toBeUndefined();
+      expect(phases.phase("C")).toMatch(/at most 2 distinct phases/);
+      const switches = makeWorkflowProgressBudget(limits);
+      for (let i = 0; i < 4; i++) expect(switches.phase("A")).toBeUndefined();
+      expect(switches.phase("A")).toMatch(/at most 4 times/);
     });
   });
 });

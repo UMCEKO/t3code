@@ -13,6 +13,52 @@ export const WORKFLOW_MESSAGE_LIMITS = {
   maxLogChars: 2000,
 } as const;
 
+export const WORKFLOW_PROGRESS_LIMITS = {
+  maxLogs: 10_000,
+  maxLogBytes: 4 * 1024 * 1024,
+  maxPhaseTitles: 256,
+  maxPhaseSwitches: 100_000,
+} as const;
+
+export interface WorkflowProgressBudget {
+  /** Returns a cap-failure message once a per-run progress budget is exceeded. */
+  readonly phase: (title: string) => string | undefined;
+  readonly log: (message: string) => string | undefined;
+}
+
+export function makeWorkflowProgressBudget(
+  limits: {
+    readonly [K in keyof typeof WORKFLOW_PROGRESS_LIMITS]: number;
+  } = WORKFLOW_PROGRESS_LIMITS,
+): WorkflowProgressBudget {
+  const titles = new Set<string>();
+  let switches = 0;
+  let logs = 0;
+  let logBytes = 0;
+  return {
+    phase: (title) => {
+      switches += 1;
+      if (switches > limits.maxPhaseSwitches) {
+        return `A workflow switches phase at most ${limits.maxPhaseSwitches} times.`;
+      }
+      if (!titles.has(title)) {
+        if (titles.size >= limits.maxPhaseTitles) {
+          return `A workflow has at most ${limits.maxPhaseTitles} distinct phases.`;
+        }
+        titles.add(title);
+      }
+      return undefined;
+    },
+    log: (message) => {
+      logs += 1;
+      logBytes += Buffer.byteLength(message, "utf8");
+      if (logs > limits.maxLogs) return `A workflow logs at most ${limits.maxLogs} lines.`;
+      if (logBytes > limits.maxLogBytes) return "Workflow log() output exceeds the 4 MiB limit.";
+      return undefined;
+    },
+  };
+}
+
 export const MAX_START_MESSAGE_BYTES = WORKFLOW_MESSAGE_LIMITS.maxValueBytes * 2 + 16_384;
 export const MAX_ERROR_MESSAGE_CHARS = 16_384;
 
@@ -719,6 +765,35 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     };
   }
 
+  function makeProgressBudget(limits) {
+    const titles = new Set();
+    let switches = 0;
+    let logs = 0;
+    let logBytes = 0;
+    return {
+      phase(title) {
+        switches += 1;
+        if (switches > limits.maxPhaseSwitches) {
+          return "A workflow switches phase at most " + limits.maxPhaseSwitches + " times.";
+        }
+        if (!titles.has(title)) {
+          if (titles.size >= limits.maxPhaseTitles) {
+            return "A workflow has at most " + limits.maxPhaseTitles + " distinct phases.";
+          }
+          titles.add(title);
+        }
+        return undefined;
+      },
+      log(message) {
+        logs += 1;
+        logBytes += byteLength(message, "utf8");
+        if (logs > limits.maxLogs) return "A workflow logs at most " + limits.maxLogs + " lines.";
+        if (logBytes > limits.maxLogBytes) return "Workflow log() output exceeds the 4 MiB limit.";
+        return undefined;
+      },
+    };
+  }
+
   class FifoSemaphore {
     constructor(limit) {
       this.limit = limit;
@@ -856,6 +931,16 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     '      },',
     '      configurable: false,',
     '      writable: false,',
+    '    });',
+    '  }',
+    '  for (const name of ["ArrayBuffer", "SharedArrayBuffer", "DataView", "Atomics", "WebAssembly", "Int8Array", "Uint8Array", "Uint8ClampedArray", "Int16Array", "Uint16Array", "Int32Array", "Uint32Array", "Float16Array", "Float32Array", "Float64Array", "BigInt64Array", "BigUint64Array", "WeakRef", "FinalizationRegistry"]) {',
+    '    if (!(name in globalThis)) continue;',
+    '    const message = name + " is not available in workflow scripts: it allocates memory outside the sandbox limit.";',
+    '    defineProperty(globalThis, name, {',
+    '      get() {',
+    '        throw makeContextError("WorkflowScriptError", message);',
+    '      },',
+    '      configurable: false,',
     '    });',
     '  }',
     '',
@@ -1093,6 +1178,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
   let idleScheduled = false;
 
   let config = null;
+  let progressBudget = null;
   let semaphore = null;
   let agentCount = 0;
   let budgetSpent = 0;
@@ -1472,6 +1558,11 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
         },
         onPhase: (title) =>
           runBridgeSync(() => {
+            const over = progressBudget.phase(title);
+            if (over !== undefined) {
+              failCap(over);
+              return;
+            }
             currentPhase = title;
             postSmallMessage({ type: "phase", title }, "Workflow phase() title");
           }),
@@ -1479,6 +1570,11 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
           runBridgeSync(() => {
             const trimmed =
               message.length > config.maxLogChars ? message.slice(0, config.maxLogChars) : message;
+            const over = progressBudget.log(trimmed);
+            if (over !== undefined) {
+              failCap(over);
+              return;
+            }
             postSmallMessage({ type: "log", message: trimmed }, "Workflow log() message");
           }),
         budgetSpent: () => runBridgeSync(() => budgetSpent),
@@ -1578,8 +1674,10 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
           maxPromptBytes: msg.maxPromptBytes,
           maxValueBytes: msg.maxValueBytes,
           maxLogChars: msg.maxLogChars,
+          progressLimits: msg.progressLimits,
         };
         budgetSpent = msg.budgetSpent;
+        progressBudget = makeProgressBudget(config.progressLimits);
         semaphore = new FifoSemaphore(config.concurrency);
 
         if (typeof msg.script !== "string") {

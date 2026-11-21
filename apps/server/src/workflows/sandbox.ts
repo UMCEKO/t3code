@@ -4,13 +4,15 @@ import * as NodeWorkerThreads from "node:worker_threads";
 import {
   MAX_ERROR_MESSAGE_CHARS,
   MAX_START_MESSAGE_BYTES,
+  makeWorkflowProgressBudget,
   WORKFLOW_MESSAGE_LIMITS,
+  WORKFLOW_PROGRESS_LIMITS,
   WORKFLOW_SANDBOX_WORKER_SOURCE,
   WORKFLOW_WORKER_RESOURCE_LIMITS,
   type RealmErrorKind,
 } from "./sandboxWorker.ts";
 
-export { WORKFLOW_MESSAGE_LIMITS, WORKFLOW_WORKER_RESOURCE_LIMITS };
+export { WORKFLOW_MESSAGE_LIMITS, WORKFLOW_PROGRESS_LIMITS, WORKFLOW_WORKER_RESOURCE_LIMITS };
 
 export interface WorkflowMeta {
   readonly name: string;
@@ -551,6 +553,10 @@ export function parseWorkflowMeta(script: string): WorkflowMeta {
   if (typeof script !== "string") {
     throw new WorkflowScriptError("Workflow script must be a string");
   }
+  // UTF-16 length bounds the UTF-8 size from below, so this rejects without scanning the text.
+  if (script.length > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
+    throw new WorkflowScriptError("Workflow script exceeds the 4 MiB limit.");
+  }
   const scanner = new MetaScanner(script);
   scanner.skipTrivia();
 
@@ -697,6 +703,7 @@ export async function runWorkflowScript(input: {
   let lastSentSeq = 0;
   let lastIdleSeq = 0;
   let hostAgentCount = 0;
+  const progressBudget = makeWorkflowProgressBudget();
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   let terminatePromise: Promise<number> | null = null;
 
@@ -831,6 +838,7 @@ export async function runWorkflowScript(input: {
         maxPromptBytes: WORKFLOW_MESSAGE_LIMITS.maxPromptBytes,
         maxValueBytes: WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
         maxLogChars: WORKFLOW_MESSAGE_LIMITS.maxLogChars,
+        progressLimits: WORKFLOW_PROGRESS_LIMITS,
       });
       const startMsg = argsJson === undefined ? base : `${base.slice(0, -1)},"args":${argsJson}}`;
       postToWorker(startMsg, MAX_START_MESSAGE_BYTES, "Workflow start payload exceeds size limit.");
@@ -867,6 +875,11 @@ export async function runWorkflowScript(input: {
         failRun(new WorkflowScriptError("Workflow worker sent an invalid phase title."));
         return;
       }
+      const overPhase = progressBudget.phase(msg.title);
+      if (overPhase !== undefined) {
+        failRun(new WorkflowScriptError(overPhase));
+        return;
+      }
       try {
         input.host.onPhase(msg.title);
       } catch (err) {
@@ -888,6 +901,11 @@ export async function runWorkflowScript(input: {
         msg.message.length > WORKFLOW_MESSAGE_LIMITS.maxLogChars
           ? msg.message.slice(0, WORKFLOW_MESSAGE_LIMITS.maxLogChars)
           : msg.message;
+      const overLog = progressBudget.log(text);
+      if (overLog !== undefined) {
+        failRun(new WorkflowScriptError(overLog));
+        return;
+      }
       try {
         input.host.onLog(text);
       } catch (err) {
