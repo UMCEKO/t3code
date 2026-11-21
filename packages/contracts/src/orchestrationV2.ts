@@ -1044,7 +1044,8 @@ export const OrchestrationV2Subagent = Schema.Struct({
   model: Schema.NullOr(Schema.String),
   modelSelection: Schema.optional(ModelSelection),
   executedModel: Schema.optional(Schema.String),
-  completionWake: Schema.optional(Schema.Literals(["always", "settled_only"])),
+  /** `never`: a server workflow reads the result, so the parent is not woken. */
+  completionWake: Schema.optional(Schema.Literals(["always", "settled_only", "never"])),
   completionDelivery: Schema.optional(OrchestrationV2DelegatedCompletionTaskDelivery),
   // The run whose unfinished task was cancelled, committed with its Stop.
   cancelledRunId: Schema.optional(RunId),
@@ -3781,8 +3782,10 @@ export const OrchestrationV2Command = Schema.Union([
     runtimeMode: RuntimeMode,
     interactionMode: ProviderInteractionMode,
     workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
-    // Defaults to settled_only; fire-and-forget wakes require always.
-    completionWake: Schema.optional(Schema.Literals(["always", "settled_only"])),
+    // Defaults to settled_only; fire-and-forget wakes require always; never is for workflow agents.
+    completionWake: Schema.optional(Schema.Literals(["always", "settled_only", "never"])),
+    /** Asks the child's first run for a result as data matching this JSON Schema. */
+    outputSchema: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
     createdAt: Schema.optional(Schema.DateTimeUtc),
   }),
   Schema.Struct({
@@ -3913,6 +3916,41 @@ const OrchestrationV2InternalCommand = Schema.Union([
         sections: Schema.optional(Schema.Array(PullRequestWakeSection)),
       }),
     ),
+  }),
+  /**
+   * Records a server workflow run on its parent: an app-owned task with no child thread,
+   * its node and its turn item. Its agents are delegated tasks under its node, and the
+   * workflow engine reports its progress and result. The ids derive from `commandId`.
+   */
+  Schema.Struct({
+    type: Schema.Literal("workflow.start"),
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    parentRunId: RunId,
+    parentNodeId: NodeId,
+    title: TrimmedNonEmptyString,
+    description: Schema.String,
+    modelSelection: ModelSelection,
+    workflow: OrchestrationV2SubagentWorkflow,
+  }),
+  /** Replaces a running workflow's progress; `progress` is its newest narrator line. */
+  Schema.Struct({
+    type: Schema.Literal("workflow.progress"),
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    taskId: NodeId,
+    workflow: OrchestrationV2SubagentWorkflow,
+    progress: Schema.optional(Schema.String),
+  }),
+  /** Ends a workflow's task. The parent wakes as for a delegated task; a finished task keeps its result. */
+  Schema.Struct({
+    type: Schema.Literal("workflow.complete"),
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    taskId: NodeId,
+    status: Schema.Literals(["completed", "failed", "cancelled", "interrupted"]),
+    result: Schema.String,
+    workflow: Schema.optional(OrchestrationV2SubagentWorkflow),
   }),
   /**
    * Records a delegated task that runs in a linked environment: the task, its

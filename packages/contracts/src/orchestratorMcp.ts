@@ -41,6 +41,7 @@ import {
   OrchestrationV2DelegatedFrom,
   OrchestrationV2RunStatus,
   OrchestrationV2TurnItemStatus,
+  OrchestrationV2WorkflowPhase,
 } from "./orchestrationV2.ts";
 import { ProviderOptionSelection, ProviderOptionSelectionValue } from "./model.ts";
 import { ProviderDriverKind, ProviderInstanceId } from "./providerInstance.ts";
@@ -983,6 +984,102 @@ export const OrchestratorMcpDeleteScheduledTaskResult = Schema.Struct({
 });
 export type OrchestratorMcpDeleteScheduledTaskResult =
   typeof OrchestratorMcpDeleteScheduledTaskResult.Type;
+
+const OrchestratorMcpWorkflowRunId = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
+
+export const OrchestratorMcpWorkflowRunInput = Schema.Struct({
+  script: Schema.optional(
+    TrimmedNonEmptyString.check(Schema.isMaxLength(524_288)).annotate({
+      description:
+        "Plain JS starting with `export const meta = {name, description, phases?}` (a pure literal). Hooks: agent, parallel, pipeline, phase, log, args, budget, workflow.",
+    }),
+  ),
+  scriptPath: Schema.optional(
+    TrimmedNonEmptyString.annotate({
+      description:
+        "A script file on this machine; wins over `script`. Edit it and pass it again to resume.",
+    }),
+  ),
+  args: Schema.optional(Schema.Json.annotate({ description: "Exposed to the script as `args`." })),
+  resumeFromRunId: Schema.optional(
+    OrchestratorMcpWorkflowRunId.annotate({
+      description: "Replays that run's unchanged prefix of agent() calls from its journal.",
+    }),
+  ),
+  // Some providers send the whole target object as JSON text.
+  target: Schema.optional(
+    Schema.Union([OrchestratorMcpTarget, Schema.fromJsonString(OrchestratorMcpTarget)]).annotate({
+      description:
+        "Default provider and model for agent() calls; each call's `opts.target` overrides it.",
+    }),
+  ),
+  tokenBudget: Schema.optional(
+    PositiveInt.annotate({
+      description: "Token ceiling for all agents; agent() throws once reached.",
+    }),
+  ),
+});
+export type OrchestratorMcpWorkflowRunInput = typeof OrchestratorMcpWorkflowRunInput.Type;
+
+export const OrchestratorMcpWorkflowRunStatus = Schema.Literals([
+  "running",
+  "completed",
+  "failed",
+  "cancelled",
+]);
+export type OrchestratorMcpWorkflowRunStatus = typeof OrchestratorMcpWorkflowRunStatus.Type;
+
+export const OrchestratorMcpWorkflowUsage = Schema.Struct({
+  agents: NonNegativeInt,
+  done: NonNegativeInt,
+  errors: NonNegativeInt,
+  empty: NonNegativeInt,
+  cached: NonNegativeInt,
+  tokens: NonNegativeInt,
+  durationMs: NonNegativeInt,
+});
+export type OrchestratorMcpWorkflowUsage = typeof OrchestratorMcpWorkflowUsage.Type;
+
+export const OrchestratorMcpWorkflowRunResult = Schema.Struct({
+  runId: OrchestratorMcpWorkflowRunId,
+  /** The workflow's row on this thread; `t3_workflow_stop` also takes it as `subagentId`. */
+  taskId: NodeId,
+  status: OrchestratorMcpWorkflowRunStatus,
+  scriptPath: TrimmedNonEmptyString,
+  journalPath: TrimmedNonEmptyString,
+  next: Schema.optional(OrchestratorMcpRunningTaskNext),
+});
+export type OrchestratorMcpWorkflowRunResult = typeof OrchestratorMcpWorkflowRunResult.Type;
+
+export const OrchestratorMcpWorkflowStatusInput = Schema.Struct({
+  runId: OrchestratorMcpWorkflowRunId,
+});
+export type OrchestratorMcpWorkflowStatusInput = typeof OrchestratorMcpWorkflowStatusInput.Type;
+
+export const OrchestratorMcpWorkflowStatusResult = Schema.Struct({
+  runId: OrchestratorMcpWorkflowRunId,
+  taskId: NodeId,
+  threadId: ThreadId,
+  name: TrimmedNonEmptyString,
+  status: OrchestratorMcpWorkflowRunStatus,
+  phases: Schema.Array(OrchestrationV2WorkflowPhase),
+  currentPhase: Schema.optional(TrimmedNonEmptyString),
+  agents: Schema.Struct({
+    queued: NonNegativeInt,
+    running: NonNegativeInt,
+    completed: NonNegativeInt,
+    failed: NonNegativeInt,
+  }),
+  /** The newest narrator lines from `log()`, oldest first. */
+  logs: Schema.Array(Schema.String),
+  usage: OrchestratorMcpWorkflowUsage,
+  /** The script's return value, once it completed. */
+  result: Schema.optional(Schema.Json),
+  error: Schema.optional(Schema.String),
+  scriptPath: TrimmedNonEmptyString,
+  journalPath: TrimmedNonEmptyString,
+});
+export type OrchestratorMcpWorkflowStatusResult = typeof OrchestratorMcpWorkflowStatusResult.Type;
 
 export class OrchestratorMcpFailure extends Schema.TaggedError<OrchestratorMcpFailure>()(
   "OrchestratorMcpFailure",
