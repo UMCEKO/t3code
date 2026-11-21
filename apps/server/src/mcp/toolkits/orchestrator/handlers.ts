@@ -11,6 +11,7 @@ import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as McpToolAccess from "../../McpToolAccess.ts";
 import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
 import * as ThreadMetadataMcpService from "../../ThreadMetadataMcpService.ts";
+import * as WorkflowService from "../../../workflows/WorkflowService.ts";
 
 const handlers = {
   orchestrator_capabilities: McpToolAccess.reads((input) =>
@@ -41,24 +42,51 @@ const handlers = {
       return yield* service.cancelTask(scope, input);
     }),
   ),
+  t3_workflow_run: McpToolAccess.actsAsCaller((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const service = yield* WorkflowService.WorkflowService;
+      return yield* service.run(scope, input);
+    }),
+  ),
+  t3_workflow_status: McpToolAccess.reads((input) =>
+    Effect.gen(function* () {
+      const scope = yield* McpInvocationContext.McpInvocationContext;
+      const service = yield* WorkflowService.WorkflowService;
+      return yield* service.status(scope, input);
+    }),
+  ),
   t3_workflow_stop: McpToolAccess.writesThreads(
-    (input) => [input.threadId],
+    (input) => (input.threadId === undefined ? [] : [input.threadId]),
     (input) =>
       Effect.gen(function* () {
+        if (input.runId !== undefined) {
+          const scope = yield* McpInvocationContext.McpInvocationContext;
+          const service = yield* WorkflowService.WorkflowService;
+          return yield* service.stop(scope, input.runId);
+        }
+        if (input.threadId === undefined || input.subagentId === undefined) {
+          return yield* new OrchestratorMcpFailure({
+            code: "invalid_request",
+            message: "Pass `runId`, or both `threadId` and `subagentId`.",
+          });
+        }
         const { threads } = yield* readCaller();
-        return yield* threads.stopWorkflow(input).pipe(
-          Effect.as({}),
-          Effect.mapError(
-            (cause) =>
-              new OrchestratorMcpFailure({
-                code:
-                  cause.reason === "unavailable" || cause.reason === "stop-failed"
-                    ? "orchestration_error"
-                    : "invalid_request",
-                message: cause.message,
-              }),
-          ),
-        );
+        return yield* threads
+          .stopWorkflow({ threadId: input.threadId, subagentId: input.subagentId })
+          .pipe(
+            Effect.as({}),
+            Effect.mapError(
+              (cause) =>
+                new OrchestratorMcpFailure({
+                  code:
+                    cause.reason === "unavailable" || cause.reason === "stop-failed"
+                      ? "orchestration_error"
+                      : "invalid_request",
+                  message: cause.message,
+                }),
+            ),
+          );
       }),
   ),
   // Claude can start a turn by itself before T3 starts its run, so a live-run check would refuse the mark.

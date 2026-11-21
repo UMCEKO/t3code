@@ -156,6 +156,7 @@ export function makeReplayServerConfig(
       workflowsDir: path.join(baseDir, "workflows"),
       attachmentsDir,
       browserArtifactsDir: path.join(stateDir, "browser-artifacts"),
+      workflowRunsDir: path.join(stateDir, "workflows"),
       environmentThemesDir,
       logsDir,
       serverLogPath: path.join(logsDir, "server.log"),

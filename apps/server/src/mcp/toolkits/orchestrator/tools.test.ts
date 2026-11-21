@@ -27,3 +27,15 @@ it("refuses a t3_thread_update whose fields do not fit its action", () => {
     true,
   );
 });
+
+it("exposes workflow run, status, and extended stop tools with expected annotations", () => {
+  expect(OrchestratorToolkit.tools.t3_workflow_run.name).toBe("t3_workflow_run");
+  expect(OrchestratorToolkit.tools.t3_workflow_status.name).toBe("t3_workflow_status");
+  expect(OrchestratorToolkit.tools.t3_workflow_stop.name).toBe("t3_workflow_stop");
+
+  const decodeStop = Schema.decodeUnknownExit(
+    OrchestratorToolkit.tools.t3_workflow_stop.parametersSchema,
+  );
+  expect(Exit.isSuccess(decodeStop({ runId: "wf_0123456789ab" }))).toBe(true);
+  expect(Exit.isSuccess(decodeStop({ threadId: "thread:1", subagentId: "node:1" }))).toBe(true);
+});

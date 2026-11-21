@@ -35,6 +35,7 @@ import * as ThreadLaunchService from "../orchestration-v2/ThreadLaunchService.ts
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
 import * as ServerSettings from "../serverSettings.ts";
+import * as ServerConfig from "../config.ts";
 import * as SqlitePersistence from "../persistence/Sqlite.ts";
 import * as McpProviderSessions from "@t3tools/provider-core/server/McpProviderSessions";
 import * as SecretResolver from "@t3tools/secret-provider-core/server/SecretResolver";
@@ -289,6 +290,11 @@ describe("orchestrator MCP toolkit", () => {
           ),
         ),
         Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
+        Layer.provide(
+          ServerConfig.layerTest(cwd, { prefix: "t3-orchestrator-mcp-it-" }).pipe(
+            Layer.provide(NodeServices.layer),
+          ),
+        ),
         Layer.provide(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
       );
 

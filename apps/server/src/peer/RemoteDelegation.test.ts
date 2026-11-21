@@ -750,6 +750,12 @@ const makeLaptop = (
       Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
       Layer.provide(Layer.mock(ThreadLaunch.ThreadLaunchService)({})),
       Layer.provide(Layer.mock(GitVcsDriver.GitVcsDriver)({})),
+      Layer.provide(
+        ServerConfig.layerTest(process.cwd(), { prefix: "t3-remote-delegation-laptop-" }).pipe(
+          Layer.provide(NodeServices.layer),
+        ),
+      ),
+      Layer.provide(NodeServices.layer),
       Layer.fresh,
     );
     const here = yield* Layer.build(layerHere);

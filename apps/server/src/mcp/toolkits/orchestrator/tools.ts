@@ -34,6 +34,11 @@ import {
   OrchestratorMcpThreadSendResult,
   OrchestratorMcpThreadWaitInput,
   OrchestratorMcpThreadWaitResult,
+  OrchestratorMcpWorkflowRunInput,
+  OrchestratorMcpWorkflowRunResult,
+  OrchestratorMcpWorkflowRunStatus,
+  OrchestratorMcpWorkflowStatusInput,
+  OrchestratorMcpWorkflowStatusResult,
   ThreadMetadataMcpUpdateInput,
   ThreadMetadataMcpUpdateResult,
   TrimmedNonEmptyString,
@@ -50,12 +55,14 @@ import * as RemoteDelegation from "../../../peer/RemoteDelegation.ts";
 import * as McpInvocationContext from "../../McpInvocationContext.ts";
 import * as OrchestratorMcpService from "../../OrchestratorMcpService.ts";
 import * as ThreadMetadataMcpService from "../../ThreadMetadataMcpService.ts";
+import * as WorkflowService from "../../../workflows/WorkflowService.ts";
 
 const dependencies = [
   McpInvocationContext.McpInvocationContext,
   ThreadManagementService.ThreadManagementService,
   OrchestratorMcpService.OrchestratorMcpService,
 ];
+const workflowDependencies = [...dependencies, WorkflowService.WorkflowService];
 /** Listing this environment's links. */
 const linkDependencies = [...dependencies, PeerForwarding.PeerForwarding];
 /** Making and forgetting links. */
@@ -128,17 +135,50 @@ const TaskCancelTool = Tool.make("task_cancel", {
   .annotate(Tool.Destructive, true)
   .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
 
-const WorkflowStopTool = Tool.make("t3_workflow_stop", {
+const WorkflowRunTool = Tool.make("t3_workflow_run", {
   description:
-    "Stop a running Claude workflow in a thread. `subagentId`: coordinator from `t3_thread_read` 'activity'. Stops only the workflow, not the thread.",
-  parameters: Schema.Struct({
-    environmentId: OrchestratorMcpEnvironmentTarget,
-    ...OrchestrationV2StopWorkflowInput.fields,
-  }),
-  success: Schema.Struct({}),
+    "Run a workflow script on the server: many agents, any provider, deterministic. Returns runId at once; completion wakes this thread. Agents keep running after your turn ends. Script: `export const meta = {name, description, phases?}` then a body using agent(prompt, {label, phase, schema, target, model, effort, isolation}), parallel, pipeline, phase, log, args, budget. No Date.now, Math.random, fs or Node. Resume: resumeFromRunId with an edited scriptPath.",
+  parameters: OrchestratorMcpWorkflowRunInput,
+  success: OrchestratorMcpWorkflowRunResult,
   failure: OrchestratorMcpFailure,
   failureMode: "return",
-  dependencies,
+  dependencies: workflowDependencies,
+})
+  .annotate(Tool.Title, "Run a workflow")
+  .annotate(Tool.Destructive, true)
+  .annotate(Tool.OpenWorld, true)
+  .annotate(McpSchema.EnabledWhen, McpInvocationContext.hiddenFromOutsideClients);
+
+const WorkflowStatusTool = Tool.make("t3_workflow_status", {
+  description:
+    "Read a server workflow run's status, phases, agent counts, recent logs, usage, and result by `runId`.",
+  parameters: OrchestratorMcpWorkflowStatusInput,
+  success: OrchestratorMcpWorkflowStatusResult,
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: workflowDependencies,
+})
+  .annotate(Tool.Title, "Get workflow status")
+  .annotate(Tool.Readonly, true)
+  .annotate(Tool.Destructive, false)
+  .annotate(Tool.Idempotent, true);
+
+const WorkflowStopTool = Tool.make("t3_workflow_stop", {
+  description:
+    "Stop a running workflow: `runId` from `t3_workflow_run`, or `threadId` + `subagentId` (a Claude workflow's coordinator from `t3_thread_read` 'activity'). Stops only the workflow and its agents, not the thread.",
+  parameters: Schema.Struct({
+    environmentId: OrchestratorMcpEnvironmentTarget,
+    runId: Schema.optional(TrimmedNonEmptyString.check(Schema.isMaxLength(128))),
+    threadId: Schema.optional(OrchestrationV2StopWorkflowInput.fields.threadId),
+    subagentId: Schema.optional(OrchestrationV2StopWorkflowInput.fields.subagentId),
+  }),
+  success: Schema.Struct({
+    runId: Schema.optional(TrimmedNonEmptyString),
+    status: Schema.optional(OrchestratorMcpWorkflowRunStatus),
+  }),
+  failure: OrchestratorMcpFailure,
+  failureMode: "return",
+  dependencies: workflowDependencies,
 })
   .annotate(Tool.Title, "Stop a workflow")
   .annotate(Tool.Destructive, true);
@@ -367,6 +407,8 @@ export const OrchestratorToolkit = Toolkit.make(
   DelegateTaskTool,
   TaskStatusTool,
   TaskCancelTool,
+  WorkflowRunTool,
+  WorkflowStatusTool,
   WorkflowStopTool,
   BackgroundWaitTool,
   ScheduleTaskTool,
