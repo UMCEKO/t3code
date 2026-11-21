@@ -987,6 +987,14 @@ export const OrchestrationV2SubagentWorkflow = Schema.Struct({
   totalTokens: Schema.optional(NonNegativeInt),
   toolCalls: Schema.optional(NonNegativeInt),
   durationMs: Schema.optional(NonNegativeInt),
+  /** Epoch ms of the first stop request; agent admission is closed from then on. */
+  stopRequestedAt: Schema.optional(NonNegativeInt),
+  /** Total agent count when `agents` is a bounded subset. */
+  agentCount: Schema.optional(NonNegativeInt),
+  /** Event-only: indices of the `agents` rows that changed in this event; never on a stored projection. */
+  changedAgentIndices: Schema.optional(Schema.Array(NonNegativeInt)),
+  /** Wire-only: `agents` holds just the changed rows; clients merge them by `index`. */
+  agentsDelta: Schema.optional(Schema.Literal(true)),
 });
 export type OrchestrationV2SubagentWorkflow = typeof OrchestrationV2SubagentWorkflow.Type;
 
@@ -3942,6 +3950,13 @@ const OrchestrationV2InternalCommand = Schema.Union([
     workflow: OrchestrationV2SubagentWorkflow,
     progress: Schema.optional(Schema.String),
   }),
+  /** Asks a running workflow to stop: closes agent admission now; its engine then cancels the agents and completes it. */
+  Schema.Struct({
+    type: Schema.Literal("workflow.stop-request"),
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    taskId: NodeId,
+  }),
   /** Ends a workflow's task. The parent wakes as for a delegated task; a finished task keeps its result. */
   Schema.Struct({
     type: Schema.Literal("workflow.complete"),
@@ -3951,6 +3966,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
     status: Schema.Literals(["completed", "failed", "cancelled", "interrupted"]),
     result: Schema.String,
     workflow: Schema.optional(OrchestrationV2SubagentWorkflow),
+    /** Disposes the completion delivery in the same transaction, so the parent is not woken. */
+    disposeDelivery: Schema.optional(Schema.Boolean),
   }),
   /**
    * Records a delegated task that runs in a linked environment: the task, its

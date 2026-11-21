@@ -705,6 +705,7 @@ function commandThreadId(command: OrchestrationV2ServerCommand): ThreadId {
     case "delegated_task.request":
     case "workflow.start":
     case "workflow.progress":
+    case "workflow.stop-request":
     case "workflow.complete":
     case "delegated_task.remote.request":
     case "delegated_task.remote.complete":
@@ -10686,6 +10687,53 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  const dispatchWorkflowStopRequest = Effect.fn("orchestrationV2.dispatch.workflowStopRequest")(
+    function* (
+      command: Extract<OrchestrationV2InternalCommand, { readonly type: "workflow.stop-request" }>,
+      events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
+    ) {
+      const { subagents } = yield* projectionStore
+        .getThreadRecords(command.parentThreadId, ["subagents"], {
+          subagentIds: [command.taskId],
+        })
+        .pipe(
+          Effect.mapError(
+            (cause) => new OrchestratorProjectionError({ threadId: command.parentThreadId, cause }),
+          ),
+        );
+      const task = subagents.find(
+        (candidate) => candidate.id === command.taskId && isAppOwnedWorkflowTask(candidate),
+      );
+      if (task === undefined) {
+        return yield* new OrchestratorDispatchError({
+          commandId: command.commandId,
+          commandType: command.type,
+          cause: `Workflow task ${command.taskId} is not an app-owned workflow task of thread ${command.parentThreadId}.`,
+        });
+      }
+      if (isTerminalDelegatedTaskStatus(task.status) || task.workflow === undefined) return;
+      if (task.workflow.stopRequestedAt !== undefined) return;
+      const now = yield* DateTime.now;
+      yield* emit(
+        events,
+        command,
+      )({
+        type: "subagent.updated",
+        threadId: command.parentThreadId,
+        ...(task.runId === null ? {} : { runId: task.runId }),
+        nodeId: task.id,
+        driver: task.driver,
+        providerInstanceId: task.providerInstanceId,
+        occurredAt: now,
+        payload: {
+          ...task,
+          workflow: { ...task.workflow, stopRequestedAt: DateTime.toEpochMillis(now) },
+          updatedAt: now,
+        },
+      });
+    },
+  );
+
   const dispatchWorkflowComplete = Effect.fn("orchestrationV2.dispatch.workflowComplete")(
     function* (
       command: Extract<OrchestrationV2InternalCommand, { readonly type: "workflow.complete" }>,
@@ -16708,6 +16756,9 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       case "workflow.progress":
         yield* dispatchWorkflowProgress(command, events);
         break;
+      case "workflow.stop-request":
+        yield* dispatchWorkflowStopRequest(command, events);
+        break;
       case "workflow.complete":
         updateDelegatedCompletionOnlyRunId = yield* dispatchWorkflowComplete(command, events);
         break;
@@ -16877,6 +16928,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           command.type === "subagent.stop" ||
           // Progress or completion on an already-terminal workflow is a no-op.
           command.type === "workflow.progress" ||
+          command.type === "workflow.stop-request" ||
           command.type === "workflow.complete" ||
           // Closing a share again, or after it ended, is not an error.
           command.type === "thread.guest-share.close" ||

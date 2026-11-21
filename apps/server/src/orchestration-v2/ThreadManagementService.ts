@@ -134,6 +134,7 @@ function existingThreadIdsForCommand(
     case "delegated_task.completion-delivery.dispose":
     case "workflow.start":
     case "workflow.progress":
+    case "workflow.stop-request":
     case "workflow.complete":
     case "delegated_task.remote.request":
     case "delegated_task.remote.complete":
