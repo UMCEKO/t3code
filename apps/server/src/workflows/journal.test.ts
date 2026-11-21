@@ -4,6 +4,8 @@ import * as Effect from "effect/Effect";
 import * as Fiber from "effect/Fiber";
 
 import {
+  JournalEncodeError,
+  MAX_PENDING_JOURNAL_BYTES,
   MAX_PENDING_JOURNAL_ENTRIES,
   agentCallKey,
   decodeJournal,
@@ -250,6 +252,146 @@ describe("journal", () => {
           expect(writer.tryAppend({ type: "log", message: "after-close-sync" })).toBe(false);
           expect(written).toHaveLength(total);
         }),
+    );
+
+    it.effect(
+      "bounds pending bytes for tryAppend and blocks append until an in-flight write completes",
+      () =>
+        Effect.gen(function* () {
+          expect(MAX_PENDING_JOURNAL_BYTES).toBe(16 * 1024 * 1024);
+          const firstEntry: JournalEntry = { type: "log", message: "a".repeat(60) };
+          const secondEntry: JournalEntry = { type: "log", message: "b".repeat(60) };
+          const firstBytes = Buffer.byteLength(encodeJournalEntry(firstEntry), "utf8");
+          const secondBytes = Buffer.byteLength(encodeJournalEntry(secondEntry), "utf8");
+          const firstWriteStarted = yield* Deferred.make<void>();
+          const releaseFirstWrite = yield* Deferred.make<void>();
+          const written: Array<string> = [];
+          let secondEnqueued = false;
+
+          const writer = yield* makeJournalWriter({
+            maxPendingBytes: firstBytes + secondBytes - 1,
+            writeLine: (line) =>
+              Effect.gen(function* () {
+                if (written.length === 0) {
+                  yield* Deferred.succeed(firstWriteStarted, undefined);
+                  yield* Deferred.await(releaseFirstWrite);
+                }
+                written.push(line);
+              }),
+          });
+
+          expect(writer.tryAppend(firstEntry)).toBe(true);
+          yield* Deferred.await(firstWriteStarted);
+          expect(yield* writer.pendingBytes).toBe(firstBytes);
+          expect(writer.tryAppend(secondEntry)).toBe(false);
+
+          const blockedAppend = yield* Effect.gen(function* () {
+            const accepted = yield* writer.append(secondEntry);
+            secondEnqueued = true;
+            return accepted;
+          }).pipe(Effect.forkScoped);
+
+          yield* Effect.yieldNow;
+          expect(secondEnqueued).toBe(false);
+          expect(blockedAppend.pollUnsafe()).toBeUndefined();
+
+          yield* Deferred.succeed(releaseFirstWrite, undefined);
+          expect(yield* Fiber.join(blockedAppend)).toBe(true);
+          yield* writer.flush;
+
+          expect(secondEnqueued).toBe(true);
+          expect(yield* writer.pendingBytes).toBe(0);
+          expect(decodeJournal(written.join(""))).toEqual([firstEntry, secondEntry]);
+        }),
+    );
+
+    it.effect("admits a single oversized entry when nothing else waits", () =>
+      Effect.gen(function* () {
+        const smallEntry: JournalEntry = { type: "log", message: "small" };
+        const smallBytes = Buffer.byteLength(encodeJournalEntry(smallEntry), "utf8");
+        const oversizedEntry: JournalEntry = {
+          type: "result",
+          index: 0,
+          key: "k-big",
+          outcome: "ok",
+          value: "x".repeat(200),
+        };
+        const oversizedBytes = Buffer.byteLength(encodeJournalEntry(oversizedEntry), "utf8");
+        expect(oversizedBytes).toBeGreaterThan(smallBytes + 10);
+
+        const smallWriteStarted = yield* Deferred.make<void>();
+        const releaseSmallWrite = yield* Deferred.make<void>();
+        const written: Array<string> = [];
+        let blockNextSmall = false;
+
+        const writer = yield* makeJournalWriter({
+          maxPendingBytes: smallBytes + 10,
+          writeLine: (line) =>
+            Effect.gen(function* () {
+              if (blockNextSmall) {
+                blockNextSmall = false;
+                yield* Deferred.succeed(smallWriteStarted, undefined);
+                yield* Deferred.await(releaseSmallWrite);
+              }
+              written.push(line);
+            }),
+        });
+
+        // Empty queue: tryAppend rejects over-cap, while append admits the oversized entry.
+        expect(writer.tryAppend(oversizedEntry)).toBe(false);
+        expect(yield* writer.append(oversizedEntry)).toBe(true);
+        yield* writer.flush;
+        expect(yield* writer.pendingBytes).toBe(0);
+        expect(decodeJournal(written.join(""))).toEqual([oversizedEntry]);
+
+        // Non-empty queue: oversized append waits for the in-flight entry to complete.
+        blockNextSmall = true;
+        expect(writer.tryAppend(smallEntry)).toBe(true);
+        yield* Deferred.await(smallWriteStarted);
+
+        const waitingOversized = yield* writer.append(oversizedEntry).pipe(Effect.forkScoped);
+        yield* Effect.yieldNow;
+        expect(waitingOversized.pollUnsafe()).toBeUndefined();
+
+        yield* Deferred.succeed(releaseSmallWrite, undefined);
+        expect(yield* Fiber.join(waitingOversized)).toBe(true);
+        yield* writer.flush;
+        expect(yield* writer.pendingBytes).toBe(0);
+        expect(decodeJournal(written.join(""))).toEqual([
+          oversizedEntry,
+          smallEntry,
+          oversizedEntry,
+        ]);
+      }),
+    );
+
+    it.effect("routes enqueue-time encode failures through onWriteError", () =>
+      Effect.gen(function* () {
+        const errors: Array<unknown> = [];
+        const written: Array<string> = [];
+        const writer = yield* makeJournalWriter({
+          writeLine: (line) => Effect.sync(() => void written.push(line)),
+          onWriteError: (error) => Effect.sync(() => void errors.push(error)),
+        });
+
+        const unserializable = {
+          type: "result",
+          index: 0,
+          key: "k-bad",
+          outcome: "ok",
+          value: 1n,
+        } as unknown as JournalEntry;
+
+        expect(writer.tryAppend(unserializable)).toBe(true);
+        expect(yield* writer.append(unserializable)).toBe(true);
+        yield* writer.flush;
+
+        expect(written).toHaveLength(0);
+        expect(errors).toHaveLength(2);
+        expect(errors[0]).toBeInstanceOf(JournalEncodeError);
+        expect(errors[1]).toBeInstanceOf(JournalEncodeError);
+        expect(yield* writer.pendingBytes).toBe(0);
+      }),
     );
   });
 });

@@ -25,14 +25,17 @@ import {
 } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
+import * as ByteSize from "effect/ByteSize";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Ref from "effect/Ref";
 import * as Schema from "effect/Schema";
@@ -3057,6 +3060,7 @@ describe("WorkflowService and workflow MCP tools", () => {
         let failChildStops = true;
         const stopAttemptFailed = yield* Queue.unbounded<void>();
         const finalMetaWritten = yield* Deferred.make<void>();
+        const deferOrder: Array<string> = [];
         const harness2 = yield* makeWorkflowHarness({
           name: "cleanup-pending-recover",
           databaseLayer,
@@ -3064,18 +3068,25 @@ describe("WorkflowService and workflow MCP tools", () => {
           wrapFileSystem: (fsService) => ({
             ...fsService,
             rename: (oldPath, newPath) =>
-              fsService
-                .rename(oldPath, newPath)
-                .pipe(
-                  Effect.tap(() =>
-                    !failChildStops && newPath === seeded.metaPath
-                      ? Deferred.succeed(finalMetaWritten, undefined)
-                      : Effect.void,
-                  ),
-                ),
+              fsService.rename(oldPath, newPath).pipe(
+                Effect.tap(() => {
+                  if (newPath !== seeded.metaPath) return Effect.void;
+                  if (failChildStops) {
+                    deferOrder.push("run.json");
+                    return Effect.void;
+                  }
+                  return Deferred.succeed(finalMetaWritten, undefined);
+                }),
+              ),
           }),
           wrapThreadManagement: (tm) => ({
             ...tm,
+            dispatch: (command) => {
+              if (command.type === "workflow.stop-request" && failChildStops) {
+                deferOrder.push("workflow.stop-request");
+              }
+              return tm.dispatch(command);
+            },
             cancelDelegatedTask: (input) =>
               failChildStops
                 ? Queue.offer(stopAttemptFailed, undefined).pipe(
@@ -3107,6 +3118,9 @@ describe("WorkflowService and workflow MCP tools", () => {
           }
           yield* Queue.take(stopAttemptFailed);
           yield* Fiber.join(sweepFiber);
+
+          // cleanupPending is persisted to run.json before workflow.stop-request is dispatched.
+          expect(deferOrder).toEqual(["run.json", "workflow.stop-request"]);
 
           // Workflow stays running in SQL, is stop-requested, and run.json is marked cleanupPending.
           const midTask = (yield* orchestrator.getThreadProjection(parentThreadId)).subagents.find(
@@ -3335,7 +3349,7 @@ describe("WorkflowService and workflow MCP tools", () => {
 
           const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
           expect(terminal.status).toBe("failed");
-          expect(terminal.result).toContain("1024-entry limit");
+          expect(terminal.result).toContain("1024-entry or 16 MiB limit");
 
           const journalEntries = decodeJournal(yield* fs.readFileString(started.journalPath));
           const logEntries = journalEntries.filter((entry) => entry.type === "log");
@@ -3352,6 +3366,614 @@ describe("WorkflowService and workflow MCP tools", () => {
           );
           expect(status.status).toBe("failed");
           expect(status.logs).toHaveLength(50);
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect.each(["run.json", "stop-request"] as const)(
+    "fails the startup sweep phase when the %s cleanup gate write fails",
+    (failing) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedBaseDir = yield* fs.realPath(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-gate-fail-" }),
+        );
+        const sharedDbContext = yield* Layer.build(SqlitePersistence.layerMemory);
+        const databaseLayer = Layer.succeedContext(sharedDbContext);
+
+        const harness1 = yield* makeWorkflowHarness({
+          name: "cleanup-gate-fail-seed",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+        });
+
+        const seeded = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcpService = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const config = yield* ServerConfig.ServerConfig;
+          const parentTurn = yield* startParentThreadAndRun(
+            harness1.turnQueue,
+            harness1.cwd,
+            "cleanup-gate-fail",
+          );
+          const parentRun = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
+            (r) => r.id === parentTurn.turn.runId,
+          )!;
+
+          const runId = "wf_gatefail0001";
+          const dir = path.join(config.workflowsDir, runId);
+          const scriptPath = path.join(dir, "script.js");
+          const journalPath = path.join(dir, "journal.jsonl");
+          yield* fs.makeDirectory(dir, { recursive: true });
+          yield* fs.writeFileString(
+            scriptPath,
+            `export const meta = { name: "GateFail", description: "Fails run.json gate write." }; return 1;`,
+          );
+          yield* fs.writeFileString(journalPath, "");
+
+          const started = yield* orchestrator.dispatch({
+            type: "workflow.start",
+            commandId: CommandId.make("command:gate-fail:workflow-start"),
+            parentThreadId,
+            parentRunId: parentRun.id,
+            parentNodeId: parentRun.rootNodeId!,
+            title: "GateFail",
+            description: "Fails run.json gate write.",
+            modelSelection,
+            workflow: {
+              name: "GateFail",
+              runHandles: { runId, scriptPath, transcriptDir: dir },
+              phases: [],
+              agents: [],
+            },
+          });
+          const taskEvent = started.storedEvents.find(
+            (s) => s.event.type === "subagent.updated" && s.event.payload.origin === "app_owned",
+          );
+          if (taskEvent?.event.type !== "subagent.updated") {
+            throw new Error("missing workflow task");
+          }
+          const taskId = taskEvent.event.payload.id;
+          yield* mcpService.delegateWorkflowAgent(parentScope, {
+            parentRunId: parentRun.id,
+            workflowNodeId: taskId,
+            requestKey: `${runId}:0`,
+            task: { task: "Stuck child", title: "Worker" },
+          });
+          yield* Queue.take(harness1.turnQueue);
+
+          const metaPath = path.join(dir, "run.json");
+          yield* fs.writeFileString(
+            metaPath,
+            JSON.stringify({
+              runId,
+              threadId: parentThreadId,
+              taskId,
+              name: "GateFail",
+              scriptPath,
+              journalPath,
+              startedAt: 0,
+              status: "running",
+              usage: {
+                agents: 1,
+                done: 0,
+                errors: 0,
+                empty: 0,
+                cached: 0,
+                tokens: 0,
+                durationMs: 0,
+              },
+            }),
+          );
+          return { runId, taskId, metaPath };
+        }).pipe(Effect.provide(harness1.layerToolkit));
+
+        const stopAttemptFailed = yield* Queue.unbounded<void>();
+        let stopRequestDispatched = false;
+        const harness2 = yield* makeWorkflowHarness({
+          name: "cleanup-gate-fail-recover",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+          wrapFileSystem: (fsService) => ({
+            ...fsService,
+            rename: (oldPath, newPath) =>
+              failing === "run.json" && newPath === seeded.metaPath
+                ? Effect.fail(
+                    PlatformError.systemError({
+                      _tag: "PermissionDenied",
+                      module: "FileSystem",
+                      method: "rename",
+                      description: "read-only workflows dir",
+                      pathOrDescriptor: newPath,
+                    }),
+                  )
+                : fsService.rename(oldPath, newPath),
+          }),
+          wrapThreadManagement: (tm) => ({
+            ...tm,
+            dispatch: (command) => {
+              if (command.type === "workflow.stop-request") {
+                stopRequestDispatched = true;
+                if (failing === "stop-request") {
+                  return Queue.offer(stopAttemptFailed, undefined).pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new Orchestrator.OrchestratorDispatchError({
+                          commandId: command.commandId,
+                          commandType: command.type,
+                          cause: "database unavailable",
+                        }),
+                      ),
+                    ),
+                  );
+                }
+              }
+              return tm.dispatch(command);
+            },
+            cancelDelegatedTask: (input) =>
+              Queue.offer(stopAttemptFailed, undefined).pipe(
+                Effect.andThen(
+                  Effect.fail(
+                    new Orchestrator.OrchestratorDispatchError({
+                      commandId: input.command.commandId,
+                      commandType: input.command.type,
+                      cause: "child stop temporarily unavailable",
+                    }),
+                  ),
+                ),
+              ),
+          }),
+        });
+
+        yield* Effect.gen(function* () {
+          const sweepFiber = yield* WorkflowService.recoverInterruptedWorkflows.pipe(
+            Effect.exit,
+            Effect.forkScoped,
+          );
+          for (const delay of [50, 100, 200, 400, 800]) {
+            yield* Queue.take(stopAttemptFailed);
+            yield* TestClock.adjust(`${delay} millis`);
+          }
+          yield* Queue.take(stopAttemptFailed);
+          if (failing === "stop-request") {
+            for (const delay of [50, 100, 200, 400, 800]) {
+              yield* Queue.take(stopAttemptFailed);
+              yield* TestClock.adjust(`${delay} millis`);
+            }
+            yield* Queue.take(stopAttemptFailed);
+          }
+          const exit = yield* Fiber.join(sweepFiber);
+          expect(Exit.isFailure(exit)).toBe(true);
+          expect(stopRequestDispatched).toBe(failing === "stop-request");
+          if (failing === "stop-request") {
+            const record = JSON.parse(yield* fs.readFileString(seeded.metaPath)) as {
+              cleanupPending?: boolean;
+            };
+            expect(record.cleanupPending).toBe(true);
+          }
+        }).pipe(Effect.provide(harness2.layerToolkit));
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "stop on a terminal or taskless row with cleanupPending keeps the gate until child stops are confirmed, then allows resume",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedBaseDir = yield* fs.realPath(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-stop-terminal-gate-" }),
+        );
+        const sharedDbContext = yield* Layer.build(SqlitePersistence.layerMemory);
+        const databaseLayer = Layer.succeedContext(sharedDbContext);
+
+        const harness1 = yield* makeWorkflowHarness({
+          name: "stop-terminal-gate-seed",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+        });
+
+        const seeded = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcpService = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const config = yield* ServerConfig.ServerConfig;
+          const parentTurn = yield* startParentThreadAndRun(
+            harness1.turnQueue,
+            harness1.cwd,
+            "stop-terminal-gate",
+          );
+          const parentRun = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
+            (r) => r.id === parentTurn.turn.runId,
+          )!;
+
+          // 1. Terminal SQL workflow row with cleanupPending and a live child thread.
+          const runId = "wf_termgate0001";
+          const dir = path.join(config.workflowsDir, runId);
+          const scriptPath = path.join(dir, "script.js");
+          const journalPath = path.join(dir, "journal.jsonl");
+          yield* fs.makeDirectory(dir, { recursive: true });
+          yield* fs.writeFileString(
+            scriptPath,
+            `export const meta = { name: "TermGate", description: "Terminal with pending child." };
+const out = await agent("Resumed work");
+return { out };`,
+          );
+
+          const started = yield* orchestrator.dispatch({
+            type: "workflow.start",
+            commandId: CommandId.make("command:term-gate:workflow-start"),
+            parentThreadId,
+            parentRunId: parentRun.id,
+            parentNodeId: parentRun.rootNodeId!,
+            title: "TermGate",
+            description: "Terminal with pending child.",
+            modelSelection,
+            workflow: {
+              name: "TermGate",
+              runHandles: { runId, scriptPath, transcriptDir: dir },
+              phases: [],
+              agents: [],
+            },
+          });
+          const taskEvent = started.storedEvents.find(
+            (s) => s.event.type === "subagent.updated" && s.event.payload.origin === "app_owned",
+          );
+          if (taskEvent?.event.type !== "subagent.updated") {
+            throw new Error("missing workflow task");
+          }
+          const taskId = taskEvent.event.payload.id;
+          const child = yield* mcpService.delegateWorkflowAgent(parentScope, {
+            parentRunId: parentRun.id,
+            workflowNodeId: taskId,
+            requestKey: `${runId}:0`,
+            task: { task: "Still running child", title: "Worker" },
+          });
+          yield* Queue.take(harness1.turnQueue);
+
+          yield* orchestrator.dispatch({
+            type: "workflow.complete",
+            commandId: CommandId.make("command:term-gate:workflow-complete"),
+            parentThreadId,
+            taskId,
+            status: "failed",
+            result: "Failed earlier.",
+          });
+
+          yield* fs.writeFileString(
+            journalPath,
+            `${JSON.stringify({
+              type: "started",
+              index: 0,
+              key: "term-gate-key",
+              label: "Worker",
+              phase: null,
+              agentId: child.taskId,
+              childThreadId: child.childThreadId,
+            })}\n`,
+          );
+          const metaPath = path.join(dir, "run.json");
+          yield* fs.writeFileString(
+            metaPath,
+            JSON.stringify({
+              runId,
+              threadId: parentThreadId,
+              taskId,
+              name: "TermGate",
+              scriptPath,
+              journalPath,
+              startedAt: 0,
+              status: "failed",
+              cleanupPending: true,
+              error: "Failed earlier.",
+              usage: {
+                agents: 1,
+                done: 0,
+                errors: 0,
+                empty: 0,
+                cached: 0,
+                tokens: 0,
+                durationMs: 0,
+              },
+            }),
+          );
+
+          // 2. Taskless (taskId: null) run.json with cleanupPending and a journal-only child thread.
+          const orphanRunId = "wf_taskless0001";
+          const orphanDir = path.join(config.workflowsDir, orphanRunId);
+          const orphanScriptPath = path.join(orphanDir, "script.js");
+          const orphanJournalPath = path.join(orphanDir, "journal.jsonl");
+          yield* fs.makeDirectory(orphanDir, { recursive: true });
+          yield* fs.writeFileString(
+            orphanScriptPath,
+            `export const meta = { name: "TasklessGate", description: "Missing task row." }; return 1;`,
+          );
+          const orphanChild = yield* mcpService.delegateWorkflowAgent(parentScope, {
+            parentRunId: parentRun.id,
+            workflowNodeId: parentRun.rootNodeId!,
+            requestKey: `${orphanRunId}:0`,
+            task: { task: "Journal-only child", title: "JournalWorker" },
+          });
+          yield* Queue.take(harness1.turnQueue);
+          yield* fs.writeFileString(
+            orphanJournalPath,
+            `${JSON.stringify({
+              type: "started",
+              index: 0,
+              key: "orphan-key",
+              label: "JournalWorker",
+              phase: null,
+              agentId: null,
+              childThreadId: orphanChild.childThreadId,
+            })}\n`,
+          );
+          const orphanMetaPath = path.join(orphanDir, "run.json");
+          yield* fs.writeFileString(
+            orphanMetaPath,
+            JSON.stringify({
+              runId: orphanRunId,
+              threadId: parentThreadId,
+              taskId: null,
+              name: "TasklessGate",
+              scriptPath: orphanScriptPath,
+              journalPath: orphanJournalPath,
+              startedAt: 0,
+              status: "cancelled",
+              cleanupPending: true,
+              usage: {
+                agents: 1,
+                done: 0,
+                errors: 0,
+                empty: 0,
+                cached: 0,
+                tokens: 0,
+                durationMs: 0,
+              },
+            }),
+          );
+
+          return {
+            runId,
+            scriptPath,
+            metaPath,
+            childThreadId: child.childThreadId,
+            orphanRunId,
+            orphanMetaPath,
+            orphanChildThreadId: orphanChild.childThreadId,
+          };
+        }).pipe(Effect.provide(harness1.layerToolkit));
+
+        let failChildStops = true;
+        const stopAttemptFailed = yield* Queue.unbounded<void>();
+        const harness2 = yield* makeWorkflowHarness({
+          name: "stop-terminal-gate-verify",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+          wrapThreadManagement: (tm) => ({
+            ...tm,
+            cancelDelegatedTask: (input) =>
+              failChildStops
+                ? Queue.offer(stopAttemptFailed, undefined).pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new Orchestrator.OrchestratorDispatchError({
+                          commandId: input.command.commandId,
+                          commandType: input.command.type,
+                          cause: "child stop temporarily unavailable",
+                        }),
+                      ),
+                    ),
+                  )
+                : tm.cancelDelegatedTask(input),
+          }),
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+
+          // Terminal row: unconfirmed child stop returns orchestration_error and preserves cleanupPending.
+          const firstStopFiber = yield* callTool("t3_workflow_stop", { runId: seeded.runId }).pipe(
+            Effect.forkScoped,
+          );
+          for (const delay of [50, 100, 200, 400, 800]) {
+            yield* Queue.take(stopAttemptFailed);
+            yield* TestClock.adjust(`${delay} millis`);
+          }
+          yield* Queue.take(stopAttemptFailed);
+          const firstStop = yield* Fiber.join(firstStopFiber);
+          expect(declaredFailure(firstStop).code).toBe("orchestration_error");
+
+          const stillPendingMeta = JSON.parse(yield* fs.readFileString(seeded.metaPath)) as {
+            cleanupPending?: boolean;
+          };
+          expect(stillPendingMeta.cleanupPending).toBe(true);
+
+          const refusedResume = yield* callTool("t3_workflow_run", {
+            scriptPath: seeded.scriptPath,
+            resumeFromRunId: seeded.runId,
+          });
+          expect(declaredFailure(refusedResume).code).toBe("invalid_request");
+          expect(declaredFailure(refusedResume).message).toMatch(/cleanup pending/i);
+
+          // Taskless row with journal child also fails closed while its journal child cannot be confirmed stopped.
+          const orphanStopFiber = yield* callTool("t3_workflow_stop", {
+            runId: seeded.orphanRunId,
+          }).pipe(Effect.forkScoped);
+          for (const delay of [50, 100, 200, 400, 800]) {
+            yield* Queue.take(stopAttemptFailed);
+            yield* TestClock.adjust(`${delay} millis`);
+          }
+          yield* Queue.take(stopAttemptFailed);
+          const orphanFirstStop = yield* Fiber.join(orphanStopFiber);
+          expect(declaredFailure(orphanFirstStop).code).toBe("orchestration_error");
+          const orphanStillPending = JSON.parse(
+            yield* fs.readFileString(seeded.orphanMetaPath),
+          ) as { cleanupPending?: boolean };
+          expect(orphanStillPending.cleanupPending).toBe(true);
+
+          // Lift the failure: second stop confirms child stops, clears cleanupPending, and allows resume.
+          failChildStops = false;
+          const secondStop = yield* callTool("t3_workflow_stop", { runId: seeded.runId });
+          expect(secondStop.isError).not.toBe(true);
+          expect(secondStop.structuredContent).toEqual({
+            runId: seeded.runId,
+            status: "failed",
+          });
+          const clearedMeta = JSON.parse(yield* fs.readFileString(seeded.metaPath)) as {
+            status: string;
+            cleanupPending?: boolean;
+          };
+          expect(clearedMeta.status).toBe("failed");
+          expect(clearedMeta.cleanupPending).toBeUndefined();
+
+          const orphanSecondStop = yield* callTool("t3_workflow_stop", {
+            runId: seeded.orphanRunId,
+          });
+          expect(orphanSecondStop.isError).not.toBe(true);
+          expect(orphanSecondStop.structuredContent).toEqual({
+            runId: seeded.orphanRunId,
+            status: "cancelled",
+          });
+          const orphanClearedMeta = JSON.parse(yield* fs.readFileString(seeded.orphanMetaPath)) as {
+            status: string;
+            cleanupPending?: boolean;
+          };
+          expect(orphanClearedMeta.status).toBe("cancelled");
+          expect(orphanClearedMeta.cleanupPending).toBeUndefined();
+
+          const beforeResumeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+          const resumedCall = yield* callTool("t3_workflow_run", {
+            scriptPath: seeded.scriptPath,
+            resumeFromRunId: seeded.runId,
+          });
+          expect(resumedCall.isError).not.toBe(true);
+          const resumed = yield* decodeRunResult(resumedCall.structuredContent);
+          const resumedTurn = yield* Queue.take(harness2.turnQueue);
+          yield* resumedTurn.complete("after-gate-cleared");
+          const resumedTerminal = yield* awaitWorkflowTerminal(resumed.taskId, beforeResumeSeq);
+          expect(resumedTerminal.status).toBe("completed");
+          expect(resumedTerminal.result).toContain('"out":"after-gate-cleared"');
+        }).pipe(Effect.provide(harness2.layerToolkit));
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "rejects oversized scriptPath files in run and nested workflow() without reading them whole",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempDir = yield* fs.realPath(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-oversized-script-" }),
+        );
+        const oversizedPath = path.join(tempDir, "oversized.js");
+        const growingPath = path.join(tempDir, "growing.js");
+        const fiveMiB = 5 * 1024 * 1024;
+        yield* Effect.scoped(
+          Effect.gen(function* () {
+            const sparse = yield* fs.open(oversizedPath, { flag: "w" });
+            yield* sparse.truncate(fiveMiB);
+            const growing = yield* fs.open(growingPath, { flag: "w" });
+            yield* growing.truncate(fiveMiB);
+          }),
+        );
+
+        let oversizedReadCalls = 0;
+        let growingBytesRead = 0;
+        const harness = yield* makeWorkflowHarness({
+          name: "oversized-script-path",
+          wrapFileSystem: (fsService) => ({
+            ...fsService,
+            open: (filePath, options) =>
+              fsService.open(filePath, options).pipe(
+                Effect.map((file) => {
+                  if (filePath === oversizedPath) {
+                    return {
+                      ...file,
+                      stat: file.stat,
+                      read: (buffer, readOptions) => {
+                        oversizedReadCalls += 1;
+                        return file.read(buffer, readOptions);
+                      },
+                      readAlloc: (size, readOptions) => {
+                        oversizedReadCalls += 1;
+                        return file.readAlloc(size, readOptions);
+                      },
+                    };
+                  }
+                  if (filePath === growingPath) {
+                    return {
+                      ...file,
+                      stat: file.stat.pipe(
+                        Effect.map((info) => ({ ...info, size: ByteSize.bytes(16) })),
+                      ),
+                      readAlloc: (size, readOptions) =>
+                        file.readAlloc(size, readOptions).pipe(
+                          Effect.tap((chunk) =>
+                            Effect.sync(() => {
+                              if (Option.isSome(chunk)) {
+                                growingBytesRead += chunk.value.byteLength;
+                              }
+                            }),
+                          ),
+                        ),
+                    };
+                  }
+                  return file;
+                }),
+              ),
+          }),
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "oversized-script-path");
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          // 1. Top-level t3_workflow_run rejects oversized scriptPath via stat without reading any bytes.
+          const topLevel = yield* callTool("t3_workflow_run", { scriptPath: oversizedPath });
+          const topLevelErr = declaredFailure(topLevel);
+          expect(topLevelErr.code).toBe("invalid_request");
+          expect(topLevelErr.message).toBe(
+            `Workflow script at ${oversizedPath} exceeds the 4 MiB limit.`,
+          );
+          expect(oversizedReadCalls).toBe(0);
+
+          // 2. A file that grows past 4 MiB after stat is rejected after reading at most 4 MiB + 1 byte.
+          const growing = yield* callTool("t3_workflow_run", { scriptPath: growingPath });
+          const growingErr = declaredFailure(growing);
+          expect(growingErr.code).toBe("invalid_request");
+          expect(growingErr.message).toBe(
+            `Workflow script at ${growingPath} exceeds the 4 MiB limit.`,
+          );
+          expect(growingBytesRead).toBe(4 * 1024 * 1024 + 1);
+
+          // 3. Nested workflow({ scriptPath }) rejects with WorkflowScriptError and the same text without reading.
+          const nestedCaller = `
+            export const meta = {
+              name: "NestedOversized",
+              description: "Loads an oversized nested script.",
+            };
+            try {
+              await workflow({ scriptPath: ${JSON.stringify(oversizedPath)} });
+            } catch (err) {
+              if (err && err.name === "WorkflowScriptError") {
+                throw err;
+              }
+              throw new Error("wrong-error-kind:" + String(err && err.name));
+            }
+            return "unexpected";
+          `;
+          const nestedCall = yield* callTool("t3_workflow_run", { script: nestedCaller });
+          expect(nestedCall.isError).not.toBe(true);
+          const started = yield* decodeRunResult(nestedCall.structuredContent);
+
+          const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
+          expect(terminal.status).toBe("failed");
+          expect(terminal.result).toContain(
+            `Workflow script at ${oversizedPath} exceeds the 4 MiB limit.`,
+          );
+          expect(oversizedReadCalls).toBe(0);
         }).pipe(Effect.provide(harness.layerToolkit));
       }).pipe(Effect.provide(NodeServices.layer)),
   );

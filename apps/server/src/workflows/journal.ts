@@ -9,6 +9,7 @@ import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
 export const MAX_PENDING_JOURNAL_ENTRIES = 1_024;
+export const MAX_PENDING_JOURNAL_BYTES = 16 * 1024 * 1024;
 
 export class JournalEncodeError extends Schema.TaggedError<JournalEncodeError>()(
   "JournalEncodeError",
@@ -263,7 +264,8 @@ export function replayCursor(previous: ReadonlyArray<JournalEntry>): ReplayCurso
 }
 
 type JournalQueueItem =
-  | { readonly _tag: "entry"; readonly entry: JournalEntry }
+  | { readonly _tag: "entry"; readonly line: string; readonly bytes: number }
+  | { readonly _tag: "encodeError"; readonly error: JournalEncodeError }
   | { readonly _tag: "flush"; readonly done: Deferred.Deferred<void> };
 
 export interface JournalWriter {
@@ -272,6 +274,20 @@ export interface JournalWriter {
   readonly flush: Effect.Effect<void>;
   readonly close: Effect.Effect<void>;
   readonly pendingCount: Effect.Effect<number>;
+  readonly pendingBytes: Effect.Effect<number>;
+}
+
+function tryEncode(
+  entry: JournalEntry,
+):
+  | { readonly ok: true; readonly line: string; readonly bytes: number }
+  | { readonly ok: false; readonly error: JournalEncodeError } {
+  try {
+    const line = encodeJournalEntry(entry);
+    return { ok: true, line, bytes: Buffer.byteLength(line, "utf8") };
+  } catch (cause) {
+    return { ok: false, error: new JournalEncodeError({ cause }) };
+  }
 }
 
 export const makeJournalWriter = Effect.fn("WorkflowJournal.makeJournalWriter")(function* <
@@ -280,12 +296,84 @@ export const makeJournalWriter = Effect.fn("WorkflowJournal.makeJournalWriter")(
   readonly writeLine: (line: string) => Effect.Effect<void, E>;
   readonly onWriteError?: (error: E | JournalEncodeError) => Effect.Effect<void>;
   readonly maxPending?: number;
+  readonly maxPendingBytes?: number;
 }): Effect.fn.Return<JournalWriter, never, Scope.Scope> {
   const capacity = Math.max(1, Math.trunc(input.maxPending ?? MAX_PENDING_JOURNAL_ENTRIES));
+  const maxPendingBytes = Math.max(
+    1,
+    Math.trunc(input.maxPendingBytes ?? MAX_PENDING_JOURNAL_BYTES),
+  );
   const queue = yield* Queue.bounded<JournalQueueItem>(capacity);
   let closed = false;
   let inFlight = 0;
+  let waitingBytes = 0;
   const pendingFlushes = new Set<Deferred.Deferred<void>>();
+  interface ByteWaiter {
+    readonly needed: number;
+    readonly ready: Deferred.Deferred<boolean>;
+    granted: boolean;
+  }
+  const byteWaiters: Array<ByteWaiter> = [];
+
+  const canAdmitBytes = (bytes: number): boolean =>
+    waitingBytes + bytes <= maxPendingBytes || (bytes > maxPendingBytes && waitingBytes === 0);
+
+  const wakeByteWaiters = (): void => {
+    if (closed) {
+      while (byteWaiters.length > 0) {
+        const waiter = byteWaiters.shift()!;
+        Deferred.doneUnsafe(waiter.ready, Exit.succeed(false));
+      }
+      return;
+    }
+    while (byteWaiters.length > 0 && canAdmitBytes(byteWaiters[0]!.needed)) {
+      const waiter = byteWaiters.shift()!;
+      waiter.granted = true;
+      waitingBytes += waiter.needed;
+      Deferred.doneUnsafe(waiter.ready, Exit.succeed(true));
+    }
+  };
+
+  const releaseBytes = (bytes: number): void => {
+    waitingBytes = Math.max(0, waitingBytes - bytes);
+    wakeByteWaiters();
+  };
+
+  const acquireBytes = (bytes: number): Effect.Effect<boolean> =>
+    Effect.uninterruptibleMask((restore) =>
+      Effect.gen(function* () {
+        if (closed) return false;
+        if (byteWaiters.length === 0 && canAdmitBytes(bytes)) {
+          waitingBytes += bytes;
+          return true;
+        }
+        const waiter: ByteWaiter = {
+          needed: bytes,
+          ready: yield* Deferred.make<boolean>(),
+          granted: false,
+        };
+        byteWaiters.push(waiter);
+        const exit = yield* Effect.exit(restore(Deferred.await(waiter.ready)));
+        if (Exit.isSuccess(exit)) {
+          if (exit.value) {
+            if (closed) {
+              releaseBytes(bytes);
+              return false;
+            }
+            return true;
+          }
+          return false;
+        }
+        const index = byteWaiters.indexOf(waiter);
+        if (index !== -1) {
+          byteWaiters.splice(index, 1);
+          wakeByteWaiters();
+        } else if (waiter.granted) {
+          releaseBytes(bytes);
+        }
+        return yield* exit;
+      }),
+    );
 
   const resolvePendingFlushes = Effect.sync(() => {
     for (const done of pendingFlushes) {
@@ -304,18 +392,28 @@ export const makeJournalWriter = Effect.fn("WorkflowJournal.makeJournalWriter")(
         Deferred.doneUnsafe(item.done, Exit.void);
         continue;
       }
+      if (item._tag === "encodeError") {
+        inFlight += 1;
+        yield* (
+          input.onWriteError !== undefined ? input.onWriteError(item.error) : Effect.void
+        ).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              inFlight -= 1;
+            }),
+          ),
+        );
+        continue;
+      }
       inFlight += 1;
-      yield* Effect.try({
-        try: () => encodeJournalEntry(item.entry),
-        catch: (cause) => new JournalEncodeError({ cause }),
-      }).pipe(
-        Effect.flatMap((line) => input.writeLine(line)),
+      yield* input.writeLine(item.line).pipe(
         Effect.catch((error) =>
           input.onWriteError !== undefined ? input.onWriteError(error) : Effect.void,
         ),
         Effect.ensuring(
           Effect.sync(() => {
             inFlight -= 1;
+            releaseBytes(item.bytes);
           }),
         ),
       );
@@ -325,21 +423,62 @@ export const makeJournalWriter = Effect.fn("WorkflowJournal.makeJournalWriter")(
   const close = Effect.gen(function* () {
     if (closed) return;
     closed = true;
+    wakeByteWaiters();
     yield* Queue.shutdown(queue);
     yield* Fiber.interrupt(writerFiber);
+    waitingBytes = 0;
     yield* resolvePendingFlushes;
   });
 
   yield* Effect.addFinalizer(() => close);
 
   const append = (entry: JournalEntry): Effect.Effect<boolean> =>
-    Effect.suspend(() =>
-      closed ? Effect.succeed(false) : Queue.offer(queue, { _tag: "entry", entry }),
-    );
+    Effect.suspend(() => {
+      if (closed) return Effect.succeed(false);
+      const encoded = tryEncode(entry);
+      if (!encoded.ok) {
+        return Queue.offer(queue, { _tag: "encodeError", error: encoded.error });
+      }
+      return Effect.uninterruptibleMask((restore) =>
+        Effect.gen(function* () {
+          const acquired = yield* restore(acquireBytes(encoded.bytes));
+          if (!acquired) return false;
+          const offeredExit = yield* Effect.exit(
+            restore(
+              Queue.offer(queue, {
+                _tag: "entry",
+                line: encoded.line,
+                bytes: encoded.bytes,
+              }),
+            ),
+          );
+          if (Exit.isFailure(offeredExit)) {
+            releaseBytes(encoded.bytes);
+            return yield* offeredExit;
+          }
+          if (!offeredExit.value) {
+            releaseBytes(encoded.bytes);
+            return false;
+          }
+          return true;
+        }),
+      );
+    });
 
   const tryAppend = (entry: JournalEntry): boolean => {
     if (closed) return false;
-    return Queue.offerUnsafe(queue, { _tag: "entry", entry });
+    const encoded = tryEncode(entry);
+    if (!encoded.ok) {
+      return Queue.offerUnsafe(queue, { _tag: "encodeError", error: encoded.error });
+    }
+    if (byteWaiters.length > 0 || waitingBytes + encoded.bytes > maxPendingBytes) {
+      return false;
+    }
+    if (!Queue.offerUnsafe(queue, { _tag: "entry", line: encoded.line, bytes: encoded.bytes })) {
+      return false;
+    }
+    waitingBytes += encoded.bytes;
+    return true;
   };
 
   const flush: Effect.Effect<void> = Effect.gen(function* () {
@@ -355,6 +494,7 @@ export const makeJournalWriter = Effect.fn("WorkflowJournal.makeJournalWriter")(
   });
 
   const pendingCount = Queue.size(queue).pipe(Effect.map((size) => size + inFlight));
+  const pendingBytes = Effect.sync(() => waitingBytes);
 
   return {
     append,
@@ -362,5 +502,6 @@ export const makeJournalWriter = Effect.fn("WorkflowJournal.makeJournalWriter")(
     flush,
     close,
     pendingCount,
+    pendingBytes,
   };
 });

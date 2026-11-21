@@ -552,6 +552,7 @@ it.effect.each([
   "running-delegated-capped",
   "running-delegated-snoozed",
   "running-delegated-stopped",
+  "running-delegated-workflow",
   "running-resume",
 ] as const)("recovers $0 work after restart", (scenario) => {
   const status = scenario.startsWith("starting")
@@ -567,12 +568,16 @@ it.effect.each([
     scenario === "running-delegated-capped" ||
     scenario === "running-delegated-snoozed" ||
     scenario === "running-delegated-stopped" ||
+    scenario === "running-delegated-workflow" ||
     scenario === "running-resume";
   const startedAt =
     status === "running" || scenario === "starting-steered"
       ? DateTime.makeUnsafe("2026-11-01T19:34:40.403Z")
       : null;
   const threadId = ThreadId.make("thread_queued_restart");
+  const workflowParentThreadId = ThreadId.make("thread_queued_restart_workflow_parent");
+  const workflowNodeId = NodeId.make("node_queued_restart_workflow");
+  const workflowAgentTaskId = NodeId.make("node_queued_restart_workflow_agent");
   const runId = RunId.make("run_queued_restart");
   const attemptId = RunAttemptId.make("attempt_queued_restart");
   const steeredAttemptId = RunAttemptId.make("attempt_queued_restart_steered");
@@ -590,7 +595,14 @@ it.effect.each([
         scenario === "running-delegated-snoozed"
           ? DateTime.makeUnsafe("2099-07-25T09:00:00.000Z")
           : null,
-      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      lineage:
+        scenario === "running-delegated-workflow"
+          ? {
+              parentThreadId: workflowParentThreadId,
+              relationshipToParent: "subagent",
+              rootThreadId: workflowParentThreadId,
+            }
+          : { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
       forkedFrom: null,
       ...(scenario === "running-resume"
         ? {
@@ -636,6 +648,9 @@ it.effect.each([
         userMessageId: MessageId.make("message_queued_restart"),
         queuePosition: 1,
         providerInstanceId: ProviderInstanceId.make("codex"),
+        ...(scenario === "running-delegated-workflow"
+          ? { delegatedTaskId: workflowAgentTaskId }
+          : {}),
         ...(scenario === "running-resume"
           ? { usageLimitContinuationOfRunId: RunId.make("run_queued_restart_limited") }
           : {}),
@@ -729,7 +744,35 @@ it.effect.each([
                   .map((message) => [message.id, message]),
               ),
             ),
-          getThreadRecords: () => Effect.succeed(projection),
+          getThreadRecords: (requestedThreadId, _fields, filter) =>
+            Effect.succeed(
+              scenario === "running-delegated-workflow" &&
+                requestedThreadId === workflowParentThreadId
+                ? ({
+                    thread: { id: workflowParentThreadId },
+                    subagents: [
+                      {
+                        id: workflowAgentTaskId,
+                        parentNodeId: workflowNodeId,
+                        runId: RunId.make("run_queued_restart_workflow_parent"),
+                        result: null,
+                        status: "running",
+                      },
+                      {
+                        id: workflowNodeId,
+                        origin: "app_owned",
+                        childThreadId: null,
+                        status: "running",
+                        workflow: { phases: [], agents: [], stopRequestedAt: 1 },
+                      },
+                    ].filter(
+                      (task) =>
+                        filter?.subagentIds === undefined || filter.subagentIds.includes(task.id),
+                    ),
+                    turnItems: [],
+                  } as unknown as OrchestrationV2ThreadProjection)
+                : projection,
+            ),
         }),
         Layer.mock(EventSink.EventSinkV2)({
           commitCommand: (input) => {
