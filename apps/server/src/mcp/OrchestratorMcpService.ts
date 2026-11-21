@@ -184,6 +184,10 @@ export interface OrchestratorMcpServiceShape {
     scope: McpInvocationScope,
     input: OrchestratorMcpDelegateTaskInput,
   ) => Effect.Effect<OrchestratorMcpDelegateTaskResult, OrchestratorMcpFailure>;
+  readonly resolveWorkflowAgentModelSelection: (
+    scope: McpThreadInvocationScope,
+    target: OrchestratorMcpTarget | undefined,
+  ) => Effect.Effect<ModelSelection, OrchestratorMcpFailure>;
   readonly delegateWorkflowAgent: (
     scope: McpThreadInvocationScope,
     input: {
@@ -1864,6 +1868,20 @@ const make = Effect.gen(function* () {
         candidate.origin === "app_owned" &&
         candidate.threadId === scope.thread.threadId,
     );
+    if (
+      task !== undefined &&
+      task.workflow !== undefined &&
+      task.childThreadId === null &&
+      task.remoteChild === undefined
+    ) {
+      const workflowRunId = task.workflow.runHandles?.runId;
+      return yield* failure(
+        "invalid_request",
+        workflowRunId === undefined
+          ? `Task ${taskId} is a workflow run. Call t3_workflow_status with its runId.`
+          : `Task ${taskId} is a workflow run. Call t3_workflow_status with runId ${workflowRunId}.`,
+      );
+    }
     if (task === undefined || (task.childThreadId === null && task.remoteChild === undefined)) {
       return yield* taskNotFound(scope, taskId);
     }
@@ -3062,6 +3080,20 @@ const make = Effect.gen(function* () {
             ? awaitTask(scope, taskId, key, input.timeoutMs, restore)
             : restore(readTask(scope, taskId, false, true)),
       });
+    }),
+    resolveWorkflowAgentModelSelection: Effect.fn(
+      "OrchestratorMcpService.resolveWorkflowAgentModelSelection",
+    )(function* (scope, target) {
+      yield* requireCapability(scope);
+      const parent = yield* loadCallerRecords(scope.thread.threadId, []);
+      const providers = yield* loadProviders;
+      const resolved = yield* resolveTargetRechecking({
+        parent,
+        target,
+        providers,
+        cwd: yield* parentWorkspaceCwd(parent),
+      });
+      return resolved.modelSelection;
     }),
     delegateWorkflowAgent: Effect.fn("OrchestratorMcpService.delegateWorkflowAgent")(
       function* (scope, input) {

@@ -15,7 +15,7 @@ export type JournalEntry =
       readonly type: "result";
       readonly index: number;
       readonly key: string;
-      readonly outcome: "ok" | "null" | "usage_limited";
+      readonly outcome: "ok" | "null" | "usage_limited" | "cancelled";
       readonly value: unknown;
       readonly cached?: true;
     }
@@ -131,7 +131,8 @@ function isJournalEntry(value: unknown): value is JournalEntry {
         typeof record.key === "string" &&
         (record.outcome === "ok" ||
           record.outcome === "null" ||
-          record.outcome === "usage_limited") &&
+          record.outcome === "usage_limited" ||
+          record.outcome === "cancelled") &&
         (record.cached === undefined || record.cached === true)
       );
     case "phase":
@@ -193,7 +194,7 @@ export function decodeJournal(text: string): ReadonlyArray<JournalEntry> {
 
 interface RecordedResult {
   readonly key: string;
-  readonly outcome: "ok" | "null" | "usage_limited";
+  readonly outcome: "ok" | "null" | "usage_limited" | "cancelled";
   readonly value: unknown;
 }
 
@@ -224,7 +225,11 @@ export function replayCursor(previous: ReadonlyArray<JournalEntry>): ReplayCurso
       }
 
       const previousResult = results.get(index);
-      if (previousResult === undefined || previousResult.key !== key) {
+      if (
+        previousResult === undefined ||
+        previousResult.key !== key ||
+        previousResult.outcome === "cancelled"
+      ) {
         broken = true;
         return { cached: false };
       }

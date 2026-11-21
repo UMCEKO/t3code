@@ -63,6 +63,7 @@ describe("journal", () => {
         { type: "result", index: 0, key: "k0", outcome: "ok", value: { files: ["a.ts"] } },
         { type: "result", index: 1, key: "k1", outcome: "null", value: null, cached: true },
         { type: "result", index: 2, key: "k2", outcome: "usage_limited", value: null },
+        { type: "result", index: 3, key: "k3", outcome: "cancelled", value: null },
         { type: "end", status: "completed", result: { ok: true } },
       ];
 
@@ -138,6 +139,19 @@ describe("journal", () => {
           agentId: "a1",
           childThreadId: "t1",
         },
+        { type: "result", index: 2, key: "k2", outcome: "ok", value: "r2" },
+      ];
+
+      const cursor = replayCursor(previous);
+      expect(cursor.take(0, "k0")).toEqual({ cached: true, value: "r0" });
+      expect(cursor.take(1, "k1")).toEqual({ cached: false });
+      expect(cursor.take(2, "k2")).toEqual({ cached: false });
+    });
+
+    it("treats cancelled results as unfinished and ends cache reuse for later calls", () => {
+      const previous: ReadonlyArray<JournalEntry> = [
+        { type: "result", index: 0, key: "k0", outcome: "ok", value: "r0" },
+        { type: "result", index: 1, key: "k1", outcome: "cancelled", value: null },
         { type: "result", index: 2, key: "k2", outcome: "ok", value: "r2" },
       ];
 
