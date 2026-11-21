@@ -119,6 +119,19 @@ export const restartStopRequested = Effect.fn("RestartContinuation.restartStopRe
     const task = (yield* getThreadRecords(lineage.parentThreadId, ["subagents"], {
       subagentIds: [taskId],
     })).subagents.find((candidate) => candidate.id === taskId);
+    if (task !== undefined) {
+      const owner = (yield* getThreadRecords(lineage.parentThreadId, ["subagents"], {
+        subagentIds: [task.parentNodeId],
+      })).subagents.find((candidate) => candidate.id === task.parentNodeId);
+      // A server workflow that is stopping or ended owns its agents' threads: nothing resumes there.
+      if (
+        owner?.origin === "app_owned" &&
+        owner.childThreadId === null &&
+        owner.workflow !== undefined &&
+        (owner.workflow.stopRequestedAt !== undefined || !isOrchestrationV2WorkActive(owner.status))
+      )
+        return true;
+    }
     // A settled task no longer owns later work in its thread.
     if (
       task === undefined ||

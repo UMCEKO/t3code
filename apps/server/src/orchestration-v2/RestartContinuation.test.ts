@@ -22,7 +22,11 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as ServerSettings from "../serverSettings.ts";
-import { restartContinuationRun, continueRestartedRun } from "./RestartContinuation.ts";
+import {
+  restartContinuationRun,
+  continueRestartedRun,
+  restartStopRequested,
+} from "./RestartContinuation.ts";
 import { continuationStartRetryDelayMs } from "./RestartBackgroundNote.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
@@ -1477,5 +1481,56 @@ it.effect("skips restart discovery when no project enables continuation", () =>
     );
     yield* recovery.prepareForShutdown;
     yield* recovery.prepareForShutdown;
+  }),
+);
+
+it.effect("treats a stopping or ended server workflow as a stop for its agents' threads", () =>
+  Effect.gen(function* () {
+    const parentThreadId = "thread:parent";
+    const workflowTask = (status: string, stopRequestedAt?: number) => ({
+      id: "node:workflow",
+      origin: "app_owned",
+      childThreadId: null,
+      status,
+      workflow: {
+        phases: [],
+        agents: [],
+        ...(stopRequestedAt === undefined ? {} : { stopRequestedAt }),
+      },
+    });
+    const agentTask = {
+      id: "node:agent",
+      parentNodeId: "node:workflow",
+      runId: "run:parent",
+      result: null,
+      status: "running",
+    };
+    const check = (owner: ReturnType<typeof workflowTask>) =>
+      restartStopRequested<never>(
+        ((
+          threadId: string,
+          fields: ReadonlyArray<string>,
+          filter: { readonly subagentIds?: ReadonlyArray<string> },
+        ) =>
+          Effect.succeed(
+            fields.includes("subagents")
+              ? {
+                  subagents:
+                    threadId !== parentThreadId
+                      ? []
+                      : [agentTask, owner].filter((task) => filter.subagentIds?.includes(task.id)),
+                }
+              : { turnItems: [] },
+          )) as never,
+        {
+          id: "thread:agent",
+          lineage: { relationshipToParent: "subagent", parentThreadId },
+          forkedFrom: null,
+        } as never,
+        { id: "run:agent", delegatedTaskId: "node:agent" } as never,
+      );
+    assert.isFalse(yield* check(workflowTask("running")));
+    assert.isTrue(yield* check(workflowTask("running", 1)));
+    assert.isTrue(yield* check(workflowTask("failed")));
   }),
 );

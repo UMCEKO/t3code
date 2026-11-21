@@ -7423,7 +7423,10 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
           }
         : undefined,
     );
-    if (command.dispatchMode.type === "queue_after_active") {
+    if (
+      command.dispatchMode.type === "queue_after_active" ||
+      command.restartContinuationOfRunId !== undefined
+    ) {
       yield* ensureOwningWorkflowAdmitting(command, projection.thread);
     }
     if (command.steerFollowUpOfRunId !== undefined) {
