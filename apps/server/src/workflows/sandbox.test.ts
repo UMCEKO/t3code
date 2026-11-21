@@ -1,18 +1,26 @@
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- Probes the real child process ulimit on Linux.
+import * as NodeChildProcess from "node:child_process";
+
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
+  MAX_PHASE_MESSAGE_BYTES,
   WORKFLOW_LIMITS,
   WORKFLOW_MESSAGE_LIMITS,
   WORKFLOW_PROGRESS_LIMITS,
-  WORKFLOW_WORKER_RESOURCE_LIMITS,
+  WORKFLOW_SANDBOX_PROCESS_LIMITS,
   WorkflowScriptError,
+  buildWorkflowSandboxCommand,
+  createWorkflowHostMessageReceiver,
+  makeBoundedLineSplitter,
   parseWorkflowMeta,
   runWorkflowScript,
   workflowConcurrency,
   type WorkflowAgentCall,
   type WorkflowHost,
 } from "./sandbox.ts";
-import { makeWorkflowProgressBudget } from "./sandboxWorker.ts";
+import { makeWorkflowProgressBudget, type WorkflowProgressLimits } from "./sandboxWorker.ts";
 
 function makeScript(body: string, meta = `{ name: "test", description: "test workflow" }`): string {
   return `export const meta = ${meta};\n${body}`;
@@ -406,6 +414,7 @@ describe("sandbox", () => {
         script: makeScript(`
           return {
             process: typeof process,
+            Buffer: typeof Buffer,
             require: typeof require,
             fetch: typeof fetch,
             setTimeout: typeof setTimeout,
@@ -419,6 +428,7 @@ describe("sandbox", () => {
       });
       expect(globals).toEqual({
         process: "undefined",
+        Buffer: "undefined",
         require: "undefined",
         fetch: "undefined",
         setTimeout: "undefined",
@@ -984,10 +994,13 @@ describe("sandbox", () => {
     });
 
     it("rejects out-of-memory allocations without crashing the host process", async () => {
-      expect(WORKFLOW_WORKER_RESOURCE_LIMITS.maxOldGenerationSizeMb).toBeLessThanOrEqual(256);
-      expect(WORKFLOW_WORKER_RESOURCE_LIMITS.maxYoungGenerationSizeMb).toBeLessThanOrEqual(32);
-      expect(WORKFLOW_WORKER_RESOURCE_LIMITS.codeRangeSizeMb).toBeLessThanOrEqual(16);
-      expect(WORKFLOW_WORKER_RESOURCE_LIMITS.stackSizeMb).toBeLessThanOrEqual(4);
+      expect(WORKFLOW_SANDBOX_PROCESS_LIMITS.maxOldSpaceSizeMb).toBeLessThanOrEqual(256);
+      expect(WORKFLOW_SANDBOX_PROCESS_LIMITS.maxSemiSpaceSizeMb).toBeLessThanOrEqual(16);
+      expect(WORKFLOW_SANDBOX_PROCESS_LIMITS.rlimitDataKiB).toBe(1024 * 1024);
+      expect(WORKFLOW_SANDBOX_PROCESS_LIMITS.nodeFlags).toEqual([
+        "--max-old-space-size=256",
+        "--max-semi-space-size=16",
+      ]);
 
       await expect(
         runWorkflowScript({
@@ -1003,8 +1016,95 @@ describe("sandbox", () => {
           concurrency: 1,
           syncTimeoutMs: 5_000,
         }),
-      ).rejects.toThrow(/ERR_WORKER_OUT_OF_MEMORY|memory limit/i);
+      ).rejects.toThrow(/exceeded its memory limit or crashed/i);
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`return "still-alive";`),
+          args: {},
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).resolves.toBe("still-alive");
     });
+
+    it("builds OS-appropriate sandbox commands with heap flags and non-Windows ulimit", () => {
+      const linuxCmd = buildWorkflowSandboxCommand({
+        platform: "linux",
+        execPath: "/usr/bin/node",
+        bootstrap: "boot()",
+      });
+      expect(linuxCmd).toEqual({
+        command: "/bin/sh",
+        args: [
+          "-c",
+          'ulimit -d 1048576 && exec "$0" "$@"',
+          "/usr/bin/node",
+          "--max-old-space-size=256",
+          "--max-semi-space-size=16",
+          "-e",
+          "boot()",
+        ],
+      });
+
+      const darwinCmd = buildWorkflowSandboxCommand({
+        platform: "darwin",
+        execPath: "/opt/node",
+        bootstrap: "boot()",
+      });
+      expect(darwinCmd.command).toBe("/bin/sh");
+      expect(darwinCmd.args[1]).toBe('ulimit -d 1048576 && exec "$0" "$@"');
+
+      const winCmd = buildWorkflowSandboxCommand({
+        platform: "win32",
+        execPath: "C:\\Program Files\\nodejs\\node.exe",
+        bootstrap: "boot()",
+      });
+      expect(winCmd).toEqual({
+        command: "C:\\Program Files\\nodejs\\node.exe",
+        args: ["--max-old-space-size=256", "--max-semi-space-size=16", "-e", "boot()"],
+      });
+    });
+
+    it.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
+      "runs the sandbox child under the 1 GiB data rlimit on Linux",
+      async () => {
+        const { command, args } = buildWorkflowSandboxCommand();
+        const child = NodeChildProcess.spawn(command, args, {
+          stdio: ["pipe", "pipe", "pipe"],
+          env: { ELECTRON_RUN_AS_NODE: "1" },
+          windowsHide: true,
+        });
+        const stdoutChunks: Array<Buffer> = [];
+        child.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
+        child.stderr.resume();
+
+        const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
+          (resolve, reject) => {
+            child.once("error", reject);
+            child.once("close", (code, signal) => resolve({ code, signal }));
+          },
+        );
+
+        const probeSource = `
+          const fs = require("node:fs");
+          const line = fs
+            .readFileSync("/proc/self/limits", "utf8")
+            .split("\\n")
+            .find((entry) => entry.startsWith("Max data size"));
+          process.stdout.write((line ?? "") + "\\n");
+          process.exit(0);
+        `;
+        child.stdin.end(`${JSON.stringify(probeSource)}\n`);
+
+        const { code, signal } = await exitPromise;
+        expect(signal).toBeNull();
+        expect(code).toBe(0);
+        const expectedBytes = String(WORKFLOW_SANDBOX_PROCESS_LIMITS.rlimitDataKiB * 1024);
+        const limitsLine = Buffer.concat(stdoutChunks).toString("utf8").trim();
+        expect(limitsLine).toContain(expectedBytes);
+      },
+    );
 
     it("rejects oversized messages on both sides of the worker boundary", async () => {
       const overPrompt = WORKFLOW_MESSAGE_LIMITS.maxPromptBytes + 1;
@@ -1171,9 +1271,112 @@ describe("sandbox", () => {
       }
     });
 
-    it("rejects an oversized script before scanning it", () => {
-      const script = "x".repeat(WORKFLOW_MESSAGE_LIMITS.maxValueBytes + 1);
-      expect(() => parseWorkflowMeta(script)).toThrow(/exceeds the 4 MiB limit/);
+    it("rejects an oversized script before scanning it, counting UTF-8 bytes", () => {
+      const asciiOver = "x".repeat(WORKFLOW_MESSAGE_LIMITS.maxValueBytes + 1);
+      expect(() => parseWorkflowMeta(asciiOver)).toThrow(/exceeds the 4 MiB limit/);
+
+      const utf8Over = `export const meta = { name: "ok", description: "ok" };\n// ${"é".repeat(2 * 1024 * 1024)}`;
+      expect(utf8Over.length).toBeLessThan(WORKFLOW_MESSAGE_LIMITS.maxValueBytes);
+      expect(Buffer.byteLength(utf8Over, "utf8")).toBeGreaterThan(
+        WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+      );
+      expect(() => parseWorkflowMeta(utf8Over)).toThrow(WorkflowScriptError);
+      expect(() => parseWorkflowMeta(utf8Over)).toThrow(/exceeds the 4 MiB limit/);
+    });
+
+    it("rejects meta.phases past the entry count, title byte, and 64 KiB total byte caps", async () => {
+      const tooManyEntries = Array.from(
+        { length: WORKFLOW_PROGRESS_LIMITS.maxPhaseTitles + 1 },
+        (_, i) => `{ title: "P${i}" }`,
+      ).join(",");
+      expect(() =>
+        parseWorkflowMeta(
+          `export const meta = { name: "a", description: "d", phases: [${tooManyEntries}] };`,
+        ),
+      ).toThrow(/at most 256 entries/);
+
+      const longTitle = "é".repeat(WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes / 2 + 1);
+      expect(() =>
+        parseWorkflowMeta(
+          `export const meta = { name: "a", description: "d", phases: [{ title: "${longTitle}" }] };`,
+        ),
+      ).toThrow(/at most 1024 bytes/);
+
+      const bigDetail = "d".repeat(WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleTotalBytes);
+      const bigDetailScript = `export const meta = { name: "a", description: "d", phases: [{ title: "A", detail: "${bigDetail}" }] };`;
+      expect(() => parseWorkflowMeta(bigDetailScript)).toThrow(/64 KiB limit/);
+      await expect(
+        runWorkflowScript({
+          script: bigDetailScript,
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).rejects.toThrow(/64 KiB limit/);
+
+      const bigModel = "m".repeat(WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleTotalBytes);
+      expect(() =>
+        parseWorkflowMeta(
+          `export const meta = { name: "a", description: "d", phases: [{ title: "A", model: "${bigModel}" }] };`,
+        ),
+      ).toThrow(/64 KiB limit/);
+
+      const manyLargeTitles = Array.from(
+        { length: 65 },
+        (_, i) => `{ title: "${String(i).padStart(4, "0")}${"x".repeat(1020)}" }`,
+      ).join(",");
+      expect(() =>
+        parseWorkflowMeta(
+          `export const meta = { name: "a", description: "d", phases: [${manyLargeTitles}] };`,
+        ),
+      ).toThrow(/64 KiB limit/);
+    });
+
+    it("fails the run when an unterminated child stdout line exceeds 4 MiB", () => {
+      const lines: Array<{ readonly line: string; readonly bytes: number }> = [];
+      let overflowed = 0;
+      const splitter = makeBoundedLineSplitter({
+        maxLineBytes: WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+        onLine: (line, bytes) => lines.push({ line, bytes }),
+        onOverflow: () => {
+          overflowed += 1;
+        },
+      });
+      // Split a 2-byte UTF-8 sequence across chunks to verify byte-level buffering.
+      const encoded = Buffer.from('{"a":"é"}\n', "utf8");
+      const splitAt = encoded.indexOf(0xc3) + 1;
+      splitter.push(encoded.subarray(0, splitAt));
+      splitter.push(encoded.subarray(splitAt));
+      expect(lines).toEqual([{ line: '{"a":"é"}', bytes: encoded.byteLength - 1 }]);
+
+      const half = Buffer.alloc(WORKFLOW_MESSAGE_LIMITS.maxValueBytes / 2, 0x61);
+      splitter.push(half);
+      splitter.push(half);
+      expect(overflowed).toBe(0);
+      splitter.push(Buffer.from("x"));
+      expect(overflowed).toBe(1);
+
+      let hostError: unknown;
+      const receiver = createWorkflowHostMessageReceiver({
+        script: makeScript("return 1;"),
+        argsJson: undefined,
+        host: makeHost(),
+        concurrency: 1,
+        syncTimeoutMs: 5_000,
+        initialSpent: 0,
+        postToChild: () => true,
+        onIdleSettled: () => {},
+        onSucceed: () => {},
+        onFail: (err) => {
+          hostError = err;
+        },
+        isSettled: () => hostError !== undefined,
+      });
+      receiver.push(half);
+      receiver.push(half);
+      receiver.push(Buffer.from("z"));
+      expect(hostError).toBeInstanceOf(WorkflowScriptError);
+      expect((hostError as Error).message).toBe("Workflow message exceeded the 4 MiB limit.");
     });
 
     it("fails the run once the log budget is spent, even when the script catches", async () => {
@@ -1188,34 +1391,259 @@ describe("sandbox", () => {
       ).rejects.toThrow(/logs at most/);
     });
 
-    it("fails the run past the distinct phase budget", async () => {
-      const script = makeScript(`
+    it("fails the run past the distinct phase, title byte, and total phase byte budgets in worker", async () => {
+      const overDistinct = makeScript(`
         for (let i = 0; i <= ${WORKFLOW_PROGRESS_LIMITS.maxPhaseTitles}; i++) {
           try { phase("P" + i); } catch {}
         }
         return "done";
       `);
       await expect(
-        runWorkflowScript({ script, args: undefined, host: makeHost(), concurrency: 1 }),
+        runWorkflowScript({
+          script: overDistinct,
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+        }),
       ).rejects.toThrow(/distinct phases/);
+
+      const overSingleTitle = makeScript(`
+        try { phase("é".repeat(${WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes / 2 + 1})); } catch {}
+        return "done";
+      `);
+      await expect(
+        runWorkflowScript({
+          script: overSingleTitle,
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).rejects.toThrow(/at most 1024 bytes/);
+
+      const overTotalTitleBytes = makeScript(`
+        const pad = "x".repeat(1020);
+        for (let i = 0; i < 65; i++) {
+          try { phase(String(i).padStart(4, "0") + pad); } catch {}
+        }
+        return "done";
+      `);
+      await expect(
+        runWorkflowScript({
+          script: overTotalTitleBytes,
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).rejects.toThrow(/64 KiB limit/);
+
+      // Repeating a valid 1024-byte title counts bytes once per distinct title.
+      const repeatedTitle = makeScript(`
+        const title = "x".repeat(${WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes});
+        for (let i = 0; i < 100; i++) {
+          phase(title);
+        }
+        return "ok";
+      `);
+      await expect(
+        runWorkflowScript({
+          script: repeatedTitle,
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).resolves.toBe("ok");
+
+      const agentOverSingleTitle = makeScript(`
+        try {
+          await agent("p", { phase: "é".repeat(${WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes / 2 + 1}) });
+        } catch {}
+        return "done";
+      `);
+      await expect(
+        runWorkflowScript({
+          script: agentOverSingleTitle,
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).rejects.toThrow(/at most 1024 bytes/);
+
+      const agentOverTotalTitleBytes = makeScript(`
+        const pad = "x".repeat(1020);
+        for (let i = 0; i < 65; i++) {
+          try { await agent("p" + i, { phase: String(i).padStart(4, "0") + pad }); } catch {}
+        }
+        return "done";
+      `);
+      await expect(
+        runWorkflowScript({
+          script: agentOverTotalTitleBytes,
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).rejects.toThrow(/64 KiB limit/);
     });
 
-    it("enforces every progress budget in the host-side tracker", () => {
-      const limits = { maxLogs: 2, maxLogBytes: 10, maxPhaseTitles: 2, maxPhaseSwitches: 4 };
+    it("enforces every progress budget in the host-side tracker and forged host messages", () => {
+      const limits = {
+        maxLogs: 2,
+        maxLogBytes: 10,
+        maxPhaseTitles: 2,
+        maxPhaseTitleBytes: 8,
+        maxPhaseTitleTotalBytes: 12,
+        maxPhaseSwitches: 4,
+      };
       const logs = makeWorkflowProgressBudget(limits);
       expect(logs.log("a")).toBeUndefined();
       expect(logs.log("b")).toBeUndefined();
       expect(logs.log("c")).toMatch(/logs at most 2/);
       const bytes = makeWorkflowProgressBudget(limits);
       expect(bytes.log("0123456789x")).toMatch(/exceeds the 4 MiB limit/);
+
       const phases = makeWorkflowProgressBudget(limits);
       expect(phases.phase("A")).toBeUndefined();
       expect(phases.phase("B")).toBeUndefined();
       expect(phases.phase("A")).toBeUndefined();
       expect(phases.phase("C")).toMatch(/at most 2 distinct phases/);
+
+      const singleBytes = makeWorkflowProgressBudget(limits);
+      expect(singleBytes.phase("ééééé")).toMatch(/at most 8 bytes/);
+
+      const totalBytes = makeWorkflowProgressBudget(limits);
+      expect(totalBytes.phase("12345678")).toBeUndefined();
+      expect(totalBytes.phase("12345678")).toBeUndefined();
+      expect(totalBytes.phase("12345")).toMatch(/64 KiB limit/);
+
       const switches = makeWorkflowProgressBudget(limits);
       for (let i = 0; i < 4; i++) expect(switches.phase("A")).toBeUndefined();
       expect(switches.phase("A")).toMatch(/at most 4 times/);
+
+      // agent() opts.phase registers titles/bytes without counting as a phase switch.
+      const agentTitles = makeWorkflowProgressBudget(limits);
+      for (let i = 0; i < 10; i++) expect(agentTitles.phaseTitle("12345678")).toBeUndefined();
+      expect(agentTitles.phase("12345678")).toBeUndefined();
+      expect(agentTitles.phaseTitle("12345")).toMatch(/64 KiB limit/);
+
+      const makeReceiver = (customLimits?: WorkflowProgressLimits) => {
+        let failed: unknown;
+        const phasesSeen: Array<string> = [];
+        const agentsSeen: Array<WorkflowAgentCall> = [];
+        const receiver = createWorkflowHostMessageReceiver({
+          script: makeScript("return 1;"),
+          argsJson: undefined,
+          host: makeHost({
+            onPhase: (title) => phasesSeen.push(title),
+            runAgent: async (call) => {
+              agentsSeen.push(call);
+              return "ok";
+            },
+          }),
+          concurrency: 1,
+          syncTimeoutMs: 5_000,
+          initialSpent: 0,
+          postToChild: () => true,
+          onIdleSettled: () => {},
+          onSucceed: () => {},
+          onFail: (err) => {
+            failed = err;
+          },
+          isSettled: () => failed !== undefined,
+          ...(customLimits !== undefined ? { progressLimits: customLimits } : {}),
+        });
+        const send = (payload: unknown) => {
+          receiver.push(Buffer.from(`${JSON.stringify(payload)}\n`, "utf8"));
+        };
+        return { send, getFailed: () => failed, phasesSeen, agentsSeen };
+      };
+
+      // Forged phase message exceeding the lowered per-message cap (maxPhaseTitleBytes + 256).
+      const overPhaseFrame = makeReceiver();
+      overPhaseFrame.send({
+        type: "phase",
+        title: "ok",
+        pad: "p".repeat(MAX_PHASE_MESSAGE_BYTES),
+      });
+      expect(overPhaseFrame.getFailed()).toBeInstanceOf(WorkflowScriptError);
+      expect((overPhaseFrame.getFailed() as Error).message).toMatch(/1280-byte limit/);
+      expect(overPhaseFrame.phasesSeen).toEqual([]);
+
+      // Forged phase message under the frame cap with a title over 1024 bytes.
+      const overPhaseTitle = makeReceiver();
+      overPhaseTitle.send({
+        type: "phase",
+        title: "a".repeat(WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes + 1),
+      });
+      expect(overPhaseTitle.getFailed()).toBeInstanceOf(WorkflowScriptError);
+      expect((overPhaseTitle.getFailed() as Error).message).toMatch(/at most 1024 bytes/);
+      expect(overPhaseTitle.phasesSeen).toEqual([]);
+
+      // Forged phase messages exceeding 64 KiB total distinct title bytes.
+      const overPhaseTotal = makeReceiver();
+      const pad1020 = "x".repeat(1020);
+      for (let i = 0; i < 65; i += 1) {
+        overPhaseTotal.send({ type: "phase", title: `${String(i).padStart(4, "0")}${pad1020}` });
+      }
+      expect(overPhaseTotal.getFailed()).toBeInstanceOf(WorkflowScriptError);
+      expect((overPhaseTotal.getFailed() as Error).message).toMatch(/64 KiB limit/);
+      expect(overPhaseTotal.phasesSeen).toHaveLength(64);
+
+      // Forged agent message carrying an overlong phase title.
+      const overAgentTitle = makeReceiver();
+      overAgentTitle.send({
+        type: "agent",
+        id: 1,
+        index: 0,
+        prompt: "hi",
+        opts: { phase: "b".repeat(WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes + 1) },
+        phase: "b".repeat(WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes + 1),
+      });
+      expect(overAgentTitle.getFailed()).toBeInstanceOf(WorkflowScriptError);
+      expect((overAgentTitle.getFailed() as Error).message).toMatch(/at most 1024 bytes/);
+      expect(overAgentTitle.agentsSeen).toEqual([]);
+
+      // Forged agent messages exceeding 64 KiB total distinct phase bytes.
+      const overAgentTotal = makeReceiver();
+      for (let i = 0; i < 65; i += 1) {
+        const title = `${String(i).padStart(4, "0")}${pad1020}`;
+        overAgentTotal.send({
+          type: "agent",
+          id: i + 1,
+          index: i,
+          prompt: "hi",
+          opts: { phase: title },
+          phase: title,
+        });
+      }
+      expect(overAgentTotal.getFailed()).toBeInstanceOf(WorkflowScriptError);
+      expect((overAgentTotal.getFailed() as Error).message).toMatch(/64 KiB limit/);
+
+      // Forged agent messages carrying a repeated phase do not consume phase switches.
+      const repeatedAgentPhase = makeReceiver({
+        ...WORKFLOW_PROGRESS_LIMITS,
+        maxPhaseSwitches: 1,
+      });
+      repeatedAgentPhase.send({
+        type: "agent",
+        id: 1,
+        index: 0,
+        prompt: "hi",
+        opts: { phase: "Reuse" },
+        phase: "Reuse",
+      });
+      repeatedAgentPhase.send({
+        type: "agent",
+        id: 2,
+        index: 1,
+        prompt: "hi",
+        opts: { phase: "Reuse" },
+        phase: "Reuse",
+      });
+      repeatedAgentPhase.send({ type: "phase", title: "Reuse" });
+      expect(repeatedAgentPhase.getFailed()).toBeUndefined();
+      repeatedAgentPhase.send({ type: "phase", title: "Reuse" });
+      expect(repeatedAgentPhase.getFailed()).toBeInstanceOf(WorkflowScriptError);
+      expect((repeatedAgentPhase.getFailed() as Error).message).toMatch(/at most 1 times/);
     });
   });
 });

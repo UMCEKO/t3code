@@ -1,11 +1,10 @@
-import type * as NodeWorkerThreads from "node:worker_threads";
-
-export const WORKFLOW_WORKER_RESOURCE_LIMITS = {
-  maxOldGenerationSizeMb: 256,
-  maxYoungGenerationSizeMb: 32,
-  codeRangeSizeMb: 16,
-  stackSizeMb: 4,
-} as const satisfies NodeWorkerThreads.ResourceLimits;
+// Linux enforces RLIMIT_DATA (brk + private mmap); macOS and Windows enforce only V8 heap flags and deadline kill.
+export const WORKFLOW_SANDBOX_PROCESS_LIMITS = {
+  maxOldSpaceSizeMb: 256,
+  maxSemiSpaceSizeMb: 16,
+  rlimitDataKiB: 1024 * 1024,
+  nodeFlags: ["--max-old-space-size=256", "--max-semi-space-size=16"],
+} as const;
 
 export const WORKFLOW_MESSAGE_LIMITS = {
   maxPromptBytes: 1024 * 1024,
@@ -22,35 +21,54 @@ export const WORKFLOW_PROGRESS_LIMITS = {
   maxPhaseSwitches: 100_000,
 } as const;
 
+export const MAX_PHASE_MESSAGE_BYTES = WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes + 256;
+
+export type WorkflowProgressLimits = {
+  readonly [K in keyof typeof WORKFLOW_PROGRESS_LIMITS]: number;
+};
+
 export interface WorkflowProgressBudget {
   /** Returns a cap-failure message once a per-run progress budget is exceeded. */
   readonly phase: (title: string) => string | undefined;
+  readonly phaseTitle: (title: string) => string | undefined;
   readonly log: (message: string) => string | undefined;
 }
 
 export function makeWorkflowProgressBudget(
-  limits: {
-    readonly [K in keyof typeof WORKFLOW_PROGRESS_LIMITS]: number;
-  } = WORKFLOW_PROGRESS_LIMITS,
+  limits: WorkflowProgressLimits = WORKFLOW_PROGRESS_LIMITS,
 ): WorkflowProgressBudget {
   const titles = new Set<string>();
+  let phaseTitleBytes = 0;
   let switches = 0;
   let logs = 0;
   let logBytes = 0;
+
+  const phaseTitle = (title: string): string | undefined => {
+    if (titles.has(title)) return undefined;
+    const bytes = Buffer.byteLength(title, "utf8");
+    if (bytes > limits.maxPhaseTitleBytes) {
+      return `A workflow phase title is at most ${limits.maxPhaseTitleBytes} bytes.`;
+    }
+    if (titles.size >= limits.maxPhaseTitles) {
+      return `A workflow has at most ${limits.maxPhaseTitles} distinct phases.`;
+    }
+    if (phaseTitleBytes + bytes > limits.maxPhaseTitleTotalBytes) {
+      return "Workflow phase titles exceed the 64 KiB limit.";
+    }
+    titles.add(title);
+    phaseTitleBytes += bytes;
+    return undefined;
+  };
+
   return {
     phase: (title) => {
       switches += 1;
       if (switches > limits.maxPhaseSwitches) {
         return `A workflow switches phase at most ${limits.maxPhaseSwitches} times.`;
       }
-      if (!titles.has(title)) {
-        if (titles.size >= limits.maxPhaseTitles) {
-          return `A workflow has at most ${limits.maxPhaseTitles} distinct phases.`;
-        }
-        titles.add(title);
-      }
-      return undefined;
+      return phaseTitle(title);
     },
+    phaseTitle,
     log: (message) => {
       logs += 1;
       logBytes += Buffer.byteLength(message, "utf8");
@@ -66,15 +84,23 @@ export const MAX_ERROR_MESSAGE_CHARS = 16_384;
 
 export type RealmErrorKind = "Error" | "TypeError" | "WorkflowScriptError";
 
-// Self-contained CommonJS source for `new Worker(source, { eval: true })` so tsdown/SEA bundles keep it intact.
+// Tiny -e bootstrap so Windows command-line limits never cap the worker source length.
+export const WORKFLOW_SANDBOX_BOOTSTRAP =
+  '(() => { const chunks = []; const onData = (chunk) => { const nl = chunk.indexOf(10); if (nl === -1) { chunks.push(chunk); return; } process.stdin.off("data", onData); chunks.push(chunk.subarray(0, nl)); const rest = chunk.subarray(nl + 1); const src = JSON.parse(Buffer.concat(chunks).toString("utf8")); chunks.length = 0; new Function("require", src)(require); if (rest.length > 0) process.stdin.emit("data", rest); }; process.stdin.on("data", onData); })();';
+
+// Self-contained CommonJS source fed over stdin to the sandbox child so tsdown/SEA bundles keep it intact.
 export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
 "use strict";
 (() => {
   const vm = require("node:vm");
-  const { parentPort } = require("node:worker_threads");
-  if (!parentPort) {
-    throw new Error("Workflow sandbox worker requires a parentPort");
-  }
+  const stdin = process.stdin;
+  const stdout = process.stdout;
+  const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
+  stdin.on("error", () => {});
+  stdout.on("error", () => {});
+  const writeMessage = (msg) => {
+    stdout.write(msg + "\n");
+  };
   const byteLength = Buffer.byteLength;
   const scheduleImmediate = setImmediate;
   const scheduleMicrotask = queueMicrotask;
@@ -527,7 +553,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     }
   }
 
-  function validateMetaObject(raw) {
+  function validateMetaObject(raw, progressLimits) {
     if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
       throw new WorkerScriptError("meta must be a plain object");
     }
@@ -549,7 +575,13 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
       if (!Array.isArray(rawPhases)) {
         throw new WorkerScriptError("meta.phases must be an array");
       }
+      if (rawPhases.length > progressLimits.maxPhaseTitles) {
+        throw new WorkerScriptError(
+          "meta.phases has at most " + progressLimits.maxPhaseTitles + " entries.",
+        );
+      }
       const seenTitles = new Set();
+      let totalPhaseBytes = 0;
       for (let i = 0; i < rawPhases.length; i += 1) {
         const item = rawPhases[i];
         if (typeof item !== "object" || item === null || Array.isArray(item)) {
@@ -558,6 +590,12 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
         const title = ownProperty(item, "title");
         if (typeof title !== "string" || title.trim().length === 0) {
           throw new WorkerScriptError("meta.phases[" + i + "].title must be a non-empty string");
+        }
+        const titleBytes = byteLength(title, "utf8");
+        if (titleBytes > progressLimits.maxPhaseTitleBytes) {
+          throw new WorkerScriptError(
+            "meta.phases[" + i + "].title is at most " + progressLimits.maxPhaseTitleBytes + " bytes.",
+          );
         }
         if (seenTitles.has(title)) {
           throw new WorkerScriptError('meta.phases contains duplicate title "' + title + '"');
@@ -570,6 +608,13 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
         const model = ownProperty(item, "model");
         if (model !== undefined && typeof model !== "string") {
           throw new WorkerScriptError("meta.phases[" + i + "].model must be a string");
+        }
+        totalPhaseBytes +=
+          titleBytes +
+          (detail !== undefined ? byteLength(detail, "utf8") : 0) +
+          (model !== undefined ? byteLength(model, "utf8") : 0);
+        if (totalPhaseBytes > progressLimits.maxPhaseTitleTotalBytes) {
+          throw new WorkerScriptError("meta.phases exceeds the 64 KiB limit.");
         }
         phases.push({
           title,
@@ -586,7 +631,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     };
   }
 
-  function parseMetaAndBody(script) {
+  function parseMetaAndBody(script, progressLimits) {
     if (typeof script !== "string") {
       throw new WorkerScriptError("Workflow script must be a string");
     }
@@ -634,7 +679,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
       }
     }
 
-    const meta = validateMetaObject(evaluated);
+    const meta = validateMetaObject(evaluated, progressLimits);
     const bodyStart = scanner.pos;
     let bodyStartLine = 0;
     for (let i = 0; i < bodyStart; i += 1) {
@@ -769,23 +814,35 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
 
   function makeProgressBudget(limits) {
     const titles = new Set();
+    let phaseTitleBytes = 0;
     let switches = 0;
     let logs = 0;
     let logBytes = 0;
+    const phaseTitle = (title) => {
+      if (titles.has(title)) return undefined;
+      const bytes = byteLength(title, "utf8");
+      if (bytes > limits.maxPhaseTitleBytes) {
+        return "A workflow phase title is at most " + limits.maxPhaseTitleBytes + " bytes.";
+      }
+      if (titles.size >= limits.maxPhaseTitles) {
+        return "A workflow has at most " + limits.maxPhaseTitles + " distinct phases.";
+      }
+      if (phaseTitleBytes + bytes > limits.maxPhaseTitleTotalBytes) {
+        return "Workflow phase titles exceed the 64 KiB limit.";
+      }
+      titles.add(title);
+      phaseTitleBytes += bytes;
+      return undefined;
+    };
     return {
       phase(title) {
         switches += 1;
         if (switches > limits.maxPhaseSwitches) {
           return "A workflow switches phase at most " + limits.maxPhaseSwitches + " times.";
         }
-        if (!titles.has(title)) {
-          if (titles.size >= limits.maxPhaseTitles) {
-            return "A workflow has at most " + limits.maxPhaseTitles + " distinct phases.";
-          }
-          titles.add(title);
-        }
-        return undefined;
+        return phaseTitle(title);
       },
+      phaseTitle,
       log(message) {
         logs += 1;
         logBytes += byteLength(message, "utf8");
@@ -1199,7 +1256,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     activeContexts.clear();
     pendingAgents.clear();
     pendingLoads.clear();
-    parentPort.postMessage(JSON.stringify({ type: "error", kind, message: safeMsg }));
+    writeMessage(JSON.stringify({ type: "error", kind, message: safeMsg }));
   }
 
   function failCap(message) {
@@ -1225,7 +1282,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
       closeContext();
     }
     activeContexts.clear();
-    parentPort.postMessage(msg);
+    writeMessage(msg);
   }
 
   function postSmallMessage(payload, capLabel) {
@@ -1235,7 +1292,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
       failCap(capLabel + " exceeds the 1 MiB limit.");
       return false;
     }
-    parentPort.postMessage(msg);
+    writeMessage(msg);
     return true;
   }
 
@@ -1245,7 +1302,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     scheduleImmediate(() => {
       idleScheduled = false;
       if (runClosed) return;
-      parentPort.postMessage(JSON.stringify({ type: "idle", seq: latestSeq }));
+      writeMessage(JSON.stringify({ type: "idle", seq: latestSeq }));
     });
   }
 
@@ -1277,7 +1334,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
 
       let parsed;
       try {
-        parsed = parseMetaAndBody(script);
+        parsed = parseMetaAndBody(script, config.progressLimits);
       } catch (err) {
         rejectRun(err);
         return;
@@ -1411,6 +1468,16 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
             return;
           }
 
+          if (opts.phase !== undefined) {
+            const overPhase = progressBudget.phaseTitle(opts.phase);
+            if (overPhase !== undefined) {
+              runtime.setCapError(overPhase);
+              deferred.rejectSpecSync("WorkflowScriptError", overPhase);
+              failCap(overPhase);
+              return;
+            }
+          }
+
           const index = agentCount;
           const requestId = nextRequestId;
           const callPhase = opts.phase ?? currentPhase;
@@ -1454,7 +1521,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
               onResolveJson: (json) => settleDeferredWithJson(deferred, json),
               onRejectSpec: (kind, message) => settleDeferredWithSpec(deferred, kind, message),
             });
-            parentPort.postMessage(agentMsg);
+            writeMessage(agentMsg);
           };
 
           if (semaphore.tryAcquire()) {
@@ -1545,7 +1612,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
             },
             onRejectSpec: (kind, message) => settleDeferredWithSpec(deferred, kind, message),
           });
-          parentPort.postMessage(loadMsg);
+          writeMessage(loadMsg);
         } catch (err) {
           const spec = toErrorSpec(err, runtime.isContextTypeError);
           deferred.rejectSpecSync(spec.kind, spec.message);
@@ -1560,22 +1627,39 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
         },
         onPhase: (title) =>
           runBridgeSync(() => {
+            if (runClosed) {
+              throw new WorkerScriptError(stickyCapFailure ?? "Workflow run closed");
+            }
             const over = progressBudget.phase(title);
             if (over !== undefined) {
+              runtime.setCapError(over);
               failCap(over);
-              return;
+              throw new WorkerScriptError(over);
+            }
+            const msg = JSON.stringify({ type: "phase", title });
+            const maxPhaseBytes = config.progressLimits.maxPhaseTitleBytes + 256;
+            if (byteLength(msg, "utf8") > maxPhaseBytes) {
+              const capMessage =
+                "Workflow phase() message exceeds the " + maxPhaseBytes + "-byte limit.";
+              runtime.setCapError(capMessage);
+              failCap(capMessage);
+              throw new WorkerScriptError(capMessage);
             }
             currentPhase = title;
-            postSmallMessage({ type: "phase", title }, "Workflow phase() title");
+            writeMessage(msg);
           }),
         onLog: (message) =>
           runBridgeSync(() => {
+            if (runClosed) {
+              throw new WorkerScriptError(stickyCapFailure ?? "Workflow run closed");
+            }
             const trimmed =
               message.length > config.maxLogChars ? message.slice(0, config.maxLogChars) : message;
             const over = progressBudget.log(trimmed);
             if (over !== undefined) {
+              runtime.setCapError(over);
               failCap(over);
-              return;
+              throw new WorkerScriptError(over);
             }
             postSmallMessage({ type: "log", message: trimmed }, "Workflow log() message");
           }),
@@ -1635,15 +1719,13 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     });
   }
 
-  parentPort.on("message", (raw) => {
-    if (runClosed) return;
-    if (typeof raw !== "string") {
-      failCap("Workflow host sent a non-string message.");
-      return;
-    }
+  let stdinChunks = [];
+  let stdinBytes = 0;
 
+  function handleHostLine(raw, bytes) {
+    if (runClosed) return;
     const maxIncoming = started ? config.maxValueBytes : MAX_START_BYTES;
-    if (byteLength(raw, "utf8") > maxIncoming) {
+    if (bytes > maxIncoming) {
       failCap("Workflow host message exceeded the 4 MiB limit.");
       return;
     }
@@ -1762,8 +1844,57 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     } finally {
       scheduleIdle();
     }
+  }
+
+  stdin.on("data", (chunk) => {
+    if (runClosed) return;
+    let offset = 0;
+    while (offset < chunk.length && !runClosed) {
+      const maxIncoming = started ? config.maxValueBytes : MAX_START_BYTES;
+      const nl = chunk.indexOf(10, offset);
+      if (nl === -1) {
+        const remaining = chunk.length - offset;
+        if (stdinBytes + remaining > maxIncoming) {
+          stdinChunks = [];
+          stdinBytes = 0;
+          failCap("Workflow host message exceeded the 4 MiB limit.");
+          return;
+        }
+        stdinChunks.push(offset === 0 ? chunk : Buffer.from(chunk.subarray(offset)));
+        stdinBytes += remaining;
+        return;
+      }
+      const segmentBytes = nl - offset;
+      const lineBytes = stdinBytes + segmentBytes;
+      if (lineBytes > maxIncoming) {
+        stdinChunks = [];
+        stdinBytes = 0;
+        failCap("Workflow host message exceeded the 4 MiB limit.");
+        return;
+      }
+      const lineBuf =
+        stdinChunks.length === 0
+          ? chunk.subarray(offset, nl)
+          : Buffer.concat([...stdinChunks, chunk.subarray(offset, nl)]);
+      stdinChunks = [];
+      stdinBytes = 0;
+      offset = nl + 1;
+      let raw;
+      try {
+        raw = utf8Decoder.decode(lineBuf);
+      } catch {
+        failCap("Workflow host sent invalid UTF-8.");
+        return;
+      }
+      handleHostLine(raw, lineBytes);
+    }
   });
 
-  parentPort.postMessage('{"type":"ready"}');
+  stdin.on("end", () => {
+    stdinChunks = [];
+    stdinBytes = 0;
+  });
+
+  writeMessage('{"type":"ready"}');
 })();
 `;

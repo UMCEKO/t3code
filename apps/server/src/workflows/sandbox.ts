@@ -1,18 +1,29 @@
-// @effect-diagnostics globalTimers:off -- The sandbox worker host owns its syncTimeoutMs deadline timer outside Effect.
-import * as NodeWorkerThreads from "node:worker_threads";
+// @effect-diagnostics globalTimers:off -- The sandbox host owns its syncTimeoutMs deadline timer outside Effect.
+// @effect-diagnostics-next-line nodeBuiltinImport:off -- The sandbox runs outside Effect and spawns its isolated child process directly.
+import * as NodeChildProcess from "node:child_process";
+
+import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import {
   MAX_ERROR_MESSAGE_CHARS,
+  MAX_PHASE_MESSAGE_BYTES,
   MAX_START_MESSAGE_BYTES,
   makeWorkflowProgressBudget,
   WORKFLOW_MESSAGE_LIMITS,
   WORKFLOW_PROGRESS_LIMITS,
+  WORKFLOW_SANDBOX_BOOTSTRAP,
+  WORKFLOW_SANDBOX_PROCESS_LIMITS,
   WORKFLOW_SANDBOX_WORKER_SOURCE,
-  WORKFLOW_WORKER_RESOURCE_LIMITS,
   type RealmErrorKind,
+  type WorkflowProgressLimits,
 } from "./sandboxWorker.ts";
 
-export { WORKFLOW_MESSAGE_LIMITS, WORKFLOW_PROGRESS_LIMITS, WORKFLOW_WORKER_RESOURCE_LIMITS };
+export {
+  MAX_PHASE_MESSAGE_BYTES,
+  WORKFLOW_MESSAGE_LIMITS,
+  WORKFLOW_PROGRESS_LIMITS,
+  WORKFLOW_SANDBOX_PROCESS_LIMITS,
+};
 
 export interface WorkflowMeta {
   readonly name: string;
@@ -508,7 +519,13 @@ function validateMetaObject(raw: unknown): WorkflowMeta {
     if (!Array.isArray(rawPhases)) {
       throw new WorkflowScriptError("meta.phases must be an array");
     }
+    if (rawPhases.length > WORKFLOW_PROGRESS_LIMITS.maxPhaseTitles) {
+      throw new WorkflowScriptError(
+        `meta.phases has at most ${WORKFLOW_PROGRESS_LIMITS.maxPhaseTitles} entries.`,
+      );
+    }
     const seenTitles = new Set<string>();
+    let totalPhaseBytes = 0;
     for (let i = 0; i < rawPhases.length; i += 1) {
       const item: unknown = rawPhases[i];
       if (typeof item !== "object" || item === null || Array.isArray(item)) {
@@ -517,6 +534,12 @@ function validateMetaObject(raw: unknown): WorkflowMeta {
       const title = ownProperty(item, "title");
       if (typeof title !== "string" || title.trim().length === 0) {
         throw new WorkflowScriptError(`meta.phases[${i}].title must be a non-empty string`);
+      }
+      const titleBytes = Buffer.byteLength(title, "utf8");
+      if (titleBytes > WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes) {
+        throw new WorkflowScriptError(
+          `meta.phases[${i}].title is at most ${WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes} bytes.`,
+        );
       }
       if (seenTitles.has(title)) {
         throw new WorkflowScriptError(`meta.phases contains duplicate title "${title}"`);
@@ -531,6 +554,14 @@ function validateMetaObject(raw: unknown): WorkflowMeta {
       const model = ownProperty(item, "model");
       if (model !== undefined && typeof model !== "string") {
         throw new WorkflowScriptError(`meta.phases[${i}].model must be a string`);
+      }
+
+      totalPhaseBytes +=
+        titleBytes +
+        (detail !== undefined ? Buffer.byteLength(detail, "utf8") : 0) +
+        (model !== undefined ? Buffer.byteLength(model, "utf8") : 0);
+      if (totalPhaseBytes > WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleTotalBytes) {
+        throw new WorkflowScriptError("meta.phases exceeds the 64 KiB limit.");
       }
 
       phases.push({
@@ -553,8 +584,7 @@ export function parseWorkflowMeta(script: string): WorkflowMeta {
   if (typeof script !== "string") {
     throw new WorkflowScriptError("Workflow script must be a string");
   }
-  // UTF-16 length bounds the UTF-8 size from below, so this rejects without scanning the text.
-  if (script.length > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
+  if (Buffer.byteLength(script, "utf8") > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
     throw new WorkflowScriptError("Workflow script exceeds the 4 MiB limit.");
   }
   const scanner = new MetaScanner(script);
@@ -653,6 +683,499 @@ function readBudgetSpent(host: WorkflowHost): number {
   return Number.isFinite(spent) ? spent : 0;
 }
 
+const WORKFLOW_SANDBOX_WORKER_BOOTSTRAP_LINE = `${JSON.stringify(WORKFLOW_SANDBOX_WORKER_SOURCE)}\n`;
+const WORKFLOW_SANDBOX_WORKER_BOOTSTRAP_LINE_BYTES = Buffer.byteLength(
+  WORKFLOW_SANDBOX_WORKER_BOOTSTRAP_LINE,
+  "utf8",
+);
+const MAX_STDIN_BUFFERED_BYTES = MAX_START_MESSAGE_BYTES * 2;
+
+export function buildWorkflowSandboxCommand(options?: {
+  readonly platform?: NodeJS.Platform;
+  readonly execPath?: string;
+  readonly bootstrap?: string;
+}): { readonly command: string; readonly args: ReadonlyArray<string> } {
+  const platform = options?.platform ?? HostProcess.Platform.defaultValue();
+  const execPath = options?.execPath ?? process.execPath;
+  const bootstrap = options?.bootstrap ?? WORKFLOW_SANDBOX_BOOTSTRAP;
+  const nodeArgs = [...WORKFLOW_SANDBOX_PROCESS_LIMITS.nodeFlags, "-e", bootstrap];
+  if (platform === "win32") {
+    return { command: execPath, args: nodeArgs };
+  }
+  return {
+    command: "/bin/sh",
+    args: [
+      "-c",
+      `ulimit -d ${WORKFLOW_SANDBOX_PROCESS_LIMITS.rlimitDataKiB} && exec "$0" "$@"`,
+      execPath,
+      ...nodeArgs,
+    ],
+  };
+}
+
+export interface BoundedLineSplitter {
+  readonly push: (chunk: Buffer) => void;
+  readonly reset: () => void;
+}
+
+export function makeBoundedLineSplitter(options: {
+  readonly maxLineBytes: number;
+  readonly onLine: (line: string, bytes: number) => void;
+  readonly onOverflow: () => void;
+  readonly onInvalidUtf8?: () => void;
+}): BoundedLineSplitter {
+  const decoder = new TextDecoder("utf-8", { fatal: true });
+  let chunks: Array<Buffer> = [];
+  let pendingBytes = 0;
+  let stopped = false;
+
+  const reset = (): void => {
+    chunks = [];
+    pendingBytes = 0;
+  };
+
+  return {
+    reset,
+    push: (chunk: Buffer) => {
+      if (stopped) return;
+      let offset = 0;
+      while (offset < chunk.length && !stopped) {
+        const nl = chunk.indexOf(0x0a, offset);
+        if (nl === -1) {
+          const remaining = chunk.length - offset;
+          if (pendingBytes + remaining > options.maxLineBytes) {
+            reset();
+            stopped = true;
+            options.onOverflow();
+            return;
+          }
+          chunks.push(offset === 0 ? chunk : Buffer.from(chunk.subarray(offset)));
+          pendingBytes += remaining;
+          return;
+        }
+        const segmentBytes = nl - offset;
+        const lineBytes = pendingBytes + segmentBytes;
+        if (lineBytes > options.maxLineBytes) {
+          reset();
+          stopped = true;
+          options.onOverflow();
+          return;
+        }
+        const lineBuf =
+          chunks.length === 0
+            ? chunk.subarray(offset, nl)
+            : Buffer.concat([...chunks, chunk.subarray(offset, nl)]);
+        reset();
+        offset = nl + 1;
+        let line: string;
+        try {
+          line = decoder.decode(lineBuf);
+        } catch {
+          stopped = true;
+          if (options.onInvalidUtf8) {
+            options.onInvalidUtf8();
+          } else {
+            options.onOverflow();
+          }
+          return;
+        }
+        options.onLine(line, lineBytes);
+      }
+    },
+  };
+}
+
+export interface WorkflowHostMessageReceiverOptions {
+  readonly script: string;
+  readonly argsJson: string | undefined;
+  readonly host: WorkflowHost;
+  readonly concurrency: number;
+  readonly syncTimeoutMs: number;
+  readonly initialSpent: number;
+  readonly postToChild: (message: string, maxBytes: number, capMessage: string) => boolean;
+  readonly onIdleSettled: (allIdle: boolean) => void;
+  readonly onSucceed: (value: unknown) => void;
+  readonly onFail: (err: unknown) => void;
+  readonly isSettled: () => boolean;
+  readonly progressLimits?: WorkflowProgressLimits;
+}
+
+export function createWorkflowHostMessageReceiver(
+  options: WorkflowHostMessageReceiverOptions,
+): BoundedLineSplitter {
+  const progressLimits = options.progressLimits ?? WORKFLOW_PROGRESS_LIMITS;
+  const maxPhaseMessageBytes = progressLimits.maxPhaseTitleBytes + 256;
+  const progressBudget = makeWorkflowProgressBudget(progressLimits);
+  let started = false;
+  let lastSentSeq = 0;
+  let lastIdleSeq = 0;
+  let hostAgentCount = 0;
+
+  const handleLine = (raw: string, bytes: number): void => {
+    if (options.isSettled()) return;
+    if (bytes > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
+      options.onFail(new WorkflowScriptError("Workflow message exceeded the 4 MiB limit."));
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      options.onFail(new WorkflowScriptError("Workflow sandbox sent invalid JSON."));
+      return;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      options.onFail(new WorkflowScriptError("Workflow sandbox sent a malformed message."));
+      return;
+    }
+    const msg = parsed as Record<string, unknown>;
+    const msgType = msg.type;
+
+    if (msgType === "ready") {
+      if (started) return;
+      started = true;
+      lastSentSeq += 1;
+      const base = JSON.stringify({
+        type: "start",
+        seq: lastSentSeq,
+        script: options.script,
+        hasArgs: options.argsJson !== undefined,
+        concurrency: options.concurrency,
+        syncTimeoutMs: options.syncTimeoutMs,
+        budgetTotal: options.host.budget.total,
+        budgetSpent: options.initialSpent,
+        maxAgents: WORKFLOW_LIMITS.maxAgents,
+        maxItems: WORKFLOW_LIMITS.maxItems,
+        maxPromptBytes: WORKFLOW_MESSAGE_LIMITS.maxPromptBytes,
+        maxValueBytes: WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+        maxLogChars: WORKFLOW_MESSAGE_LIMITS.maxLogChars,
+        progressLimits,
+      });
+      const startMsg =
+        options.argsJson === undefined ? base : `${base.slice(0, -1)},"args":${options.argsJson}}`;
+      options.postToChild(
+        startMsg,
+        MAX_START_MESSAGE_BYTES,
+        "Workflow start payload exceeds size limit.",
+      );
+      return;
+    }
+
+    if (msgType === "idle") {
+      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
+        options.onFail(
+          new WorkflowScriptError("Workflow sandbox message exceeded the 1 MiB limit."),
+        );
+        return;
+      }
+      const seq = msg.seq;
+      if (typeof seq !== "number" || !Number.isInteger(seq) || seq < 0 || seq > lastSentSeq) {
+        options.onFail(new WorkflowScriptError("Workflow sandbox sent an invalid idle sequence."));
+        return;
+      }
+      if (seq > lastIdleSeq) {
+        lastIdleSeq = seq;
+        options.onIdleSettled(lastIdleSeq === lastSentSeq);
+      }
+      return;
+    }
+
+    if (msgType === "phase") {
+      if (bytes > maxPhaseMessageBytes) {
+        options.onFail(
+          new WorkflowScriptError(
+            `Workflow phase() message exceeds the ${maxPhaseMessageBytes}-byte limit.`,
+          ),
+        );
+        return;
+      }
+      if (typeof msg.title !== "string" || msg.title.trim().length === 0) {
+        options.onFail(new WorkflowScriptError("Workflow sandbox sent an invalid phase title."));
+        return;
+      }
+      const overPhase = progressBudget.phase(msg.title);
+      if (overPhase !== undefined) {
+        options.onFail(new WorkflowScriptError(overPhase));
+        return;
+      }
+      try {
+        options.host.onPhase(msg.title);
+      } catch (err) {
+        options.onFail(err);
+      }
+      return;
+    }
+
+    if (msgType === "log") {
+      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
+        options.onFail(new WorkflowScriptError("Workflow log() message exceeds the 1 MiB limit."));
+        return;
+      }
+      if (typeof msg.message !== "string") {
+        options.onFail(new WorkflowScriptError("Workflow sandbox sent an invalid log message."));
+        return;
+      }
+      const text =
+        msg.message.length > WORKFLOW_MESSAGE_LIMITS.maxLogChars
+          ? msg.message.slice(0, WORKFLOW_MESSAGE_LIMITS.maxLogChars)
+          : msg.message;
+      const overLog = progressBudget.log(text);
+      if (overLog !== undefined) {
+        options.onFail(new WorkflowScriptError(overLog));
+        return;
+      }
+      try {
+        options.host.onLog(text);
+      } catch (err) {
+        options.onFail(err);
+      }
+      return;
+    }
+
+    if (msgType === "agent") {
+      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
+        options.onFail(
+          new WorkflowScriptError("Workflow agent() prompt and options exceed the 1 MiB limit."),
+        );
+        return;
+      }
+      const id = msg.id;
+      const index = msg.index;
+      const prompt = msg.prompt;
+      const opts = msg.opts;
+      const phase = msg.phase;
+      if (
+        typeof id !== "number" ||
+        !Number.isInteger(id) ||
+        typeof index !== "number" ||
+        !Number.isInteger(index) ||
+        index < 0 ||
+        typeof prompt !== "string" ||
+        typeof opts !== "object" ||
+        opts === null ||
+        Array.isArray(opts) ||
+        (phase !== undefined && typeof phase !== "string")
+      ) {
+        options.onFail(new WorkflowScriptError("Workflow sandbox sent an invalid agent request."));
+        return;
+      }
+      const optsPhase = ownProperty(opts, "phase");
+      if (optsPhase !== undefined && typeof optsPhase !== "string") {
+        options.onFail(new WorkflowScriptError("Workflow sandbox sent an invalid agent request."));
+        return;
+      }
+      if (phase !== undefined) {
+        const overPhase = progressBudget.phaseTitle(phase);
+        if (overPhase !== undefined) {
+          options.onFail(new WorkflowScriptError(overPhase));
+          return;
+        }
+      }
+      if (typeof optsPhase === "string" && optsPhase !== phase) {
+        const overOptsPhase = progressBudget.phaseTitle(optsPhase);
+        if (overOptsPhase !== undefined) {
+          options.onFail(new WorkflowScriptError(overOptsPhase));
+          return;
+        }
+      }
+
+      hostAgentCount += 1;
+      if (hostAgentCount > WORKFLOW_LIMITS.maxAgents) {
+        options.onFail(
+          new WorkflowScriptError(`A workflow runs at most ${WORKFLOW_LIMITS.maxAgents} agents`),
+        );
+        return;
+      }
+
+      const call: WorkflowAgentCall = {
+        index,
+        prompt,
+        opts: opts as WorkflowAgentOpts,
+        phase,
+      };
+
+      void Promise.resolve()
+        .then(() => options.host.runAgent(call))
+        .then(
+          (value) => {
+            if (options.isSettled()) return;
+            let spent: number;
+            try {
+              spent = readBudgetSpent(options.host);
+            } catch (err) {
+              options.onFail(err);
+              return;
+            }
+            const seq = (lastSentSeq += 1);
+            if (value === undefined) {
+              options.postToChild(
+                JSON.stringify({ type: "agentResult", seq, id, ok: true, spent, hasValue: false }),
+                WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+                "Workflow agent() result exceeds the 4 MiB limit.",
+              );
+              return;
+            }
+            let valueJson: string;
+            try {
+              valueJson = serializeHostValue(value);
+            } catch (err) {
+              const spec = toRealmErrorSpec(err);
+              options.postToChild(
+                JSON.stringify({
+                  type: "agentResult",
+                  seq,
+                  id,
+                  ok: false,
+                  spent,
+                  errorKind: spec.kind,
+                  errorMessage: spec.message,
+                }),
+                WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+                "Workflow agent() result exceeds the 4 MiB limit.",
+              );
+              return;
+            }
+            const resultMsg = `{"type":"agentResult","seq":${seq},"id":${id},"ok":true,"spent":${spent},"hasValue":true,"value":${valueJson}}`;
+            options.postToChild(
+              resultMsg,
+              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+              "Workflow agent() result exceeds the 4 MiB limit.",
+            );
+          },
+          (err) => {
+            if (options.isSettled() || options.host.signal.aborted) return;
+            let spent: number;
+            try {
+              spent = readBudgetSpent(options.host);
+            } catch (budgetErr) {
+              options.onFail(budgetErr);
+              return;
+            }
+            const seq = (lastSentSeq += 1);
+            const spec = toRealmErrorSpec(err);
+            options.postToChild(
+              JSON.stringify({
+                type: "agentResult",
+                seq,
+                id,
+                ok: false,
+                spent,
+                errorKind: spec.kind,
+                errorMessage: spec.message,
+              }),
+              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+              "Workflow agent() result exceeds the 4 MiB limit.",
+            );
+          },
+        );
+      return;
+    }
+
+    if (msgType === "loadScript") {
+      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
+        options.onFail(new WorkflowScriptError("workflow() scriptPath exceeds the 1 MiB limit."));
+        return;
+      }
+      const id = msg.id;
+      const scriptPath = msg.scriptPath;
+      if (
+        typeof id !== "number" ||
+        !Number.isInteger(id) ||
+        typeof scriptPath !== "string" ||
+        scriptPath.trim().length === 0
+      ) {
+        options.onFail(
+          new WorkflowScriptError("Workflow sandbox sent an invalid loadScript request."),
+        );
+        return;
+      }
+
+      void Promise.resolve()
+        .then(() => options.host.loadScript({ scriptPath }))
+        .then(
+          (childScript) => {
+            if (options.isSettled()) return;
+            const seq = (lastSentSeq += 1);
+            if (typeof childScript !== "string") {
+              options.postToChild(
+                JSON.stringify({
+                  type: "loadScriptResult",
+                  seq,
+                  id,
+                  ok: false,
+                  errorKind: "WorkflowScriptError",
+                  errorMessage: "Workflow script must be a string",
+                }),
+                WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+                "Nested workflow script exceeds the 4 MiB limit.",
+              );
+              return;
+            }
+            options.postToChild(
+              JSON.stringify({
+                type: "loadScriptResult",
+                seq,
+                id,
+                ok: true,
+                script: childScript,
+              }),
+              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+              "Nested workflow script exceeds the 4 MiB limit.",
+            );
+          },
+          (err) => {
+            if (options.isSettled() || options.host.signal.aborted) return;
+            const seq = (lastSentSeq += 1);
+            const spec = toRealmErrorSpec(err);
+            options.postToChild(
+              JSON.stringify({
+                type: "loadScriptResult",
+                seq,
+                id,
+                ok: false,
+                errorKind: spec.kind,
+                errorMessage: spec.message,
+              }),
+              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+              "Nested workflow script exceeds the 4 MiB limit.",
+            );
+          },
+        );
+      return;
+    }
+
+    if (msgType === "done") {
+      options.onSucceed(msg.value);
+      return;
+    }
+
+    if (msgType === "error") {
+      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
+        options.onFail(new WorkflowScriptError("Workflow error message exceeds the 1 MiB limit."));
+        return;
+      }
+      options.onFail(fromRealmErrorSpec(msg.kind, msg.message));
+      return;
+    }
+
+    options.onFail(
+      new WorkflowScriptError(`Unknown workflow sandbox message type: ${String(msgType)}`),
+    );
+  };
+
+  return makeBoundedLineSplitter({
+    maxLineBytes: WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+    onLine: handleLine,
+    onOverflow: () => {
+      options.onFail(new WorkflowScriptError("Workflow message exceeded the 4 MiB limit."));
+    },
+    onInvalidUtf8: () => {
+      options.onFail(new WorkflowScriptError("Workflow sandbox sent invalid UTF-8."));
+    },
+  });
+}
+
 export async function runWorkflowScript(input: {
   readonly script: string;
   readonly args: unknown;
@@ -685,31 +1208,28 @@ export async function runWorkflowScript(input: {
       : DEFAULT_SYNC_TIMEOUT_MS;
   const initialSpent = readBudgetSpent(input.host);
 
-  const worker = new NodeWorkerThreads.Worker(WORKFLOW_SANDBOX_WORKER_SOURCE, {
-    eval: true,
-    resourceLimits: { ...WORKFLOW_WORKER_RESOURCE_LIMITS },
-    env: {},
-    stdout: true,
-    stderr: true,
-    argv: [],
-    execArgv: [],
+  const { command, args } = buildWorkflowSandboxCommand();
+  const child = NodeChildProcess.spawn(command, args, {
+    stdio: ["pipe", "pipe", "pipe"],
+    env: { ELECTRON_RUN_AS_NODE: "1" },
+    windowsHide: true,
   });
-  worker.stdout?.resume();
-  worker.stderr?.resume();
+  child.stdin.on("error", () => {});
+  child.stdout.on("error", () => {});
+  child.stderr.on("error", () => {});
+  child.stderr.resume();
 
   const runDeferred = Promise.withResolvers<unknown>();
+  const exitDeferred = Promise.withResolvers<void>();
+  let exited = false;
   let settled = false;
-  let started = false;
-  let lastSentSeq = 0;
-  let lastIdleSeq = 0;
-  let hostAgentCount = 0;
-  const progressBudget = makeWorkflowProgressBudget();
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
-  let terminatePromise: Promise<number> | null = null;
+  let terminatePromise: Promise<void> | null = null;
 
-  const terminateWorker = (): Promise<number> => {
-    terminatePromise ??= worker.terminate().catch(() => 0);
-    return terminatePromise;
+  const markExited = (): void => {
+    if (exited) return;
+    exited = true;
+    exitDeferred.resolve();
   };
 
   const clearDeadline = (): void => {
@@ -723,7 +1243,7 @@ export async function runWorkflowScript(input: {
     if (settled) return;
     settled = true;
     clearDeadline();
-    void terminateWorker();
+    void terminateChild();
     runDeferred.reject(err);
   };
 
@@ -755,16 +1275,78 @@ export async function runWorkflowScript(input: {
     deadlineTimer = setTimeout(onDeadlineExpired, syncTimeoutMs);
   };
 
-  const postToWorker = (message: string, maxBytes: number, capMessage: string): boolean => {
+  const writeToChildStdin = (line: string, lineBytes: number): boolean => {
     if (settled) return false;
-    if (Buffer.byteLength(message, "utf8") > maxBytes) {
+    if (child.stdin.destroyed || !child.stdin.writable) {
+      failRun(new WorkflowScriptError("Workflow sandbox stopped reading its input."));
+      return false;
+    }
+    if (child.stdin.writableLength + lineBytes > MAX_STDIN_BUFFERED_BYTES) {
+      failRun(new WorkflowScriptError("Workflow sandbox stopped reading its input."));
+      return false;
+    }
+    child.stdin.write(line);
+    return true;
+  };
+
+  const postToChild = (message: string, maxBytes: number, capMessage: string): boolean => {
+    if (settled) return false;
+    const msgBytes = Buffer.byteLength(message, "utf8");
+    if (msgBytes > maxBytes) {
       failRun(new WorkflowScriptError(capMessage));
       return false;
     }
+    if (!writeToChildStdin(`${message}\n`, msgBytes + 1)) {
+      return false;
+    }
     armDeadlineIfIdle();
-    // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node worker_threads Worker.postMessage has no targetOrigin argument.
-    worker.postMessage(message);
     return true;
+  };
+
+  const receiver = createWorkflowHostMessageReceiver({
+    script: input.script,
+    argsJson,
+    host: input.host,
+    concurrency: limit,
+    syncTimeoutMs,
+    initialSpent,
+    postToChild,
+    onIdleSettled: (allIdle) => {
+      if (allIdle) {
+        clearDeadline();
+      } else {
+        resetDeadline();
+      }
+    },
+    onSucceed: succeedRun,
+    onFail: failRun,
+    isSettled: () => settled,
+  });
+
+  const terminateChild = (): Promise<void> => {
+    terminatePromise ??= (async () => {
+      receiver.reset();
+      child.stdin.destroy();
+      child.stdout.destroy();
+      child.stderr.destroy();
+      if (
+        exited ||
+        child.exitCode !== null ||
+        child.signalCode !== null ||
+        child.pid === undefined
+      ) {
+        markExited();
+        return;
+      }
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        markExited();
+        return;
+      }
+      await exitDeferred.promise;
+    })();
+    return terminatePromise;
   };
 
   const onAbort = (): void => {
@@ -772,355 +1354,54 @@ export async function runWorkflowScript(input: {
   };
   input.host.signal.addEventListener("abort", onAbort, { once: true });
 
-  worker.on("error", (err: unknown) => {
+  child.once("error", (err: unknown) => {
+    markExited();
     if (settled) return;
     const code = extractErrorCode(err);
     const message = extractErrorMessage(err);
-    if (code === "ERR_WORKER_OUT_OF_MEMORY") {
-      failRun(
-        new WorkflowScriptError(`Workflow worker exceeded memory limit (${code}): ${message}`),
-      );
-      return;
-    }
     failRun(
       new WorkflowScriptError(
-        `Workflow worker crashed${code !== undefined ? ` (${code})` : ""}: ${message}`,
+        `Workflow sandbox failed to start${code !== undefined ? ` (${code})` : ""}: ${message}`,
       ),
     );
   });
 
-  worker.on("exit", (code: number) => {
-    if (settled) return;
-    failRun(new WorkflowScriptError(`Workflow worker exited unexpectedly (code ${code})`));
+  child.once("exit", () => {
+    markExited();
   });
 
-  worker.on("message", (raw: unknown) => {
+  child.once("close", (code: number | null, signal: NodeJS.Signals | null) => {
+    markExited();
     if (settled) return;
-    if (typeof raw !== "string") {
-      failRun(new WorkflowScriptError("Workflow worker sent a non-string message."));
+    if (signal !== null) {
+      failRun(
+        new WorkflowScriptError(
+          `Workflow sandbox exceeded its memory limit or crashed (${signal})`,
+        ),
+      );
       return;
     }
-    const bytes = Buffer.byteLength(raw, "utf8");
-    if (bytes > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
-      failRun(new WorkflowScriptError("Workflow message exceeded the 4 MiB limit."));
+    if (code !== null && code !== 0) {
+      failRun(
+        new WorkflowScriptError(
+          `Workflow sandbox exceeded its memory limit or crashed (code ${code})`,
+        ),
+      );
       return;
     }
-
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(raw);
-    } catch {
-      failRun(new WorkflowScriptError("Workflow worker sent invalid JSON."));
-      return;
-    }
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-      failRun(new WorkflowScriptError("Workflow worker sent a malformed message."));
-      return;
-    }
-    const msg = parsed as Record<string, unknown>;
-    const msgType = msg.type;
-
-    if (msgType === "ready") {
-      if (started) return;
-      started = true;
-      lastSentSeq += 1;
-      const base = JSON.stringify({
-        type: "start",
-        seq: lastSentSeq,
-        script: input.script,
-        hasArgs: argsJson !== undefined,
-        concurrency: limit,
-        syncTimeoutMs,
-        budgetTotal: input.host.budget.total,
-        budgetSpent: initialSpent,
-        maxAgents: WORKFLOW_LIMITS.maxAgents,
-        maxItems: WORKFLOW_LIMITS.maxItems,
-        maxPromptBytes: WORKFLOW_MESSAGE_LIMITS.maxPromptBytes,
-        maxValueBytes: WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
-        maxLogChars: WORKFLOW_MESSAGE_LIMITS.maxLogChars,
-        progressLimits: WORKFLOW_PROGRESS_LIMITS,
-      });
-      const startMsg = argsJson === undefined ? base : `${base.slice(0, -1)},"args":${argsJson}}`;
-      postToWorker(startMsg, MAX_START_MESSAGE_BYTES, "Workflow start payload exceeds size limit.");
-      return;
-    }
-
-    if (msgType === "idle") {
-      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
-        failRun(new WorkflowScriptError("Workflow worker message exceeded the 1 MiB limit."));
-        return;
-      }
-      const seq = msg.seq;
-      if (typeof seq !== "number" || !Number.isInteger(seq) || seq < 0 || seq > lastSentSeq) {
-        failRun(new WorkflowScriptError("Workflow worker sent an invalid idle sequence."));
-        return;
-      }
-      if (seq > lastIdleSeq) {
-        lastIdleSeq = seq;
-        if (lastIdleSeq === lastSentSeq) {
-          clearDeadline();
-        } else {
-          resetDeadline();
-        }
-      }
-      return;
-    }
-
-    if (msgType === "phase") {
-      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
-        failRun(new WorkflowScriptError("Workflow phase() message exceeds the 1 MiB limit."));
-        return;
-      }
-      if (typeof msg.title !== "string" || msg.title.trim().length === 0) {
-        failRun(new WorkflowScriptError("Workflow worker sent an invalid phase title."));
-        return;
-      }
-      const overPhase = progressBudget.phase(msg.title);
-      if (overPhase !== undefined) {
-        failRun(new WorkflowScriptError(overPhase));
-        return;
-      }
-      try {
-        input.host.onPhase(msg.title);
-      } catch (err) {
-        failRun(err);
-      }
-      return;
-    }
-
-    if (msgType === "log") {
-      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
-        failRun(new WorkflowScriptError("Workflow log() message exceeds the 1 MiB limit."));
-        return;
-      }
-      if (typeof msg.message !== "string") {
-        failRun(new WorkflowScriptError("Workflow worker sent an invalid log message."));
-        return;
-      }
-      const text =
-        msg.message.length > WORKFLOW_MESSAGE_LIMITS.maxLogChars
-          ? msg.message.slice(0, WORKFLOW_MESSAGE_LIMITS.maxLogChars)
-          : msg.message;
-      const overLog = progressBudget.log(text);
-      if (overLog !== undefined) {
-        failRun(new WorkflowScriptError(overLog));
-        return;
-      }
-      try {
-        input.host.onLog(text);
-      } catch (err) {
-        failRun(err);
-      }
-      return;
-    }
-
-    if (msgType === "agent") {
-      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
-        failRun(
-          new WorkflowScriptError("Workflow agent() prompt and options exceed the 1 MiB limit."),
-        );
-        return;
-      }
-      const id = msg.id;
-      const index = msg.index;
-      const prompt = msg.prompt;
-      const opts = msg.opts;
-      const phase = msg.phase;
-      if (
-        typeof id !== "number" ||
-        !Number.isInteger(id) ||
-        typeof index !== "number" ||
-        !Number.isInteger(index) ||
-        index < 0 ||
-        typeof prompt !== "string" ||
-        typeof opts !== "object" ||
-        opts === null ||
-        Array.isArray(opts) ||
-        (phase !== undefined && typeof phase !== "string")
-      ) {
-        failRun(new WorkflowScriptError("Workflow worker sent an invalid agent request."));
-        return;
-      }
-
-      hostAgentCount += 1;
-      if (hostAgentCount > WORKFLOW_LIMITS.maxAgents) {
-        failRun(
-          new WorkflowScriptError(`A workflow runs at most ${WORKFLOW_LIMITS.maxAgents} agents`),
-        );
-        return;
-      }
-
-      const call: WorkflowAgentCall = {
-        index,
-        prompt,
-        opts: opts as WorkflowAgentOpts,
-        phase,
-      };
-
-      void Promise.resolve()
-        .then(() => input.host.runAgent(call))
-        .then(
-          (value) => {
-            if (settled) return;
-            let spent: number;
-            try {
-              spent = readBudgetSpent(input.host);
-            } catch (err) {
-              failRun(err);
-              return;
-            }
-            const seq = (lastSentSeq += 1);
-            if (value === undefined) {
-              postToWorker(
-                JSON.stringify({ type: "agentResult", seq, id, ok: true, spent, hasValue: false }),
-                WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
-                "Workflow agent() result exceeds the 4 MiB limit.",
-              );
-              return;
-            }
-            let valueJson: string;
-            try {
-              valueJson = serializeHostValue(value);
-            } catch (err) {
-              const spec = toRealmErrorSpec(err);
-              postToWorker(
-                JSON.stringify({
-                  type: "agentResult",
-                  seq,
-                  id,
-                  ok: false,
-                  spent,
-                  errorKind: spec.kind,
-                  errorMessage: spec.message,
-                }),
-                WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
-                "Workflow agent() result exceeds the 4 MiB limit.",
-              );
-              return;
-            }
-            const resultMsg = `{"type":"agentResult","seq":${seq},"id":${id},"ok":true,"spent":${spent},"hasValue":true,"value":${valueJson}}`;
-            postToWorker(
-              resultMsg,
-              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
-              "Workflow agent() result exceeds the 4 MiB limit.",
-            );
-          },
-          (err) => {
-            if (settled || input.host.signal.aborted) return;
-            let spent: number;
-            try {
-              spent = readBudgetSpent(input.host);
-            } catch (budgetErr) {
-              failRun(budgetErr);
-              return;
-            }
-            const seq = (lastSentSeq += 1);
-            const spec = toRealmErrorSpec(err);
-            postToWorker(
-              JSON.stringify({
-                type: "agentResult",
-                seq,
-                id,
-                ok: false,
-                spent,
-                errorKind: spec.kind,
-                errorMessage: spec.message,
-              }),
-              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
-              "Workflow agent() result exceeds the 4 MiB limit.",
-            );
-          },
-        );
-      return;
-    }
-
-    if (msgType === "loadScript") {
-      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
-        failRun(new WorkflowScriptError("workflow() scriptPath exceeds the 1 MiB limit."));
-        return;
-      }
-      const id = msg.id;
-      const scriptPath = msg.scriptPath;
-      if (
-        typeof id !== "number" ||
-        !Number.isInteger(id) ||
-        typeof scriptPath !== "string" ||
-        scriptPath.trim().length === 0
-      ) {
-        failRun(new WorkflowScriptError("Workflow worker sent an invalid loadScript request."));
-        return;
-      }
-
-      void Promise.resolve()
-        .then(() => input.host.loadScript({ scriptPath }))
-        .then(
-          (childScript) => {
-            if (settled) return;
-            const seq = (lastSentSeq += 1);
-            if (typeof childScript !== "string") {
-              postToWorker(
-                JSON.stringify({
-                  type: "loadScriptResult",
-                  seq,
-                  id,
-                  ok: false,
-                  errorKind: "WorkflowScriptError",
-                  errorMessage: "Workflow script must be a string",
-                }),
-                WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
-                "Nested workflow script exceeds the 4 MiB limit.",
-              );
-              return;
-            }
-            postToWorker(
-              JSON.stringify({
-                type: "loadScriptResult",
-                seq,
-                id,
-                ok: true,
-                script: childScript,
-              }),
-              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
-              "Nested workflow script exceeds the 4 MiB limit.",
-            );
-          },
-          (err) => {
-            if (settled || input.host.signal.aborted) return;
-            const seq = (lastSentSeq += 1);
-            const spec = toRealmErrorSpec(err);
-            postToWorker(
-              JSON.stringify({
-                type: "loadScriptResult",
-                seq,
-                id,
-                ok: false,
-                errorKind: spec.kind,
-                errorMessage: spec.message,
-              }),
-              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
-              "Nested workflow script exceeds the 4 MiB limit.",
-            );
-          },
-        );
-      return;
-    }
-
-    if (msgType === "done") {
-      succeedRun(msg.value);
-      return;
-    }
-
-    if (msgType === "error") {
-      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
-        failRun(new WorkflowScriptError("Workflow error message exceeds the 1 MiB limit."));
-        return;
-      }
-      failRun(fromRealmErrorSpec(msg.kind, msg.message));
-      return;
-    }
-
-    failRun(new WorkflowScriptError(`Unknown workflow worker message type: ${String(msgType)}`));
+    failRun(new WorkflowScriptError(`Workflow sandbox exited unexpectedly (code ${code ?? 0})`));
   });
+
+  child.stdout.on("data", (chunk: Buffer) => {
+    receiver.push(chunk);
+  });
+
+  if (child.pid !== undefined) {
+    writeToChildStdin(
+      WORKFLOW_SANDBOX_WORKER_BOOTSTRAP_LINE,
+      WORKFLOW_SANDBOX_WORKER_BOOTSTRAP_LINE_BYTES,
+    );
+  }
 
   try {
     return await runDeferred.promise;
@@ -1128,6 +1409,6 @@ export async function runWorkflowScript(input: {
     settled = true;
     clearDeadline();
     input.host.signal.removeEventListener("abort", onAbort);
-    await terminateWorker();
+    await terminateChild();
   }
 }
