@@ -30,6 +30,7 @@ import {
   type ProviderOptionSelection,
   type RunId,
 } from "@t3tools/contracts";
+import * as IdAllocator from "@t3tools/provider-core/server/IdAllocator";
 import {
   SUBAGENT_RESULT_TURN_ITEM_TYPES,
   subagentResultForRun,
@@ -41,6 +42,7 @@ import * as Deferred from "effect/Deferred";
 import * as Duration from "effect/Duration";
 import * as Effect from "effect/Effect";
 import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
 import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
@@ -83,7 +85,7 @@ import {
 } from "./sandbox.ts";
 
 const MAX_PROGRESS_PREVIEW_CHARS = 160;
-const MAX_RESULT_SUMMARY_CHARS = 20_000;
+const MAX_COMPLETION_TEXT_BYTES = 12_000;
 const MAX_IN_MEMORY_LOGS = 50;
 const MAX_SCHEMA_REPROMPTS = 3;
 const PROGRESS_COALESCE_INTERVAL_MS = 1_000;
@@ -102,7 +104,7 @@ const TASK_ROLE_LITERALS: ReadonlySet<string> = new Set<OrchestratorMcpTaskRole>
 const PersistedWorkflowRun = Schema.Struct({
   runId: TrimmedNonEmptyString,
   threadId: ThreadId,
-  taskId: NodeId,
+  taskId: Schema.NullOr(NodeId),
   name: TrimmedNonEmptyString,
   scriptPath: TrimmedNonEmptyString,
   journalPath: TrimmedNonEmptyString,
@@ -122,7 +124,7 @@ const decodePersistedWorkflowRun = Schema.decodeUnknownEffect(
 const encodePersistedWorkflowRun = Schema.encodeUnknownEffect(
   Schema.fromJsonString(PersistedWorkflowRun),
 );
-const decodeTargetOptions = Schema.decodeUnknownEffect(OrchestratorMcpTargetOptions);
+const decodeTargetOptionsSync = Schema.decodeUnknownSync(OrchestratorMcpTargetOptions);
 
 class WorkflowAbortedError extends Schema.TaggedError<WorkflowAbortedError>()(
   "WorkflowAbortedError",
@@ -313,23 +315,143 @@ function formatDuration(durationMs: number): string {
   return `${minutes}m ${seconds}s`;
 }
 
+function truncateUtf8Bytes(text: string, maxBytes: number): string {
+  if (maxBytes <= 0) return "";
+  if (Buffer.byteLength(text, "utf8") <= maxBytes) return text;
+  let bytes = 0;
+  let endIndex = 0;
+  for (const ch of text) {
+    const chBytes = Buffer.byteLength(ch, "utf8");
+    if (bytes + chBytes > maxBytes) break;
+    bytes += chBytes;
+    endIndex += ch.length;
+  }
+  return text.slice(0, endIndex);
+}
+
 function formatCompletionResult(input: {
+  readonly runId: string;
   readonly name: string;
   readonly result: unknown;
   readonly usage: OrchestratorMcpWorkflowUsage;
   readonly journalPath: string;
 }): string {
   const rawJson = JSON.stringify(input.result ?? null) ?? "null";
-  const resultJson =
-    rawJson.length > MAX_RESULT_SUMMARY_CHARS
-      ? `${rawJson.slice(0, MAX_RESULT_SUMMARY_CHARS - 3)}...`
-      : rawJson;
-  return [
-    `Workflow ${input.name} completed.`,
-    `Result: ${resultJson}`,
-    `Usage: ${input.usage.agents} agents, ${input.usage.done} done, ${input.usage.errors} errors, ${input.usage.empty} empty, ${input.usage.tokens} tokens, ${formatDuration(input.usage.durationMs)}`,
-    `Journal: ${input.journalPath}`,
-  ].join("\n");
+  const headerLine = `Workflow ${input.name} completed.`;
+  const runLine = `Run: ${input.runId} (full result available from t3_workflow_status with runId ${input.runId})`;
+  const usageLine = `Usage: ${input.usage.agents} agents, ${input.usage.done} done, ${input.usage.errors} errors, ${input.usage.empty} empty, ${input.usage.tokens} tokens, ${formatDuration(input.usage.durationMs)}`;
+  const journalLine = `Journal: ${input.journalPath}`;
+  const full = [headerLine, runLine, `Result: ${rawJson}`, usageLine, journalLine].join("\n");
+  if (Buffer.byteLength(full, "utf8") <= MAX_COMPLETION_TEXT_BYTES) {
+    return full;
+  }
+  const suffix = "... (truncated)";
+  const fixedBytes = Buffer.byteLength(
+    [headerLine, runLine, `Result: ${suffix}`, usageLine, journalLine].join("\n"),
+    "utf8",
+  );
+  const availableBytes = Math.max(0, MAX_COMPLETION_TEXT_BYTES - fixedBytes);
+  const resultJson = `${truncateUtf8Bytes(rawJson, availableBytes)}${suffix}`;
+  return [headerLine, runLine, `Result: ${resultJson}`, usageLine, journalLine].join("\n");
+}
+
+function formatFailureResult(input: { readonly runId: string; readonly error: string }): string {
+  const runLine = `Run: ${input.runId} (details available from t3_workflow_status with runId ${input.runId})`;
+  const full = `${input.error}\n${runLine}`;
+  if (Buffer.byteLength(full, "utf8") <= MAX_COMPLETION_TEXT_BYTES) {
+    return full;
+  }
+  const suffix = "... (truncated)";
+  const availableBytes = Math.max(
+    0,
+    MAX_COMPLETION_TEXT_BYTES - Buffer.byteLength(`${suffix}\n${runLine}`, "utf8"),
+  );
+  return `${truncateUtf8Bytes(input.error, availableBytes)}${suffix}\n${runLine}`;
+}
+
+function resolveAgentTargetSync(
+  call: WorkflowAgentCall,
+  runTarget: OrchestratorMcpTarget | undefined,
+): Result.Result<OrchestratorMcpTarget | undefined, OrchestratorMcpFailure> {
+  const callTarget = call.opts.target;
+  if (
+    callTarget === undefined &&
+    runTarget === undefined &&
+    call.opts.model === undefined &&
+    call.opts.effort === undefined
+  ) {
+    return Result.succeed(undefined);
+  }
+
+  // Replacing provider/driver starts a clean target instead of mixing options across providers.
+  const switchesProvider =
+    callTarget !== undefined &&
+    (callTarget.providerInstanceId !== undefined || callTarget.driverKind !== undefined);
+  const inheritedTarget = switchesProvider ? undefined : runTarget;
+
+  let options: Array<ProviderOptionSelection> | undefined;
+  if (callTarget?.options !== undefined) {
+    try {
+      options = [...decodeTargetOptionsSync(callTarget.options)];
+    } catch {
+      return Result.fail(failure("invalid_request", "agent() opts.target.options is invalid."));
+    }
+  } else if (inheritedTarget?.options !== undefined) {
+    options = [...inheritedTarget.options];
+  }
+
+  if (call.opts.effort !== undefined) {
+    const next = (options ?? []).filter((selection) => selection.id !== "effort");
+    next.push({ id: "effort", value: call.opts.effort });
+    options = next;
+  }
+
+  const providerInstanceId =
+    callTarget?.providerInstanceId !== undefined
+      ? ProviderInstanceId.make(callTarget.providerInstanceId)
+      : inheritedTarget?.providerInstanceId;
+  const driverKind =
+    callTarget?.driverKind !== undefined
+      ? ProviderDriverKind.make(callTarget.driverKind)
+      : inheritedTarget?.driverKind;
+  const model = call.opts.model ?? callTarget?.model ?? inheritedTarget?.model;
+  const projectId = inheritedTarget?.projectId;
+  const environmentId = inheritedTarget?.environmentId;
+
+  return Result.succeed({
+    ...(providerInstanceId === undefined ? {} : { providerInstanceId }),
+    ...(driverKind === undefined ? {} : { driverKind }),
+    ...(model === undefined ? {} : { model }),
+    ...(options === undefined ? {} : { options }),
+    ...(projectId === undefined ? {} : { projectId }),
+    ...(environmentId === undefined ? {} : { environmentId }),
+  });
+}
+
+function agentOptsForReplayKey(
+  call: WorkflowAgentCall,
+  resolvedTarget: Result.Result<OrchestratorMcpTarget | undefined, OrchestratorMcpFailure>,
+  runTarget: OrchestratorMcpTarget | undefined,
+): Record<string, unknown> {
+  const { model: _model, effort: _effort, target: _target, ...rest } = call.opts;
+  if (Result.isFailure(resolvedTarget)) {
+    return {
+      ...call.opts,
+      ...(runTarget === undefined ? {} : { runTarget }),
+    };
+  }
+  const target = resolvedTarget.success;
+  if (target === undefined) {
+    return rest;
+  }
+  const normalizedTarget =
+    target.options === undefined
+      ? target
+      : {
+          ...target,
+          options: [...target.options].toSorted((a, b) => a.id.localeCompare(b.id)),
+        };
+  return { ...rest, target: normalizedTarget };
 }
 
 function stableCommandId(input: {
@@ -452,7 +574,7 @@ function reconstructFromJournal(
 
   return {
     runId: persisted.runId,
-    taskId: persisted.taskId,
+    taskId: persisted.taskId ?? NodeId.make(`node:workflow:unstarted:${persisted.runId}`),
     threadId: persisted.threadId,
     name: persisted.name,
     status: persisted.status,
@@ -505,17 +627,114 @@ const make = Effect.gen(function* () {
     return yield* decodePersistedWorkflowRun(content).pipe(Effect.option);
   });
 
+  const writePersistedRunStrict = Effect.fn("WorkflowService.writePersistedRunStrict")(function* (
+    record: PersistedWorkflowRun,
+  ) {
+    const encoded = yield* encodePersistedWorkflowRun(record);
+    const dir = runDirFor(record.runId);
+    const targetPath = runMetaPathFor(record.runId);
+    const nonce = (yield* Random.nextIntBetween(0, 0x1000000)).toString(16).padStart(6, "0");
+    const tempPath = path.join(dir, `.run.json.${nonce}.tmp`);
+    yield* fileSystem.writeFileString(tempPath, encoded);
+    yield* fileSystem
+      .rename(tempPath, targetPath)
+      .pipe(Effect.tapError(() => fileSystem.remove(tempPath).pipe(Effect.ignore)));
+  });
+
   const writePersistedRun = Effect.fn("WorkflowService.writePersistedRun")(function* (
     record: PersistedWorkflowRun,
   ) {
-    yield* encodePersistedWorkflowRun(record).pipe(
-      Effect.flatMap((encoded) =>
-        fileSystem.writeFileString(runMetaPathFor(record.runId), encoded),
-      ),
+    yield* writePersistedRunStrict(record).pipe(
       Effect.catch((error) =>
         Effect.logWarning("workflow.run-meta.write-failed", { runId: record.runId, error }),
       ),
     );
+  });
+
+  const readWorkflowTask = Effect.fn("WorkflowService.readWorkflowTask")(function* (
+    threadId: ThreadId,
+    taskId: NodeId,
+  ) {
+    return yield* threadManagement
+      .getThreadRecords(threadId, ["subagents"], { subagentIds: [taskId] })
+      .pipe(
+        Effect.map(({ subagents }) => subagents.find((candidate) => candidate.id === taskId)),
+        Effect.orElseSucceed(() => undefined),
+      );
+  });
+
+  const stopStartupChild = Effect.fn("WorkflowService.stopStartupChild")(function* (input: {
+    readonly runId: string;
+    readonly parentThreadId: ThreadId;
+    readonly index: number;
+    readonly childTaskId: NodeId | undefined;
+    readonly childThreadId: ThreadId;
+  }) {
+    const childShell = yield* threadManagement
+      .getThreadShell(input.childThreadId)
+      .pipe(Effect.orElseSucceed(() => null));
+    if (childShell === null || childShell.deletedAt !== null) return;
+
+    const commandId = CommandId.make(`server:workflow-restart-child:${input.runId}:${input.index}`);
+    const reason = "Server restarted while parent workflow was running.";
+    let stopped = false;
+    if (input.childTaskId !== undefined) {
+      const stopCommand = {
+        type: "thread.stop" as const,
+        commandId,
+        threadId: input.childThreadId,
+        stopDelegatedTasks: false,
+        reason,
+      };
+      const result = yield* threadManagement
+        .cancelDelegatedTask({
+          parentThreadId: input.parentThreadId,
+          taskId: input.childTaskId,
+          command: stopCommand,
+          stopDescendants: (remoteDispatch) =>
+            threadManagement.stopDelegatedTasks({
+              threadId: input.childThreadId,
+              commandId,
+              reason,
+              remoteDispatch,
+            }),
+        })
+        .pipe(Effect.result);
+      stopped = Result.isSuccess(result);
+    }
+    if (!stopped) {
+      yield* threadManagement.dispatch({
+        type: "thread.stop",
+        commandId,
+        threadId: input.childThreadId,
+        stopDelegatedTasks: true,
+        reason,
+      });
+    }
+
+    const childRecords = yield* threadManagement.getThreadRecords(input.childThreadId, ["runs"]);
+    for (const childRun of childRecords.runs) {
+      if (childRun.status !== "queued") continue;
+      yield* threadManagement
+        .dispatch({
+          type: "queued-run.cancel",
+          commandId: CommandId.make(
+            `server:workflow-restart-child-queued:${input.runId}:${input.index}:${childRun.id}`,
+          ),
+          threadId: input.childThreadId,
+          runId: childRun.id,
+        })
+        .pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("workflow.startup-sweep.child-queued-cancel-failed", {
+              runId: input.runId,
+              childThreadId: input.childThreadId,
+              queuedRunId: childRun.id,
+              error,
+            }),
+          ),
+        );
+    }
   });
 
   const generateRunId = Effect.gen(function* () {
@@ -524,7 +743,7 @@ const make = Effect.gen(function* () {
     return `wf_${hi.toString(16).padStart(6, "0")}${lo.toString(16).padStart(6, "0")}`;
   });
 
-  // Startup sweep: mark any workflow left running by a previous server process as failed.
+  // Startup sweep: stop orphaned children, fail stale running tasks, and reconcile run.json with SQL.
   const runStartupSweep = Effect.gen(function* () {
     const dirExists = yield* fileSystem
       .exists(serverConfig.workflowsDir)
@@ -540,17 +759,115 @@ const make = Effect.gen(function* () {
         if (Option.isNone(persisted)) return;
         const record = persisted.value;
         if (record.status !== "running" || liveRuns.has(record.runId)) return;
+
+        const existingTask =
+          record.taskId === null
+            ? undefined
+            : yield* readWorkflowTask(record.threadId, record.taskId);
+        const journalText = yield* fileSystem
+          .readFileString(record.journalPath)
+          .pipe(Effect.orElseSucceed(() => ""));
+        const journalEntries = yield* Effect.try({
+          try: () => decodeJournal(journalText),
+          catch: () => [] as ReadonlyArray<JournalEntry>,
+        }).pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<JournalEntry>));
+
+        if (existingTask?.status !== "completed") {
+          const finishedIndices = new Set<number>();
+          for (const item of journalEntries) {
+            if (item.type === "result") finishedIndices.add(item.index);
+          }
+          const unfinishedByThread = new Map<
+            ThreadId,
+            { readonly index: number; readonly childTaskId: NodeId | undefined }
+          >();
+          for (const item of journalEntries) {
+            if (
+              item.type === "started" &&
+              item.childThreadId !== null &&
+              !finishedIndices.has(item.index)
+            ) {
+              unfinishedByThread.set(ThreadId.make(item.childThreadId), {
+                index: item.index,
+                childTaskId: item.agentId === null ? undefined : NodeId.make(item.agentId),
+              });
+            }
+          }
+          for (const [childThreadId, childInfo] of unfinishedByThread) {
+            yield* stopStartupChild({
+              runId: record.runId,
+              parentThreadId: record.threadId,
+              index: childInfo.index,
+              childTaskId: childInfo.childTaskId,
+              childThreadId,
+            }).pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("workflow.startup-sweep.child-stop-failed", {
+                  runId: record.runId,
+                  childThreadId,
+                  error,
+                }),
+              ),
+            );
+          }
+        }
+
         const restartMessage = `The server restarted while this workflow ran. Resume it with t3_workflow_run resumeFromRunId=${record.runId}.`;
-        yield* threadManagement.dispatch({
-          type: "workflow.complete",
-          commandId: CommandId.make(`server:workflow-restart:${record.runId}`),
-          parentThreadId: record.threadId,
-          taskId: record.taskId,
-          status: "failed",
-          result: restartMessage,
-        });
+        if (record.taskId !== null && existingTask !== undefined) {
+          yield* threadManagement.dispatch({
+            type: "workflow.complete",
+            commandId: CommandId.make(`server:workflow-restart:${record.runId}`),
+            parentThreadId: record.threadId,
+            taskId: record.taskId,
+            status: "failed",
+            result: restartMessage,
+          });
+        }
+
+        const finalTask =
+          record.taskId === null || existingTask === undefined
+            ? undefined
+            : yield* readWorkflowTask(record.threadId, record.taskId);
+        const endEntry = journalEntries.findLast(
+          (item): item is Extract<JournalEntry, { readonly type: "end" }> => item.type === "end",
+        );
+
+        const { error: _previousError, ...baseRecord } = record;
+        if (finalTask !== undefined && isTerminalSubagentStatus(finalTask.status)) {
+          const finalStatus = subagentStatusToWorkflowStatus(finalTask.status);
+          if (finalStatus === "completed") {
+            const recoveredResult =
+              record.result ??
+              (endEntry?.status === "completed" && endEntry.result !== undefined
+                ? (endEntry.result as Schema.Json)
+                : undefined);
+            yield* writePersistedRun({
+              ...baseRecord,
+              status: "completed",
+              ...(recoveredResult === undefined ? {} : { result: recoveredResult }),
+            });
+            return;
+          }
+          if (finalStatus === "cancelled") {
+            yield* writePersistedRun({
+              ...baseRecord,
+              status: "cancelled",
+            });
+            return;
+          }
+          yield* writePersistedRun({
+            ...baseRecord,
+            status: "failed",
+            error:
+              finalTask.result ??
+              (endEntry?.status === "failed" ? endEntry.error : undefined) ??
+              restartMessage,
+          });
+          return;
+        }
+
         yield* writePersistedRun({
-          ...record,
+          ...baseRecord,
           status: "failed",
           error: restartMessage,
         });
@@ -570,65 +887,6 @@ const make = Effect.gen(function* () {
     Effect.catchCause((cause) => Effect.logWarning("workflow.startup-sweep.defect", { cause })),
     Effect.forkIn(layerScope),
   );
-
-  const resolveAgentTarget = Effect.fn("WorkflowService.resolveAgentTarget")(function* (
-    call: WorkflowAgentCall,
-    runTarget: OrchestratorMcpTarget | undefined,
-  ): Effect.fn.Return<OrchestratorMcpTarget | undefined, OrchestratorMcpFailure> {
-    const baseTarget = call.opts.target ?? runTarget;
-    if (
-      baseTarget === undefined &&
-      call.opts.model === undefined &&
-      call.opts.effort === undefined
-    ) {
-      return undefined;
-    }
-
-    let options: Array<ProviderOptionSelection> | undefined;
-    if (call.opts.target !== undefined) {
-      if (call.opts.target.options !== undefined) {
-        const decoded = yield* decodeTargetOptions(call.opts.target.options).pipe(
-          Effect.mapError(() =>
-            failure("invalid_request", "agent() opts.target.options is invalid."),
-          ),
-        );
-        options = [...decoded];
-      }
-    } else if (runTarget?.options !== undefined) {
-      options = [...runTarget.options];
-    }
-
-    if (call.opts.effort !== undefined) {
-      const next = (options ?? []).filter((selection) => selection.id !== "effort");
-      next.push({ id: "effort", value: call.opts.effort });
-      options = next;
-    }
-
-    const providerInstanceId =
-      call.opts.target !== undefined
-        ? call.opts.target.providerInstanceId === undefined
-          ? undefined
-          : ProviderInstanceId.make(call.opts.target.providerInstanceId)
-        : runTarget?.providerInstanceId;
-    const driverKind =
-      call.opts.target !== undefined
-        ? call.opts.target.driverKind === undefined
-          ? undefined
-          : ProviderDriverKind.make(call.opts.target.driverKind)
-        : runTarget?.driverKind;
-    const model = call.opts.model ?? baseTarget?.model;
-    const projectId = call.opts.target !== undefined ? undefined : runTarget?.projectId;
-    const environmentId = call.opts.target !== undefined ? undefined : runTarget?.environmentId;
-
-    return {
-      ...(providerInstanceId === undefined ? {} : { providerInstanceId }),
-      ...(driverKind === undefined ? {} : { driverKind }),
-      ...(model === undefined ? {} : { model }),
-      ...(options === undefined ? {} : { options }),
-      ...(projectId === undefined ? {} : { projectId }),
-      ...(environmentId === undefined ? {} : { environmentId }),
-    };
-  });
 
   const runEngine = Effect.fn("WorkflowService.runEngine")(function* (params: {
     readonly scope: McpInvocationContext.McpThreadInvocationScope;
@@ -671,18 +929,43 @@ const make = Effect.gen(function* () {
     } = params;
 
     const abortController = createHostAbortController();
-    const abortedDeferred = yield* Deferred.make<void>();
+    const agentsAbortDeferred = yield* Deferred.make<void>();
     const journalQueue = yield* Queue.unbounded<JournalQueueItem>();
     const progressSignal = yield* Queue.dropping<void>(1);
     const runtimeContext = yield* Effect.context<never>();
     const runSync = Effect.runSyncWith(runtimeContext);
     const runPromise = Effect.runPromiseWith(runtimeContext);
 
+    interface TrackedRepromptRun {
+      readonly childThreadId: ThreadId;
+      readonly runId: RunId;
+      readonly followupTaskId: NodeId | undefined;
+    }
+
+    interface LiveAgentRecord {
+      readonly index: number;
+      readonly key: string;
+      readonly label: string;
+      readonly phaseInfo: { readonly index: number; readonly title: string } | undefined;
+      readonly done: Deferred.Deferred<void>;
+      queuedAt: number | undefined;
+      startedAt: number | undefined;
+      countedInUsage: boolean;
+      childTaskId: NodeId | undefined;
+      childThreadId: ThreadId | undefined;
+      initialTaskTerminal: boolean;
+      readonly repromptRuns: Array<TrackedRepromptRun>;
+      resultJournaled: boolean;
+      cancelled: boolean;
+    }
+
     let status: OrchestratorMcpWorkflowRunStatus = "running";
     let finalResult: Schema.Json | undefined;
     let finalError: string | undefined;
     let endedByEngine = false;
     let stopRequested = false;
+    let scriptSettled = false;
+    let cancelledUnawaitedCount = 0;
     let progressDirty = false;
     let progressSeq = 0;
 
@@ -696,7 +979,7 @@ const make = Effect.gen(function* () {
     let currentPhase: string | undefined;
     const logs: Array<string> = [];
     const agentsByIndex = new Map<number, OrchestrationV2WorkflowAgent>();
-    const liveChildren = new Map<NodeId, ThreadId>();
+    const activeAgents = new Map<number, LiveAgentRecord>();
     const usage: MutableUsage = {
       agents: 0,
       done: 0,
@@ -723,6 +1006,13 @@ const make = Effect.gen(function* () {
 
     const appendJournalSync = (entry: JournalEntry): void => {
       runSync(Queue.offer(journalQueue, { _tag: "entry", entry }));
+    };
+
+    const recordLogSync = (message: string): void => {
+      logs.push(message);
+      if (logs.length > MAX_IN_MEMORY_LOGS) logs.shift();
+      appendJournalSync({ type: "log", message });
+      signalProgressSync();
     };
 
     const flushJournal = Effect.gen(function* () {
@@ -773,7 +1063,7 @@ const make = Effect.gen(function* () {
     const triggerExternalStop = (): void => {
       if (endedByEngine || stopRequested) return;
       stopRequested = true;
-      Deferred.doneUnsafe(abortedDeferred, Exit.void);
+      Deferred.doneUnsafe(agentsAbortDeferred, Exit.void);
       if (!abortController.signal.aborted) {
         abortController.abort(new WorkflowAbortedError());
       }
@@ -833,11 +1123,138 @@ const make = Effect.gen(function* () {
         );
     });
 
-    const cancelAllLiveChildren = Effect.gen(function* () {
-      const ids = [...liveChildren.keys()];
-      liveChildren.clear();
-      if (ids.length === 0) return;
-      yield* Effect.forEach(ids, cancelChildTask, { concurrency: "unbounded", discard: true });
+    const cancelTrackedReprompt = Effect.fn("WorkflowService.cancelTrackedReprompt")(function* (
+      reprompt: TrackedRepromptRun,
+    ): Effect.fn.Return<boolean> {
+      const readRun = () =>
+        threadManagement
+          .getThreadRecords(reprompt.childThreadId, ["runs"], { runIds: [reprompt.runId] })
+          .pipe(
+            Effect.map(({ runs }) => runs.find((candidate) => candidate.id === reprompt.runId)),
+            Effect.orElseSucceed(() => undefined),
+          );
+      const current = yield* readRun();
+      if (current === undefined || isTerminalRunStatus(current.status)) {
+        return false;
+      }
+      if (current.status === "queued") {
+        const cancelled = yield* threadManagement
+          .dispatch({
+            type: "queued-run.cancel",
+            commandId: stableCommandId({
+              scope,
+              operation: "workflow-cancel-reprompt-queued",
+              key: `${runId}:${reprompt.runId}`,
+            }),
+            threadId: reprompt.childThreadId,
+            runId: reprompt.runId,
+          })
+          .pipe(Effect.result);
+        if (Result.isSuccess(cancelled)) {
+          return false;
+        }
+      }
+      const refreshed = yield* readRun();
+      if (refreshed === undefined || isTerminalRunStatus(refreshed.status)) {
+        return false;
+      }
+      if (refreshed.status === "queued") {
+        yield* threadManagement
+          .dispatch({
+            type: "queued-run.cancel",
+            commandId: stableCommandId({
+              scope,
+              operation: "workflow-cancel-reprompt-queued-retry",
+              key: `${runId}:${reprompt.runId}`,
+            }),
+            threadId: reprompt.childThreadId,
+            runId: reprompt.runId,
+          })
+          .pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("workflow.cancel-reprompt-queued.failed", {
+                runId,
+                taskId,
+                childThreadId: reprompt.childThreadId,
+                repromptRunId: reprompt.runId,
+                error,
+              }),
+            ),
+          );
+        return false;
+      }
+      if (reprompt.followupTaskId !== undefined) {
+        yield* cancelChildTask(reprompt.followupTaskId);
+        return true;
+      }
+      const interrupted = yield* threadManagement
+        .dispatch({
+          type: "run.interrupt",
+          commandId: stableCommandId({
+            scope,
+            operation: "workflow-cancel-reprompt-interrupt",
+            key: `${runId}:${reprompt.runId}`,
+          }),
+          threadId: reprompt.childThreadId,
+          runId: reprompt.runId,
+          reason: "Workflow stopped.",
+        })
+        .pipe(Effect.result);
+      if (Result.isFailure(interrupted)) {
+        yield* threadManagement
+          .dispatch({
+            type: "thread.stop",
+            commandId: stableCommandId({
+              scope,
+              operation: "workflow-cancel-reprompt-stop",
+              key: `${runId}:${reprompt.runId}`,
+            }),
+            threadId: reprompt.childThreadId,
+            stopDelegatedTasks: false,
+            reason: "Workflow stopped.",
+          })
+          .pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("workflow.cancel-reprompt-stop.failed", {
+                runId,
+                taskId,
+                childThreadId: reprompt.childThreadId,
+                repromptRunId: reprompt.runId,
+                error,
+              }),
+            ),
+          );
+      }
+      return true;
+    });
+
+    const cancelLiveAgent = Effect.fn("WorkflowService.cancelLiveAgent")(function* (
+      record: LiveAgentRecord,
+    ) {
+      if (record.cancelled) return;
+      record.cancelled = true;
+      // Cancel tracked re-prompt runs first so queued ones are removed before anything promotes them.
+      let stoppedThreadViaTask = false;
+      for (const reprompt of record.repromptRuns) {
+        const stopped = yield* cancelTrackedReprompt(reprompt);
+        if (stopped) stoppedThreadViaTask = true;
+      }
+      if (
+        record.childTaskId !== undefined &&
+        (!record.initialTaskTerminal || !stoppedThreadViaTask)
+      ) {
+        yield* cancelChildTask(record.childTaskId);
+      }
+    });
+
+    const awaitAllActiveAgents = Effect.gen(function* () {
+      while (activeAgents.size > 0) {
+        const records = [...activeAgents.values()];
+        yield* Effect.forEach(records, (record) => Deferred.await(record.done), {
+          concurrency: "unbounded",
+          discard: true,
+        });
+      }
     });
 
     const waitForChildTaskTerminal = Effect.fn("WorkflowService.waitForChildTaskTerminal")(
@@ -894,7 +1311,7 @@ const make = Effect.gen(function* () {
 
         return yield* Effect.raceFirst(
           waitStream,
-          Deferred.await(abortedDeferred).pipe(
+          Deferred.await(agentsAbortDeferred).pipe(
             Effect.andThen(Effect.fail(new WorkflowAbortedError())),
           ),
         );
@@ -944,7 +1361,7 @@ const make = Effect.gen(function* () {
 
       return yield* Effect.raceFirst(
         waitStream,
-        Deferred.await(abortedDeferred).pipe(
+        Deferred.await(agentsAbortDeferred).pipe(
           Effect.andThen(Effect.fail(new WorkflowAbortedError())),
         ),
       );
@@ -995,16 +1412,61 @@ const make = Effect.gen(function* () {
       return total;
     };
 
+    const cancelUnawaitedAgent = Effect.fn("WorkflowService.cancelUnawaitedAgent")(function* (
+      record: LiveAgentRecord,
+    ) {
+      if (record.resultJournaled) return null;
+      record.resultJournaled = true;
+      yield* cancelLiveAgent(record);
+      const cancelledAt = yield* Clock.currentTimeMillis;
+      if (!record.countedInUsage) {
+        record.countedInUsage = true;
+        usage.agents += 1;
+      }
+      usage.errors += 1;
+      const existing = agentsByIndex.get(record.index);
+      const startedTime = record.startedAt ?? record.queuedAt ?? cancelledAt;
+      agentsByIndex.set(record.index, {
+        ...(existing ?? {
+          index: record.index,
+          label: record.label,
+          ...(record.phaseInfo === undefined
+            ? {}
+            : { phaseIndex: record.phaseInfo.index, phaseTitle: record.phaseInfo.title }),
+          attempt: 1,
+          queuedAt: startedTime,
+        }),
+        state: "failed",
+        completedAt: cancelledAt,
+        durationMs: Math.max(0, cancelledAt - startedTime),
+      });
+      appendJournalSync({
+        type: "result",
+        index: record.index,
+        key: record.key,
+        outcome: "null",
+        value: null,
+      });
+      cancelledUnawaitedCount += 1;
+      signalProgressSync();
+      yield* flushJournal;
+      return null;
+    });
+
     const runAgentEffect = Effect.fn("WorkflowService.runAgent")(function* (
       call: WorkflowAgentCall,
       key: string,
       replayed: { readonly cached: true; readonly value: unknown } | { readonly cached: false },
+      resolvedTarget: Result.Result<OrchestratorMcpTarget | undefined, OrchestratorMcpFailure>,
+      record: LiveAgentRecord | undefined,
     ): Effect.fn.Return<unknown, WorkflowAbortedError | WorkflowInternalError> {
-      const label = agentLabel(call);
+      const label = record?.label ?? agentLabel(call);
       const phaseInfo =
-        call.phase !== undefined && call.phase.trim().length > 0
-          ? ensurePhase(call.phase)
-          : undefined;
+        record !== undefined
+          ? record.phaseInfo
+          : call.phase !== undefined && call.phase.trim().length > 0
+            ? ensurePhase(call.phase)
+            : undefined;
       const promptPreview = previewText(call.prompt);
       const effort = call.opts.effort?.trim();
 
@@ -1045,399 +1507,552 @@ const make = Effect.gen(function* () {
         return replayed.value;
       }
 
-      const queuedAt = yield* Clock.currentTimeMillis;
-      usage.agents += 1;
-      agentsByIndex.set(call.index, {
-        index: call.index,
-        label,
-        state: "queued",
-        ...(phaseInfo === undefined
-          ? {}
-          : { phaseIndex: phaseInfo.index, phaseTitle: phaseInfo.title }),
-        ...(effort !== undefined && effort.length > 0 ? { effort } : {}),
-        attempt: 1,
-        queuedAt,
-        ...(promptPreview === undefined ? {} : { prompt: promptPreview }),
-      });
-      signalProgressSync();
-
-      const resolvedTarget = yield* resolveAgentTarget(call, runTarget).pipe(Effect.result);
-      if (Result.isFailure(resolvedTarget)) {
-        const failedAt = yield* Clock.currentTimeMillis;
-        usage.errors += 1;
-        agentsByIndex.set(call.index, {
-          ...agentsByIndex.get(call.index)!,
-          state: "failed",
-          completedAt: failedAt,
-          durationMs: Math.max(0, failedAt - queuedAt),
-        });
-        appendJournalSync({
-          type: "started",
-          index: call.index,
-          key,
-          label,
-          phase: phaseInfo?.title ?? null,
-          agentId: null,
-          childThreadId: null,
-        });
-        appendJournalSync({
-          type: "result",
-          index: call.index,
-          key,
-          outcome: "null",
-          value: null,
-        });
-        signalProgressSync();
-        yield* flushJournal;
-        return null;
-      }
-      const target = resolvedTarget.success;
-
-      const role: OrchestratorMcpTaskRole | undefined =
-        call.opts.agentType !== undefined && TASK_ROLE_LITERALS.has(call.opts.agentType)
-          ? (call.opts.agentType as OrchestratorMcpTaskRole)
-          : undefined;
-      const delegateTaskInput: OrchestratorMcpDelegateTaskInput = {
-        task: call.prompt,
-        title: label,
-        ...(role === undefined ? {} : { role }),
-        ...(call.opts.isolation === undefined ? {} : { isolation: call.opts.isolation }),
-        ...(target === undefined ? {} : { target }),
-      };
-      const outputSchema = call.opts.schema as Readonly<Record<string, Schema.Json>> | undefined;
-
-      const beforeDelegateSeq = yield* threadManagement
-        .getThreadEventSequence(parentThreadId)
-        .pipe(Effect.orElseSucceed(() => afterSequence));
-
-      const delegated = yield* orchestratorMcp
-        .delegateWorkflowAgent(scope, {
-          parentRunId,
-          workflowNodeId: taskId,
-          requestKey: `${runId}:${call.index}`,
-          task: delegateTaskInput,
-          ...(outputSchema === undefined ? {} : { outputSchema }),
-        })
-        .pipe(Effect.result);
-
-      if (Result.isFailure(delegated)) {
-        if (stopRequested || abortController.signal.aborted) {
+      const liveRecord = record!;
+      return yield* Effect.gen(function* () {
+        if (stopRequested) {
+          yield* cancelLiveAgent(liveRecord);
           return yield* new WorkflowAbortedError();
         }
-        const failedAt = yield* Clock.currentTimeMillis;
-        usage.errors += 1;
+        if (abortController.signal.aborted) {
+          return yield* new WorkflowAbortedError();
+        }
+        if (scriptSettled) {
+          return yield* cancelUnawaitedAgent(liveRecord);
+        }
+
+        const queuedAt = yield* Clock.currentTimeMillis;
+        liveRecord.queuedAt = queuedAt;
+        liveRecord.countedInUsage = true;
+        usage.agents += 1;
         agentsByIndex.set(call.index, {
-          ...agentsByIndex.get(call.index)!,
-          state: "failed",
-          completedAt: failedAt,
-          durationMs: Math.max(0, failedAt - queuedAt),
-        });
-        appendJournalSync({
-          type: "started",
           index: call.index,
-          key,
           label,
-          phase: phaseInfo?.title ?? null,
-          agentId: null,
-          childThreadId: null,
-        });
-        appendJournalSync({
-          type: "result",
-          index: call.index,
-          key,
-          outcome: "null",
-          value: null,
+          state: "queued",
+          ...(phaseInfo === undefined
+            ? {}
+            : { phaseIndex: phaseInfo.index, phaseTitle: phaseInfo.title }),
+          ...(effort !== undefined && effort.length > 0 ? { effort } : {}),
+          attempt: 1,
+          queuedAt,
+          ...(promptPreview === undefined ? {} : { prompt: promptPreview }),
         });
         signalProgressSync();
-        yield* flushJournal;
-        return null;
-      }
 
-      const { taskId: childTaskId, childThreadId } = delegated.success;
-      liveChildren.set(childTaskId, childThreadId);
-
-      if (stopRequested || abortController.signal.aborted) {
-        liveChildren.delete(childTaskId);
-        yield* cancelChildTask(childTaskId);
-        return yield* new WorkflowAbortedError();
-      }
-
-      const startedAtAgent = yield* Clock.currentTimeMillis;
-      const requestedModel = target?.model?.trim();
-      agentsByIndex.set(call.index, {
-        ...agentsByIndex.get(call.index)!,
-        agentId: childTaskId,
-        childThreadId,
-        state: "running",
-        startedAt: startedAtAgent,
-        ...(requestedModel !== undefined && requestedModel.length > 0
-          ? { model: requestedModel }
-          : {}),
-      });
-      appendJournalSync({
-        type: "started",
-        index: call.index,
-        key,
-        label,
-        phase: phaseInfo?.title ?? null,
-        agentId: childTaskId,
-        childThreadId,
-      });
-      signalProgressSync();
-
-      const finishAgent = Effect.fnUntraced(function* (finish: {
-        readonly state: "completed" | "failed";
-        readonly outcome: "ok" | "null" | "usage_limited";
-        readonly value: unknown;
-        readonly countAs: "done" | "error" | "empty";
-        readonly model?: string | undefined;
-        readonly tokens: number;
-      }) {
-        liveChildren.delete(childTaskId);
-        const completedAt = yield* Clock.currentTimeMillis;
-        usage.tokens += finish.tokens;
-        if (finish.countAs === "done") usage.done += 1;
-        else if (finish.countAs === "error") usage.errors += 1;
-        else usage.empty += 1;
-
-        const resultPreview = previewValue(finish.value);
-        const currentAgent = agentsByIndex.get(call.index)!;
-        const resolvedModel = finish.model?.trim() || currentAgent.model;
-        agentsByIndex.set(call.index, {
-          ...currentAgent,
-          state: finish.state,
-          ...(resolvedModel !== undefined && resolvedModel.length > 0
-            ? { model: resolvedModel }
-            : {}),
-          totalTokens: finish.tokens,
-          completedAt,
-          durationMs: Math.max(0, completedAt - startedAtAgent),
-          ...(resultPreview === undefined ? {} : { result: resultPreview }),
-        });
-        appendJournalSync({
-          type: "result",
-          index: call.index,
-          key,
-          outcome: finish.outcome,
-          value: finish.value,
-        });
-        signalProgressSync();
-        yield* flushJournal;
-        return finish.value;
-      });
-
-      const settledTask = yield* waitForChildTaskTerminal(
-        childTaskId,
-        childThreadId,
-        beforeDelegateSeq,
-      ).pipe(
-        Effect.mapError((error) =>
-          error._tag === "WorkflowAbortedError"
-            ? error
-            : new WorkflowInternalError({ messageText: errorMessage(error) }),
-        ),
-      );
-      if (stopRequested || abortController.signal.aborted) {
-        return yield* new WorkflowAbortedError();
-      }
-
-      const initialSnapshot = yield* loadChildRunSnapshot(childThreadId, undefined).pipe(
-        Effect.mapError((error) => new WorkflowInternalError({ messageText: errorMessage(error) })),
-      );
-      const initialTokens = sumThreadTokens(initialSnapshot.providerTurns);
-      const initialRun =
-        initialSnapshot.runs.find((candidate) => candidate.delegatedTaskId === childTaskId) ??
-        initialSnapshot.run;
-
-      if (settledTask === undefined || settledTask.status !== "completed") {
-        const rootFailure =
-          initialRun === undefined
-            ? undefined
-            : latestRootProviderFailure(initialRun, initialSnapshot.turnItems);
-        const isUsageLimited =
-          initialRun?.status === "failed" && rootFailure?.class === "usage_limit";
-        return yield* finishAgent({
-          state: "failed",
-          outcome: isUsageLimited ? "usage_limited" : "null",
-          value: null,
-          countAs: "error",
-          model: initialSnapshot.model,
-          tokens: initialTokens,
-        });
-      }
-
-      if (outputSchema === undefined) {
-        const finalText =
-          settledTask.result ??
-          (initialRun === undefined ? "" : subagentResultForRun(initialSnapshot, initialRun).text);
-        if (finalText.trim().length === 0) {
-          return yield* finishAgent({
-            state: "completed",
-            outcome: "null",
-            value: null,
-            countAs: "empty",
-            model: initialSnapshot.model,
-            tokens: initialTokens,
-          });
-        }
-        return yield* finishAgent({
-          state: "completed",
-          outcome: "ok",
-          value: finalText,
-          countAs: "done",
-          model: initialSnapshot.model,
-          tokens: initialTokens,
-        });
-      }
-
-      // Structured output: prefer run.output.value, fall back to JSON text + checkOutput, re-prompt up to 3 times.
-      let currentSnapshot = initialSnapshot;
-      let currentRun = initialRun;
-      let latestTaskResult = settledTask.result;
-
-      for (let reprompt = 0; ; reprompt += 1) {
-        if (currentRun?.output !== undefined) {
-          return yield* finishAgent({
-            state: "completed",
-            outcome: "ok",
-            value: currentRun.output.value,
-            countAs: "done",
-            model: currentSnapshot.model,
-            tokens: sumThreadTokens(currentSnapshot.providerTurns),
-          });
-        }
-
-        const candidateText =
-          (reprompt === 0 ? latestTaskResult : undefined) ??
-          (currentRun === undefined ? "" : subagentResultForRun(currentSnapshot, currentRun).text);
-        const stripped = stripSingleJsonFence(candidateText);
-        const checked = yield* checkOutput(outputSchema, stripped);
-        if (Result.isSuccess(checked)) {
-          return yield* finishAgent({
-            state: "completed",
-            outcome: "ok",
-            value: checked.success,
-            countAs: "done",
-            model: currentSnapshot.model,
-            tokens: sumThreadTokens(currentSnapshot.providerTurns),
-          });
-        }
-
-        if (reprompt >= MAX_SCHEMA_REPROMPTS) {
-          return yield* finishAgent({
+        if (Result.isFailure(resolvedTarget)) {
+          liveRecord.resultJournaled = true;
+          const failedAt = yield* Clock.currentTimeMillis;
+          usage.errors += 1;
+          agentsByIndex.set(call.index, {
+            ...agentsByIndex.get(call.index)!,
             state: "failed",
+            completedAt: failedAt,
+            durationMs: Math.max(0, failedAt - queuedAt),
+          });
+          appendJournalSync({
+            type: "started",
+            index: call.index,
+            key,
+            label,
+            phase: phaseInfo?.title ?? null,
+            agentId: null,
+            childThreadId: null,
+          });
+          appendJournalSync({
+            type: "result",
+            index: call.index,
+            key,
             outcome: "null",
             value: null,
-            countAs: "error",
-            model: currentSnapshot.model,
-            tokens: sumThreadTokens(currentSnapshot.providerTurns),
           });
+          signalProgressSync();
+          yield* flushJournal;
+          return null;
         }
+        const target = resolvedTarget.success;
 
-        if (stopRequested || abortController.signal.aborted) {
+        const role: OrchestratorMcpTaskRole | undefined =
+          call.opts.agentType !== undefined && TASK_ROLE_LITERALS.has(call.opts.agentType)
+            ? (call.opts.agentType as OrchestratorMcpTaskRole)
+            : undefined;
+        const delegateTaskInput: OrchestratorMcpDelegateTaskInput = {
+          task: call.prompt,
+          title: label,
+          ...(role === undefined ? {} : { role }),
+          ...(call.opts.isolation === undefined ? {} : { isolation: call.opts.isolation }),
+          ...(target === undefined ? {} : { target }),
+        };
+        const outputSchema = call.opts.schema as Readonly<Record<string, Schema.Json>> | undefined;
+
+        const beforeDelegateSeq = yield* threadManagement
+          .getThreadEventSequence(parentThreadId)
+          .pipe(Effect.orElseSucceed(() => afterSequence));
+
+        if (stopRequested) {
+          yield* cancelLiveAgent(liveRecord);
           return yield* new WorkflowAbortedError();
         }
+        if (abortController.signal.aborted) {
+          return yield* new WorkflowAbortedError();
+        }
+        if (scriptSettled) {
+          return yield* cancelUnawaitedAgent(liveRecord);
+        }
 
-        const problem = formatOutputRejection(checked.failure);
-        const nextAttempt = reprompt + 2;
-        agentsByIndex.set(call.index, {
-          ...agentsByIndex.get(call.index)!,
-          attempt: nextAttempt,
-        });
-        signalProgressSync();
-
-        const beforeRepromptSeq = yield* threadManagement
-          .getThreadEventSequence(childThreadId)
-          .pipe(Effect.orElseSucceed(() => afterSequence));
-        const repromptKey = `${runId}:${call.index}:reprompt:${reprompt + 1}`;
-        const sent = yield* threadManagement
-          .sendToThread({
-            projectId: parentProjectId,
-            commandId: stableCommandId({
-              scope,
-              operation: "workflow-reprompt",
-              key: repromptKey,
-            }),
-            threadId: childThreadId,
-            senderThreadId: parentThreadId,
-            messageId: stableMessageId({
-              scope,
-              operation: "workflow-reprompt",
-              key: repromptKey,
-            }),
-            text: `Your result did not match the schema: ${problem}. Submit it with t3_submit_output.`,
-            attachments: [],
-            mode: "queue",
-            outputSchema,
-            createdBy: "agent",
-            creationSource: "mcp",
+        const delegated = yield* orchestratorMcp
+          .delegateWorkflowAgent(scope, {
+            parentRunId,
+            workflowNodeId: taskId,
+            requestKey: `${runId}:${call.index}`,
+            task: delegateTaskInput,
+            ...(outputSchema === undefined ? {} : { outputSchema }),
           })
           .pipe(Effect.result);
 
-        if (Result.isFailure(sent)) {
+        if (Result.isFailure(delegated)) {
           if (stopRequested || abortController.signal.aborted) {
             return yield* new WorkflowAbortedError();
           }
-          return yield* finishAgent({
+          if (scriptSettled) {
+            return yield* cancelUnawaitedAgent(liveRecord);
+          }
+          liveRecord.resultJournaled = true;
+          const failedAt = yield* Clock.currentTimeMillis;
+          usage.errors += 1;
+          agentsByIndex.set(call.index, {
+            ...agentsByIndex.get(call.index)!,
             state: "failed",
+            completedAt: failedAt,
+            durationMs: Math.max(0, failedAt - queuedAt),
+          });
+          appendJournalSync({
+            type: "started",
+            index: call.index,
+            key,
+            label,
+            phase: phaseInfo?.title ?? null,
+            agentId: null,
+            childThreadId: null,
+          });
+          appendJournalSync({
+            type: "result",
+            index: call.index,
+            key,
             outcome: "null",
             value: null,
-            countAs: "error",
-            model: currentSnapshot.model,
-            tokens: sumThreadTokens(currentSnapshot.providerTurns),
           });
+          signalProgressSync();
+          yield* flushJournal;
+          return null;
         }
 
-        const settledReprompt = yield* waitForChildRunTerminal(
+        const { taskId: childTaskId, childThreadId } = delegated.success;
+        liveRecord.childTaskId = childTaskId;
+        liveRecord.childThreadId = childThreadId;
+
+        const startedAtAgent = yield* Clock.currentTimeMillis;
+        liveRecord.startedAt = startedAtAgent;
+        const requestedModel = target?.model?.trim();
+        agentsByIndex.set(call.index, {
+          ...agentsByIndex.get(call.index)!,
+          agentId: childTaskId,
           childThreadId,
-          sent.success.run.id,
-          beforeRepromptSeq,
-        ).pipe(
-          Effect.mapError((error) =>
-            error._tag === "WorkflowAbortedError"
-              ? error
-              : new WorkflowInternalError({ messageText: errorMessage(error) }),
-          ),
-        );
-        if (stopRequested || abortController.signal.aborted) {
+          state: "running",
+          startedAt: startedAtAgent,
+          ...(requestedModel !== undefined && requestedModel.length > 0
+            ? { model: requestedModel }
+            : {}),
+        });
+        appendJournalSync({
+          type: "started",
+          index: call.index,
+          key,
+          label,
+          phase: phaseInfo?.title ?? null,
+          agentId: childTaskId,
+          childThreadId,
+        });
+        signalProgressSync();
+
+        if (stopRequested) {
+          yield* cancelLiveAgent(liveRecord);
           return yield* new WorkflowAbortedError();
         }
+        if (abortController.signal.aborted) {
+          return yield* new WorkflowAbortedError();
+        }
+        if (scriptSettled) {
+          return yield* cancelUnawaitedAgent(liveRecord);
+        }
 
-        currentSnapshot = yield* loadChildRunSnapshot(childThreadId, sent.success.run.id).pipe(
+        const finishAgent = Effect.fnUntraced(function* (finish: {
+          readonly state: "completed" | "failed";
+          readonly outcome: "ok" | "null" | "usage_limited";
+          readonly value: unknown;
+          readonly countAs: "done" | "error" | "empty";
+          readonly model?: string | undefined;
+          readonly tokens: number;
+        }) {
+          liveRecord.resultJournaled = true;
+          const completedAt = yield* Clock.currentTimeMillis;
+          usage.tokens += finish.tokens;
+          if (finish.countAs === "done") usage.done += 1;
+          else if (finish.countAs === "error") usage.errors += 1;
+          else usage.empty += 1;
+
+          const resultPreview = previewValue(finish.value);
+          const currentAgent = agentsByIndex.get(call.index)!;
+          const resolvedModel = finish.model?.trim() || currentAgent.model;
+          agentsByIndex.set(call.index, {
+            ...currentAgent,
+            state: finish.state,
+            ...(resolvedModel !== undefined && resolvedModel.length > 0
+              ? { model: resolvedModel }
+              : {}),
+            totalTokens: finish.tokens,
+            completedAt,
+            durationMs: Math.max(0, completedAt - startedAtAgent),
+            ...(resultPreview === undefined ? {} : { result: resultPreview }),
+          });
+          appendJournalSync({
+            type: "result",
+            index: call.index,
+            key,
+            outcome: finish.outcome,
+            value: finish.value,
+          });
+          signalProgressSync();
+          yield* flushJournal;
+          return finish.value;
+        });
+
+        const settledTaskResult = yield* waitForChildTaskTerminal(
+          childTaskId,
+          childThreadId,
+          beforeDelegateSeq,
+        ).pipe(Effect.result);
+        if (Result.isFailure(settledTaskResult)) {
+          if (settledTaskResult.failure._tag === "WorkflowAbortedError") {
+            if (stopRequested) {
+              yield* cancelLiveAgent(liveRecord);
+              return yield* new WorkflowAbortedError();
+            }
+            if (scriptSettled) {
+              return yield* cancelUnawaitedAgent(liveRecord);
+            }
+            return yield* new WorkflowAbortedError();
+          }
+          return yield* new WorkflowInternalError({
+            messageText: errorMessage(settledTaskResult.failure),
+          });
+        }
+        const settledTask = settledTaskResult.success;
+        liveRecord.initialTaskTerminal = true;
+
+        if (stopRequested) {
+          yield* cancelLiveAgent(liveRecord);
+          return yield* new WorkflowAbortedError();
+        }
+        if (abortController.signal.aborted) {
+          return yield* new WorkflowAbortedError();
+        }
+        if (scriptSettled) {
+          return yield* cancelUnawaitedAgent(liveRecord);
+        }
+
+        const initialSnapshot = yield* loadChildRunSnapshot(childThreadId, undefined).pipe(
           Effect.mapError(
             (error) => new WorkflowInternalError({ messageText: errorMessage(error) }),
           ),
         );
-        currentRun = currentSnapshot.run ?? settledReprompt;
-        latestTaskResult = null;
+        const initialTokens = sumThreadTokens(initialSnapshot.providerTurns);
+        const initialRun =
+          initialSnapshot.runs.find((candidate) => candidate.delegatedTaskId === childTaskId) ??
+          initialSnapshot.run;
 
-        if (currentRun === undefined || currentRun.status !== "completed") {
+        if (settledTask === undefined || settledTask.status !== "completed") {
           const rootFailure =
-            currentRun === undefined
+            initialRun === undefined
               ? undefined
-              : latestRootProviderFailure(currentRun, currentSnapshot.turnItems);
+              : latestRootProviderFailure(initialRun, initialSnapshot.turnItems);
           const isUsageLimited =
-            currentRun?.status === "failed" && rootFailure?.class === "usage_limit";
+            initialRun?.status === "failed" && rootFailure?.class === "usage_limit";
           return yield* finishAgent({
             state: "failed",
             outcome: isUsageLimited ? "usage_limited" : "null",
             value: null,
             countAs: "error",
-            model: currentSnapshot.model,
-            tokens: sumThreadTokens(currentSnapshot.providerTurns),
+            model: initialSnapshot.model,
+            tokens: initialTokens,
           });
         }
-      }
+
+        if (outputSchema === undefined) {
+          const finalText =
+            settledTask.result ??
+            (initialRun === undefined
+              ? ""
+              : subagentResultForRun(initialSnapshot, initialRun).text);
+          if (finalText.trim().length === 0) {
+            return yield* finishAgent({
+              state: "completed",
+              outcome: "null",
+              value: null,
+              countAs: "empty",
+              model: initialSnapshot.model,
+              tokens: initialTokens,
+            });
+          }
+          return yield* finishAgent({
+            state: "completed",
+            outcome: "ok",
+            value: finalText,
+            countAs: "done",
+            model: initialSnapshot.model,
+            tokens: initialTokens,
+          });
+        }
+
+        // Structured output: prefer run.output.value, fall back to JSON text + checkOutput, re-prompt up to 3 times.
+        let currentSnapshot = initialSnapshot;
+        let currentRun = initialRun;
+        let latestTaskResult = settledTask.result;
+
+        for (let reprompt = 0; ; reprompt += 1) {
+          if (currentRun?.output !== undefined) {
+            return yield* finishAgent({
+              state: "completed",
+              outcome: "ok",
+              value: currentRun.output.value,
+              countAs: "done",
+              model: currentSnapshot.model,
+              tokens: sumThreadTokens(currentSnapshot.providerTurns),
+            });
+          }
+
+          const candidateText =
+            (reprompt === 0 ? latestTaskResult : undefined) ??
+            (currentRun === undefined
+              ? ""
+              : subagentResultForRun(currentSnapshot, currentRun).text);
+          const stripped = stripSingleJsonFence(candidateText);
+          const checked = yield* checkOutput(outputSchema, stripped);
+          if (Result.isSuccess(checked)) {
+            return yield* finishAgent({
+              state: "completed",
+              outcome: "ok",
+              value: checked.success,
+              countAs: "done",
+              model: currentSnapshot.model,
+              tokens: sumThreadTokens(currentSnapshot.providerTurns),
+            });
+          }
+
+          if (reprompt >= MAX_SCHEMA_REPROMPTS) {
+            return yield* finishAgent({
+              state: "failed",
+              outcome: "null",
+              value: null,
+              countAs: "error",
+              model: currentSnapshot.model,
+              tokens: sumThreadTokens(currentSnapshot.providerTurns),
+            });
+          }
+
+          if (stopRequested) {
+            yield* cancelLiveAgent(liveRecord);
+            return yield* new WorkflowAbortedError();
+          }
+          if (abortController.signal.aborted) {
+            return yield* new WorkflowAbortedError();
+          }
+          if (scriptSettled) {
+            return yield* cancelUnawaitedAgent(liveRecord);
+          }
+
+          const problem = formatOutputRejection(checked.failure);
+          const nextAttempt = reprompt + 2;
+          agentsByIndex.set(call.index, {
+            ...agentsByIndex.get(call.index)!,
+            attempt: nextAttempt,
+          });
+          signalProgressSync();
+
+          const beforeRepromptSeq = yield* threadManagement
+            .getThreadEventSequence(childThreadId)
+            .pipe(Effect.orElseSucceed(() => afterSequence));
+          const repromptKey = `${runId}:${call.index}:reprompt:${reprompt + 1}`;
+          const sent = yield* threadManagement
+            .sendToThread({
+              projectId: parentProjectId,
+              commandId: stableCommandId({
+                scope,
+                operation: "workflow-reprompt",
+                key: repromptKey,
+              }),
+              threadId: childThreadId,
+              senderThreadId: parentThreadId,
+              messageId: stableMessageId({
+                scope,
+                operation: "workflow-reprompt",
+                key: repromptKey,
+              }),
+              text: `Your result did not match the schema: ${problem}. Submit it with t3_submit_output.`,
+              attachments: [],
+              mode: "queue",
+              outputSchema,
+              createdBy: "agent",
+              creationSource: "mcp",
+            })
+            .pipe(Effect.result);
+
+          if (Result.isFailure(sent)) {
+            if (stopRequested) {
+              yield* cancelLiveAgent(liveRecord);
+              return yield* new WorkflowAbortedError();
+            }
+            if (abortController.signal.aborted) {
+              return yield* new WorkflowAbortedError();
+            }
+            if (scriptSettled) {
+              return yield* cancelUnawaitedAgent(liveRecord);
+            }
+            return yield* finishAgent({
+              state: "failed",
+              outcome: "null",
+              value: null,
+              countAs: "error",
+              model: currentSnapshot.model,
+              tokens: sumThreadTokens(currentSnapshot.providerTurns),
+            });
+          }
+
+          liveRecord.repromptRuns.push({
+            childThreadId,
+            runId: sent.success.run.id,
+            followupTaskId: sent.success.run.delegatedTaskId,
+          });
+
+          if (stopRequested) {
+            yield* cancelLiveAgent(liveRecord);
+            return yield* new WorkflowAbortedError();
+          }
+          if (abortController.signal.aborted) {
+            return yield* new WorkflowAbortedError();
+          }
+          if (scriptSettled) {
+            return yield* cancelUnawaitedAgent(liveRecord);
+          }
+
+          const settledRepromptResult = yield* waitForChildRunTerminal(
+            childThreadId,
+            sent.success.run.id,
+            beforeRepromptSeq,
+          ).pipe(Effect.result);
+          if (Result.isFailure(settledRepromptResult)) {
+            if (settledRepromptResult.failure._tag === "WorkflowAbortedError") {
+              if (stopRequested) {
+                yield* cancelLiveAgent(liveRecord);
+                return yield* new WorkflowAbortedError();
+              }
+              if (scriptSettled) {
+                return yield* cancelUnawaitedAgent(liveRecord);
+              }
+              return yield* new WorkflowAbortedError();
+            }
+            return yield* new WorkflowInternalError({
+              messageText: errorMessage(settledRepromptResult.failure),
+            });
+          }
+          const settledReprompt = settledRepromptResult.success;
+
+          if (stopRequested) {
+            yield* cancelLiveAgent(liveRecord);
+            return yield* new WorkflowAbortedError();
+          }
+          if (abortController.signal.aborted) {
+            return yield* new WorkflowAbortedError();
+          }
+          if (scriptSettled) {
+            return yield* cancelUnawaitedAgent(liveRecord);
+          }
+
+          currentSnapshot = yield* loadChildRunSnapshot(childThreadId, sent.success.run.id).pipe(
+            Effect.mapError(
+              (error) => new WorkflowInternalError({ messageText: errorMessage(error) }),
+            ),
+          );
+          currentRun = currentSnapshot.run ?? settledReprompt;
+          latestTaskResult = null;
+
+          if (currentRun === undefined || currentRun.status !== "completed") {
+            const rootFailure =
+              currentRun === undefined
+                ? undefined
+                : latestRootProviderFailure(currentRun, currentSnapshot.turnItems);
+            const isUsageLimited =
+              currentRun?.status === "failed" && rootFailure?.class === "usage_limit";
+            return yield* finishAgent({
+              state: "failed",
+              outcome: isUsageLimited ? "usage_limited" : "null",
+              value: null,
+              countAs: "error",
+              model: currentSnapshot.model,
+              tokens: sumThreadTokens(currentSnapshot.providerTurns),
+            });
+          }
+        }
+      }).pipe(
+        Effect.ensuring(
+          Effect.sync(() => {
+            activeAgents.delete(call.index);
+            Deferred.doneUnsafe(liveRecord.done, Exit.void);
+          }),
+        ),
+      );
     });
 
     const host: WorkflowHost = {
       runAgent: (call) => {
-        const key = agentCallKey(call.prompt, call.opts);
+        if (scriptSettled) {
+          return Promise.resolve(null);
+        }
+        if (stopRequested || abortController.signal.aborted) {
+          return Promise.reject(new WorkflowAbortedError());
+        }
+        const resolvedTarget = resolveAgentTargetSync(call, runTarget);
+        const key = agentCallKey(
+          call.prompt,
+          agentOptsForReplayKey(call, resolvedTarget, runTarget),
+        );
         // Take from the positional replay cursor synchronously before entering Effect so parallel calls stay ordered.
         const replayed =
           cursor === undefined ? ({ cached: false } as const) : cursor.take(call.index, key);
+        let record: LiveAgentRecord | undefined;
+        if (!replayed.cached) {
+          const phaseInfo =
+            call.phase !== undefined && call.phase.trim().length > 0
+              ? ensurePhase(call.phase)
+              : undefined;
+          record = {
+            index: call.index,
+            key,
+            label: agentLabel(call),
+            phaseInfo,
+            done: Deferred.makeUnsafe<void>(),
+            queuedAt: undefined,
+            startedAt: undefined,
+            countedInUsage: false,
+            childTaskId: undefined,
+            childThreadId: undefined,
+            initialTaskTerminal: false,
+            repromptRuns: [],
+            resultJournaled: false,
+            cancelled: false,
+          };
+          activeAgents.set(call.index, record);
+        }
         return runPromise(
-          runAgentEffect(call, key, replayed).pipe(
+          runAgentEffect(call, key, replayed, resolvedTarget, record).pipe(
             Effect.catchTags({
               WorkflowInternalError: () => Effect.succeed(null),
             }),
@@ -1451,10 +2066,7 @@ const make = Effect.gen(function* () {
         signalProgressSync();
       },
       onLog: (message) => {
-        logs.push(message);
-        if (logs.length > MAX_IN_MEMORY_LOGS) logs.shift();
-        appendJournalSync({ type: "log", message });
-        signalProgressSync();
+        recordLogSync(message);
       },
       loadScript: ({ scriptPath: nestedPath }) =>
         runPromise(fileSystem.readFileString(nestedPath)).catch(() => {
@@ -1486,48 +2098,77 @@ const make = Effect.gen(function* () {
           ),
         ).pipe(Effect.forkScoped);
 
+        const coalescerStop = yield* Deferred.make<void>();
+        const dispatchProgress = Effect.gen(function* () {
+          if (!progressDirty) return;
+          progressDirty = false;
+          const sentAt = yield* Clock.currentTimeMillis;
+          progressSeq += 1;
+          const latestLog = logs.at(-1);
+          yield* threadManagement
+            .dispatch({
+              type: "workflow.progress",
+              commandId: stableCommandId({
+                scope,
+                operation: "workflow-progress",
+                key: `${runId}:${progressSeq}`,
+              }),
+              parentThreadId,
+              taskId,
+              workflow: buildWorkflowSnapshot(sentAt),
+              ...(latestLog === undefined ? {} : { progress: latestLog }),
+            })
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("workflow.progress.dispatch-failed", {
+                  runId,
+                  taskId,
+                  error,
+                }),
+              ),
+            );
+        });
+
         // Coalesce workflow.progress updates to at most once per second via Effect Clock.
-        yield* Effect.gen(function* () {
+        const coalescerFiber = yield* Effect.gen(function* () {
           let lastSentAt: number | undefined;
           while (true) {
-            yield* Queue.take(progressSignal);
-            if (!progressDirty || endedByEngine || stopRequested) continue;
+            const event = yield* Effect.raceFirst(
+              Queue.take(progressSignal).pipe(Effect.as("signal" as const)),
+              Deferred.await(coalescerStop).pipe(Effect.as("stop" as const)),
+            );
+            if (event === "stop") {
+              yield* dispatchProgress;
+              return;
+            }
+            if (!progressDirty) continue;
             const now = yield* Clock.currentTimeMillis;
             if (lastSentAt !== undefined) {
               const remaining = PROGRESS_COALESCE_INTERVAL_MS - (now - lastSentAt);
               if (remaining > 0) {
-                yield* Effect.sleep(Duration.millis(remaining));
+                const slept = yield* Effect.raceFirst(
+                  Effect.sleep(Duration.millis(remaining)).pipe(Effect.as("tick" as const)),
+                  Deferred.await(coalescerStop).pipe(Effect.as("stop" as const)),
+                );
+                if (slept === "stop") {
+                  yield* dispatchProgress;
+                  return;
+                }
               }
             }
-            if (!progressDirty || endedByEngine || stopRequested) continue;
-            progressDirty = false;
+            yield* dispatchProgress;
             lastSentAt = yield* Clock.currentTimeMillis;
-            progressSeq += 1;
-            const latestLog = logs.at(-1);
-            yield* threadManagement
-              .dispatch({
-                type: "workflow.progress",
-                commandId: stableCommandId({
-                  scope,
-                  operation: "workflow-progress",
-                  key: `${runId}:${progressSeq}`,
-                }),
-                parentThreadId,
-                taskId,
-                workflow: buildWorkflowSnapshot(lastSentAt),
-                ...(latestLog === undefined ? {} : { progress: latestLog }),
-              })
-              .pipe(
-                Effect.catch((error) =>
-                  Effect.logWarning("workflow.progress.dispatch-failed", {
-                    runId,
-                    taskId,
-                    error,
-                  }),
-                ),
-              );
+            if (yield* Deferred.isDone(coalescerStop)) {
+              yield* dispatchProgress;
+              return;
+            }
           }
         }).pipe(Effect.forkScoped);
+
+        const flushCoalescer = Effect.gen(function* () {
+          Deferred.doneUnsafe(coalescerStop, Exit.void);
+          yield* Fiber.join(coalescerFiber);
+        });
 
         // Watch our own task row so stopWorkflow, thread Stop, or t3_workflow_stop aborts the script.
         yield* threadManagement
@@ -1561,7 +2202,7 @@ const make = Effect.gen(function* () {
               "abort",
               () => {
                 // Layer shutdown interrupts this fiber; leave the task and run.json running for startup sweep.
-                Deferred.doneUnsafe(abortedDeferred, Exit.void);
+                Deferred.doneUnsafe(agentsAbortDeferred, Exit.void);
                 if (!abortController.signal.aborted) {
                   abortController.abort(new WorkflowAbortedError());
                 }
@@ -1578,13 +2219,80 @@ const make = Effect.gen(function* () {
           catch: (err) => new WorkflowExecutionError({ messageText: errorMessage(err) }),
         }).pipe(Effect.result);
 
+        if (!stopRequested) {
+          scriptSettled = true;
+          Deferred.doneUnsafe(agentsAbortDeferred, Exit.void);
+          yield* awaitAllActiveAgents;
+          if (cancelledUnawaitedCount > 0) {
+            recordLogSync(
+              `${cancelledUnawaitedCount} unawaited ${cancelledUnawaitedCount === 1 ? "agent was" : "agents were"} cancelled when the script ended`,
+            );
+          }
+        }
+
         if (stopRequested) {
           status = "cancelled";
-          yield* cancelAllLiveChildren;
+          Deferred.doneUnsafe(agentsAbortDeferred, Exit.void);
+          yield* awaitAllActiveAgents;
+          const stoppedAt = yield* Clock.currentTimeMillis;
+          for (const [index, agent] of agentsByIndex) {
+            if (agent.state === "queued" || agent.state === "running") {
+              agentsByIndex.set(index, {
+                ...agent,
+                state: "failed",
+                completedAt: stoppedAt,
+                durationMs: Math.max(
+                  0,
+                  stoppedAt - (agent.startedAt ?? agent.queuedAt ?? stoppedAt),
+                ),
+              });
+              signalProgressSync();
+            }
+          }
+          yield* flushCoalescer;
           appendJournalSync({ type: "end", status: "cancelled" });
           yield* flushJournal;
-          const now = yield* Clock.currentTimeMillis;
-          yield* writePersistedRun(buildPersistedRecord(now));
+          // Dispose completion delivery before workflow.complete so stopping never wakes the parent.
+          yield* threadManagement
+            .dispatch({
+              type: "delegated_task.completion-delivery.dispose",
+              commandId: stableCommandId({
+                scope,
+                operation: "workflow-stop-dispose-delivery",
+                key: runId,
+              }),
+              parentThreadId,
+              taskId,
+            })
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("workflow.stop-dispose-delivery.failed", {
+                  runId,
+                  taskId,
+                  error,
+                }),
+              ),
+            );
+          yield* threadManagement
+            .dispatch({
+              type: "workflow.complete",
+              commandId: stableCommandId({
+                scope,
+                operation: "workflow-complete",
+                key: runId,
+              }),
+              parentThreadId,
+              taskId,
+              status: "cancelled",
+              result: "Stopped.",
+              workflow: buildWorkflowSnapshot(stoppedAt),
+            })
+            .pipe(
+              Effect.catch((error) =>
+                Effect.logWarning("workflow.complete.dispatch-failed", { runId, taskId, error }),
+              ),
+            );
+          yield* writePersistedRun(buildPersistedRecord(stoppedAt));
           return;
         }
 
@@ -1594,13 +2302,13 @@ const make = Effect.gen(function* () {
           finalResult = scriptOutcome.success as Schema.Json;
           const completedAt = yield* Clock.currentTimeMillis;
           const finalUsage = buildUsage(completedAt);
+          yield* flushCoalescer;
           appendJournalSync({
             type: "end",
             status: "completed",
             result: scriptOutcome.success,
           });
           yield* flushJournal;
-          yield* writePersistedRun(buildPersistedRecord(completedAt));
           yield* threadManagement
             .dispatch({
               type: "workflow.complete",
@@ -1613,6 +2321,7 @@ const make = Effect.gen(function* () {
               taskId,
               status: "completed",
               result: formatCompletionResult({
+                runId,
                 name: meta.name,
                 result: scriptOutcome.success,
                 usage: finalUsage,
@@ -1625,21 +2334,21 @@ const make = Effect.gen(function* () {
                 Effect.logWarning("workflow.complete.dispatch-failed", { runId, taskId, error }),
               ),
             );
+          yield* writePersistedRun(buildPersistedRecord(completedAt));
           return;
         }
 
         const errText = scriptOutcome.failure.messageText;
         status = "failed";
         finalError = errText;
-        yield* cancelAllLiveChildren;
         const failedAt = yield* Clock.currentTimeMillis;
+        yield* flushCoalescer;
         appendJournalSync({
           type: "end",
           status: "failed",
           error: errText,
         });
         yield* flushJournal;
-        yield* writePersistedRun(buildPersistedRecord(failedAt));
         yield* threadManagement
           .dispatch({
             type: "workflow.complete",
@@ -1651,7 +2360,7 @@ const make = Effect.gen(function* () {
             parentThreadId,
             taskId,
             status: "failed",
-            result: errText,
+            result: formatFailureResult({ runId, error: errText }),
             workflow: buildWorkflowSnapshot(failedAt),
           })
           .pipe(
@@ -1659,6 +2368,7 @@ const make = Effect.gen(function* () {
               Effect.logWarning("workflow.complete.dispatch-failed", { runId, taskId, error }),
             ),
           );
+        yield* writePersistedRun(buildPersistedRecord(failedAt));
       }),
     ).pipe(
       Effect.ensuring(
@@ -1824,10 +2534,39 @@ const make = Effect.gen(function* () {
       agents: [],
     };
 
+    const startCommandId = stableCommandId({ scope, operation: "workflow-start", key: runId });
+    const derivedTaskId = IdAllocator.derive.delegatedTaskNode({ commandId: startCommandId });
+    const startedAt = yield* Clock.currentTimeMillis;
+    const initialPersistedRun: PersistedWorkflowRun = {
+      runId,
+      threadId: scope.thread.threadId,
+      taskId: derivedTaskId,
+      name: meta.name,
+      scriptPath: snapshotScriptPath,
+      journalPath,
+      startedAt,
+      status: "running",
+      phases: initialPhases,
+      usage: {
+        agents: 0,
+        done: 0,
+        errors: 0,
+        empty: 0,
+        cached: 0,
+        tokens: 0,
+        durationMs: 0,
+      },
+    };
+    yield* writePersistedRunStrict(initialPersistedRun).pipe(
+      Effect.mapError(() =>
+        failure("orchestration_error", `Unable to persist workflow metadata for ${runId}.`),
+      ),
+    );
+
     const started = yield* threadManagement
       .dispatch({
         type: "workflow.start",
-        commandId: stableCommandId({ scope, operation: "workflow-start", key: runId }),
+        commandId: startCommandId,
         parentThreadId: scope.thread.threadId,
         parentRunId: parentRun.id,
         parentNodeId: parentRun.rootNodeId,
@@ -1837,6 +2576,7 @@ const make = Effect.gen(function* () {
         workflow: initialWorkflow,
       })
       .pipe(
+        Effect.tapError(() => fileSystem.remove(runDir, { recursive: true }).pipe(Effect.ignore)),
         Effect.mapError((error) => {
           const message = userFacingDispatchErrorMessage(error) ?? errorMessage(error);
           return failure(
@@ -1857,28 +2597,9 @@ const make = Effect.gen(function* () {
       );
     }
     const taskId = taskEvent.event.payload.id;
-    const startedAt = yield* Clock.currentTimeMillis;
-
-    yield* writePersistedRun({
-      runId,
-      threadId: scope.thread.threadId,
-      taskId,
-      name: meta.name,
-      scriptPath: snapshotScriptPath,
-      journalPath,
-      startedAt,
-      status: "running",
-      phases: initialPhases,
-      usage: {
-        agents: 0,
-        done: 0,
-        errors: 0,
-        empty: 0,
-        cached: 0,
-        tokens: 0,
-        durationMs: 0,
-      },
-    });
+    if (taskId !== derivedTaskId) {
+      yield* writePersistedRun({ ...initialPersistedRun, taskId });
+    }
 
     const done = yield* Deferred.make<void>();
     const registered = yield* Deferred.make<void>();
@@ -2016,6 +2737,19 @@ const make = Effect.gen(function* () {
       return { runId, status: knownStatus };
     }
 
+    if (live !== undefined) {
+      live.triggerExternalStop();
+      yield* Deferred.await(live.done);
+      return { runId, status: live.currentStatus() };
+    }
+
+    if (targetTaskId === null) {
+      if (Option.isSome(persisted)) {
+        yield* writePersistedRun({ ...persisted.value, status: "cancelled" });
+      }
+      return { runId, status: "cancelled" };
+    }
+
     const stopped = yield* threadManagement
       .stopWorkflow({ threadId: targetThreadId, subagentId: targetTaskId })
       .pipe(Effect.result);
@@ -2052,10 +2786,7 @@ const make = Effect.gen(function* () {
       );
     }
 
-    if (live !== undefined) {
-      live.triggerExternalStop();
-      yield* Deferred.await(live.done);
-    } else if (Option.isSome(persisted)) {
+    if (Option.isSome(persisted)) {
       yield* writePersistedRun({ ...persisted.value, status: "cancelled" });
     }
 

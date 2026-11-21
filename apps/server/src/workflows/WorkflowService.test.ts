@@ -67,6 +67,7 @@ import { decodeJournal } from "./journal.ts";
 const driver = ProviderDriverKind.make("claudeAgent");
 const instanceId = ProviderInstanceId.make("claudeAgent");
 const model = "claude-test";
+const altModel = "claude-test-alt";
 const modelSelection: ModelSelection = { instanceId, model };
 const projectId = ProjectId.make("project:workflow-test");
 const parentThreadId = ThreadId.make("thread:workflow-parent");
@@ -113,6 +114,12 @@ const providerSnapshot: ServerProvider = {
     {
       slug: model,
       name: model,
+      isCustom: false,
+      capabilities: null,
+    },
+    {
+      slug: altModel,
+      name: altModel,
       isCustom: false,
       capabilities: null,
     },
@@ -904,6 +911,39 @@ describe("WorkflowService and workflow MCP tools", () => {
           const statusCall = yield* callTool("t3_workflow_status", { runId: run2.runId });
           const status = yield* decodeStatusResult(statusCall.structuredContent);
           expect(status.usage).toMatchObject({ agents: 2, done: 2, cached: 1, errors: 0 });
+
+          // Resuming the exact same script with a different run-level target caches nothing.
+          const turnsBeforeAltResume = (yield* Ref.get(harness.startedTurns)).length;
+          const beforeAltResumeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+          const run3Call = yield* callTool("t3_workflow_run", {
+            scriptPath: scriptFile,
+            resumeFromRunId: run2.runId,
+            target: { model: altModel },
+          });
+          expect(run3Call.isError).not.toBe(true);
+          const run3 = yield* decodeRunResult(run3Call.structuredContent);
+
+          const altFirstTurn = yield* Queue.take(harness.turnQueue);
+          expect(altFirstTurn.turn.modelSelection.model).toBe(altModel);
+          expect(altFirstTurn.turn.message.text).toContain("First task");
+          yield* altFirstTurn.complete("alt-first");
+
+          const altSecondTurn = yield* Queue.take(harness.turnQueue);
+          expect(altSecondTurn.turn.modelSelection.model).toBe(altModel);
+          expect(altSecondTurn.turn.message.text).toContain("Second task v2");
+          yield* altSecondTurn.complete("alt-second");
+
+          const terminalRun3 = yield* awaitWorkflowTerminal(run3.taskId, beforeAltResumeSeq);
+          expect(terminalRun3.status).toBe("completed");
+          expect(terminalRun3.result).toContain('"a":"alt-first"');
+          expect(terminalRun3.result).toContain('"b":"alt-second"');
+
+          const turnsAfterAltResume = yield* Ref.get(harness.startedTurns);
+          expect(turnsAfterAltResume.length - turnsBeforeAltResume).toBe(2);
+
+          const altStatusCall = yield* callTool("t3_workflow_status", { runId: run3.runId });
+          const altStatus = yield* decodeStatusResult(altStatusCall.structuredContent);
+          expect(altStatus.usage).toMatchObject({ agents: 2, done: 2, cached: 0, errors: 0 });
         }).pipe(Effect.provide(harness.layerToolkit));
       }),
   );
@@ -1129,7 +1169,7 @@ describe("WorkflowService and workflow MCP tools", () => {
   );
 
   it.effect(
-    "startup sweep marks running run.json files from a previous process as failed with a resume hint",
+    "startup sweep stops unfinished children, reconciles already-completed tasks without overwriting results, and marks unstarted runs terminal",
     () =>
       Effect.gen(function* () {
         const fs = yield* FileSystem.FileSystem;
@@ -1145,9 +1185,20 @@ describe("WorkflowService and workflow MCP tools", () => {
           baseDir: sharedBaseDir,
         });
 
-        // Seed a running workflow in SQLite and write its run.json with status "running".
+        const zeroUsage = {
+          agents: 0,
+          done: 0,
+          errors: 0,
+          empty: 0,
+          cached: 0,
+          tokens: 0,
+          durationMs: 0,
+        };
+
+        // Seed three running run.json files: stale with an unfinished child, already completed in SQL, and never started.
         const seeded = yield* Effect.gen(function* () {
           const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcpService = yield* OrchestratorMcpService.OrchestratorMcpService;
           const config = yield* ServerConfig.ServerConfig;
           const parentTurn = yield* startParentThreadAndRun(
             harness1.turnQueue,
@@ -1156,18 +1207,19 @@ describe("WorkflowService and workflow MCP tools", () => {
           );
           const parentProjection = yield* orchestrator.getThreadProjection(parentThreadId);
           const parentRun = parentProjection.runs.find((r) => r.id === parentTurn.turn.runId)!;
+
+          // 1. Stale running workflow with a live child thread + a queued follow-up run on that child.
           const staleRunId = "wf_deadbeef1234";
-          const runDir = path.join(config.workflowRunsDir, staleRunId);
-          const scriptPath = path.join(runDir, "script.js");
-          const journalPath = path.join(runDir, "journal.jsonl");
-          yield* fs.makeDirectory(runDir, { recursive: true });
+          const staleDir = path.join(config.workflowRunsDir, staleRunId);
+          const staleScriptPath = path.join(staleDir, "script.js");
+          const staleJournalPath = path.join(staleDir, "journal.jsonl");
+          yield* fs.makeDirectory(staleDir, { recursive: true });
           yield* fs.writeFileString(
-            scriptPath,
+            staleScriptPath,
             `export const meta = { name: "Stale", description: "Interrupted by restart." }; return 1;`,
           );
-          yield* fs.writeFileString(journalPath, "");
 
-          const started = yield* orchestrator.dispatch({
+          const staleStarted = yield* orchestrator.dispatch({
             type: "workflow.start",
             commandId: CommandId.make("command:sweep:workflow-start"),
             parentThreadId,
@@ -1178,43 +1230,183 @@ describe("WorkflowService and workflow MCP tools", () => {
             modelSelection,
             workflow: {
               name: "Stale",
-              runHandles: { runId: staleRunId, scriptPath, transcriptDir: runDir },
+              runHandles: {
+                runId: staleRunId,
+                scriptPath: staleScriptPath,
+                transcriptDir: staleDir,
+              },
               phases: [],
               agents: [],
             },
           });
-          const taskEvent = started.storedEvents.find(
+          const staleTaskEvent = staleStarted.storedEvents.find(
             (stored) =>
               stored.event.type === "subagent.updated" &&
               stored.event.payload.origin === "app_owned",
           );
-          if (taskEvent?.event.type !== "subagent.updated") {
-            throw new Error("missing workflow task");
+          if (staleTaskEvent?.event.type !== "subagent.updated") {
+            throw new Error("missing stale workflow task");
           }
-          const taskId = taskEvent.event.payload.id;
+          const staleTaskId = staleTaskEvent.event.payload.id;
+
+          const child = yield* mcpService.delegateWorkflowAgent(parentScope, {
+            parentRunId: parentRun.id,
+            workflowNodeId: staleTaskId,
+            requestKey: `${staleRunId}:0`,
+            task: { task: "Stale child task", title: "Orphan child" },
+          });
+          const staleChildTurn = yield* Queue.take(harness1.turnQueue);
+          expect(staleChildTurn.turn.threadId).toBe(child.childThreadId);
+
+          // Queue another run behind the active child turn so recovery would resume it unless sweep cancels it.
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "agent",
+            creationSource: "mcp",
+            commandId: CommandId.make("command:sweep:child-queued"),
+            threadId: child.childThreadId,
+            senderThreadId: parentThreadId,
+            messageId: MessageId.make("message:sweep:child-queued"),
+            text: "Queued work behind active child",
+            attachments: [],
+            modelSelection,
+            dispatchMode: { type: "queue_after_active" },
+          });
+          const childBeforeRestart = yield* orchestrator.getThreadProjection(child.childThreadId);
+          expect(childBeforeRestart.runs.some((run) => run.status === "queued")).toBe(true);
+
           yield* fs.writeFileString(
-            path.join(runDir, "run.json"),
+            staleJournalPath,
+            `${JSON.stringify({
+              type: "started",
+              index: 0,
+              key: "stale-child-key",
+              label: "Orphan child",
+              phase: null,
+              agentId: child.taskId,
+              childThreadId: child.childThreadId,
+            })}\n`,
+          );
+          yield* fs.writeFileString(
+            path.join(staleDir, "run.json"),
             JSON.stringify({
               runId: staleRunId,
               threadId: parentThreadId,
-              taskId,
+              taskId: staleTaskId,
               name: "Stale",
-              scriptPath,
-              journalPath,
+              scriptPath: staleScriptPath,
+              journalPath: staleJournalPath,
               startedAt: 0,
               status: "running",
-              usage: {
-                agents: 0,
-                done: 0,
-                errors: 0,
-                empty: 0,
-                cached: 0,
-                tokens: 0,
-                durationMs: 0,
-              },
+              usage: zeroUsage,
             }),
           );
-          return { staleRunId, taskId };
+
+          // 2. Workflow already completed in SQL whose run.json still says "running" (crash between complete and write).
+          const completedRunId = "wf_c0ffee123456";
+          const completedDir = path.join(config.workflowsDir, completedRunId);
+          const completedScriptPath = path.join(completedDir, "script.js");
+          const completedJournalPath = path.join(completedDir, "journal.jsonl");
+          const completedResultText = "Workflow AlreadyDone completed.\nResult: 42";
+          yield* fs.makeDirectory(completedDir, { recursive: true });
+          yield* fs.writeFileString(
+            completedScriptPath,
+            `export const meta = { name: "AlreadyDone", description: "Finished before crash." }; return 42;`,
+          );
+          yield* fs.writeFileString(
+            completedJournalPath,
+            `${JSON.stringify({ type: "end", status: "completed", result: 42 })}\n`,
+          );
+          const completedStarted = yield* orchestrator.dispatch({
+            type: "workflow.start",
+            commandId: CommandId.make("command:sweep:completed-start"),
+            parentThreadId,
+            parentRunId: parentRun.id,
+            parentNodeId: parentRun.rootNodeId!,
+            title: "AlreadyDone",
+            description: "Finished before crash.",
+            modelSelection,
+            workflow: {
+              name: "AlreadyDone",
+              runHandles: {
+                runId: completedRunId,
+                scriptPath: completedScriptPath,
+                transcriptDir: completedDir,
+              },
+              phases: [],
+              agents: [],
+            },
+          });
+          const completedTaskEvent = completedStarted.storedEvents.find(
+            (stored) =>
+              stored.event.type === "subagent.updated" &&
+              stored.event.payload.origin === "app_owned",
+          );
+          if (completedTaskEvent?.event.type !== "subagent.updated") {
+            throw new Error("missing completed workflow task");
+          }
+          const completedTaskId = completedTaskEvent.event.payload.id;
+          yield* orchestrator.dispatch({
+            type: "workflow.complete",
+            commandId: CommandId.make("command:sweep:completed-finish"),
+            parentThreadId,
+            taskId: completedTaskId,
+            status: "completed",
+            result: completedResultText,
+          });
+          yield* fs.writeFileString(
+            path.join(completedDir, "run.json"),
+            JSON.stringify({
+              runId: completedRunId,
+              threadId: parentThreadId,
+              taskId: completedTaskId,
+              name: "AlreadyDone",
+              scriptPath: completedScriptPath,
+              journalPath: completedJournalPath,
+              startedAt: 0,
+              status: "running",
+              usage: zeroUsage,
+            }),
+          );
+
+          // 3. run.json written before workflow.start crashed, so the task never existed in SQL.
+          const unstartedRunId = "wf_0000dead0001";
+          const unstartedDir = path.join(config.workflowsDir, unstartedRunId);
+          const unstartedScriptPath = path.join(unstartedDir, "script.js");
+          const unstartedJournalPath = path.join(unstartedDir, "journal.jsonl");
+          yield* fs.makeDirectory(unstartedDir, { recursive: true });
+          yield* fs.writeFileString(
+            unstartedScriptPath,
+            `export const meta = { name: "Unstarted", description: "Crashed before start." }; return 0;`,
+          );
+          yield* fs.writeFileString(unstartedJournalPath, "");
+          yield* fs.writeFileString(
+            path.join(unstartedDir, "run.json"),
+            JSON.stringify({
+              runId: unstartedRunId,
+              threadId: parentThreadId,
+              taskId: NodeId.make("node:delegated-task:never-dispatched"),
+              name: "Unstarted",
+              scriptPath: unstartedScriptPath,
+              journalPath: unstartedJournalPath,
+              startedAt: 0,
+              status: "running",
+              usage: zeroUsage,
+            }),
+          );
+
+          return {
+            staleRunId,
+            staleTaskId,
+            childTaskId: child.taskId,
+            childThreadId: child.childThreadId,
+            completedRunId,
+            completedTaskId,
+            completedResultText,
+            unstartedRunId,
+            completedMetaPath: path.join(completedDir, "run.json"),
+            unstartedMetaPath: path.join(unstartedDir, "run.json"),
+          };
         }).pipe(Effect.provide(harness1.layerToolkit));
 
         // Build a fresh WorkflowService layer against the same workflowsDir and database.
@@ -1225,18 +1417,406 @@ describe("WorkflowService and workflow MCP tools", () => {
         });
         yield* Effect.gen(function* () {
           const orchestrator = yield* Orchestrator.OrchestratorV2;
-          const statusCall = yield* callTool("t3_workflow_status", { runId: seeded.staleRunId });
-          expect(statusCall.isError).not.toBe(true);
-          const status = yield* decodeStatusResult(statusCall.structuredContent);
-          expect(status.status).toBe("failed");
-          expect(status.error).toContain(`resumeFromRunId=${seeded.staleRunId}`);
+
+          // 1. Stale workflow is marked failed and its unfinished child is stopped with queued runs cancelled.
+          const staleStatusCall = yield* callTool("t3_workflow_status", {
+            runId: seeded.staleRunId,
+          });
+          expect(staleStatusCall.isError).not.toBe(true);
+          const staleStatus = yield* decodeStatusResult(staleStatusCall.structuredContent);
+          expect(staleStatus.status).toBe("failed");
+          expect(staleStatus.error).toContain(`resumeFromRunId=${seeded.staleRunId}`);
 
           const parentProjection = yield* orchestrator.getThreadProjection(parentThreadId);
-          const task = parentProjection.subagents.find((s) => s.id === seeded.taskId);
-          expect(task?.status).toBe("failed");
-          expect(task?.result).toContain(`resumeFromRunId=${seeded.staleRunId}`);
+          const staleTask = parentProjection.subagents.find((s) => s.id === seeded.staleTaskId);
+          expect(staleTask?.status).toBe("failed");
+          expect(staleTask?.result).toContain(`resumeFromRunId=${seeded.staleRunId}`);
+
+          const childProjection = yield* orchestrator.getThreadProjection(seeded.childThreadId);
+          expect(childProjection.runs.filter((run) => run.status === "queued")).toHaveLength(0);
+          expect(childProjection.runs.some((run) => run.status === "cancelled")).toBe(true);
+          expect(
+            childProjection.turnItems.some((item) => item.type === "run_interrupt_request") ||
+              childProjection.runs.some((run) => run.status === "interrupted"),
+          ).toBe(true);
+
+          // 2. Already-completed task keeps its result untouched and run.json reconciles to completed.
+          const completedTask = parentProjection.subagents.find(
+            (s) => s.id === seeded.completedTaskId,
+          );
+          expect(completedTask?.status).toBe("completed");
+          expect(completedTask?.result).toBe(seeded.completedResultText);
+
+          const completedStatusCall = yield* callTool("t3_workflow_status", {
+            runId: seeded.completedRunId,
+          });
+          const completedStatus = yield* decodeStatusResult(completedStatusCall.structuredContent);
+          expect(completedStatus.status).toBe("completed");
+          expect(completedStatus.result).toBe(42);
+          expect(completedStatus.error).toBeUndefined();
+          const completedMeta = JSON.parse(yield* fs.readFileString(seeded.completedMetaPath)) as {
+            status: string;
+          };
+          expect(completedMeta.status).toBe("completed");
+
+          // 3. Unstarted run.json is marked terminal failed without erroring on missing SQL task.
+          const unstartedStatusCall = yield* callTool("t3_workflow_status", {
+            runId: seeded.unstartedRunId,
+          });
+          const unstartedStatus = yield* decodeStatusResult(unstartedStatusCall.structuredContent);
+          expect(unstartedStatus.status).toBe("failed");
+          const unstartedMeta = JSON.parse(yield* fs.readFileString(seeded.unstartedMetaPath)) as {
+            status: string;
+          };
+          expect(unstartedMeta.status).toBe("failed");
         }).pipe(Effect.provide(harness2.layerToolkit));
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "cancels unawaited agents when the script returns, journals them null with a log line, and then completes",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWorkflowHarness({ name: "unawaited-agent" });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const fs = yield* FileSystem.FileSystem;
+          yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "unawaited-agent");
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          const script = `
+            export const meta = {
+              name: "Unawaited",
+              description: "Leaves one agent running when returning.",
+            };
+            agent("Hold me open", { label: "Orphan" });
+            const gate = await agent("Release script", { label: "Gate" });
+            return { gate };
+          `;
+          const runCall = yield* callTool("t3_workflow_run", { script });
+          expect(runCall.isError).not.toBe(true);
+          const started = yield* decodeRunResult(runCall.structuredContent);
+
+          const turnA = yield* Queue.take(harness.turnQueue);
+          const turnB = yield* Queue.take(harness.turnQueue);
+          const orphanTurn = turnA.turn.message.text.includes("Hold me open") ? turnA : turnB;
+          const gateTurn = orphanTurn === turnA ? turnB : turnA;
+
+          // Keep orphanTurn held open while gateTurn finishes so the script returns with a live child.
+          yield* gateTurn.complete("go");
+
+          yield* Deferred.await(orphanTurn.interrupted);
+          const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
+          expect(terminal.status).toBe("completed");
+          expect(terminal.result).toContain('"gate":"go"');
+          expect(terminal.workflow?.agents).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ label: "Orphan", state: "failed" }),
+              expect.objectContaining({ label: "Gate", state: "completed" }),
+            ]),
+          );
+
+          const statusCall = yield* callTool("t3_workflow_status", { runId: started.runId });
+          const status = yield* decodeStatusResult(statusCall.structuredContent);
+          expect(status.logs).toContain("1 unawaited agent was cancelled when the script ended");
+
+          const journal = decodeJournal(yield* fs.readFileString(started.journalPath));
+          const orphanResultIndex = journal.findIndex(
+            (entry) => entry.type === "result" && entry.index === 0 && entry.outcome === "null",
+          );
+          const logIndex = journal.findIndex(
+            (entry) =>
+              entry.type === "log" &&
+              entry.message === "1 unawaited agent was cancelled when the script ended",
+          );
+          const endIndex = journal.findIndex((entry) => entry.type === "end");
+          expect(orphanResultIndex).toBeGreaterThan(-1);
+          expect(logIndex).toBeGreaterThan(orphanResultIndex);
+          expect(endIndex).toBeGreaterThan(logIndex);
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }),
+  );
+
+  it.effect(
+    "cancels a queued schema re-prompt on stop so no queued run remains and nothing wakes the parent",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWorkflowHarness({
+          name: "stop-queued-reprompt",
+          runContinuationWorker: true,
+        });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const parentTurn = yield* startParentThreadAndRun(
+            harness.turnQueue,
+            harness.cwd,
+            "stop-queued-reprompt",
+          );
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          const script = `
+            export const meta = {
+              name: "QueuedReprompt",
+              description: "Stops while schema re-prompt is queued.",
+            };
+            return await agent("Return JSON", {
+              label: "Structured",
+              schema: {
+                type: "object",
+                properties: { ok: { type: "boolean" } },
+                required: ["ok"],
+                additionalProperties: false,
+              },
+            });
+          `;
+          const runCall = yield* callTool("t3_workflow_run", { script });
+          expect(runCall.isError).not.toBe(true);
+          const started = yield* decodeRunResult(runCall.structuredContent);
+
+          // Complete the parent turn so any unwanted wake would actually start a second parent turn.
+          yield* parentTurn.complete("Started workflow.");
+          yield* awaitRunStatus(parentThreadId, parentTurn.turn.runId, "completed", beforeSeq);
+
+          const attempt1 = yield* Queue.take(harness.turnQueue);
+          const childThreadId = attempt1.turn.threadId;
+          yield* attempt1.complete("invalid json 1");
+
+          // Let re-prompt #1 start; queue a blocker behind it so re-prompt #2 lands queued.
+          const reprompt1 = yield* Queue.take(harness.turnQueue);
+          expect(reprompt1.turn.threadId).toBe(childThreadId);
+          expect(reprompt1.turn.message.text).toContain("Your result did not match the schema:");
+          const beforeChildSeq = yield* orchestrator.getThreadEventSequence(childThreadId);
+
+          yield* orchestrator.dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("command:stop-queued-reprompt:blocker"),
+            threadId: childThreadId,
+            messageId: MessageId.make("message:stop-queued-reprompt:blocker"),
+            text: "Hold child busy while re-prompt #2 queues",
+            attachments: [],
+            modelSelection,
+            dispatchMode: { type: "queue_after_active" },
+          });
+
+          yield* reprompt1.complete("invalid json 2");
+          const blockerTurn = yield* Queue.take(harness.turnQueue);
+          expect(blockerTurn.turn.threadId).toBe(childThreadId);
+
+          // Wait until re-prompt #2 is durably queued on the child thread behind the blocker turn.
+          const queuedReprompt = yield* orchestrator
+            .streamStoredEventsFrom({
+              threadId: childThreadId,
+              afterSequence: beforeChildSeq,
+              eventType: "run.updated",
+            })
+            .pipe(
+              Stream.filter(
+                ({ event }) =>
+                  event.type === "run.updated" &&
+                  event.payload.id !== attempt1.turn.runId &&
+                  event.payload.id !== reprompt1.turn.runId &&
+                  event.payload.outputSchema !== undefined &&
+                  event.payload.status === "queued",
+              ),
+              Stream.runHead,
+            );
+          if (Option.isNone(queuedReprompt) || queuedReprompt.value.event.type !== "run.updated") {
+            throw new Error("Expected queued schema re-prompt run");
+          }
+          const repromptRunId = queuedReprompt.value.event.payload.id;
+
+          const externalFullAccessScope: McpInvocationContext.McpInvocationScope = {
+            environmentId: parentScope.environmentId,
+            requestNamespace: "client-session:external-stop",
+            thread: undefined,
+            client: {
+              sessionId: "client-session:external-stop",
+              label: "External Stop",
+              access: "full-access",
+            },
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+          const stopCall = yield* callTool(
+            "t3_workflow_stop",
+            { runId: started.runId },
+            externalFullAccessScope,
+          );
+          expect(stopCall.isError).not.toBe(true);
+          expect(stopCall.structuredContent).toEqual({
+            runId: started.runId,
+            status: "cancelled",
+          });
+
+          yield* Deferred.await(blockerTurn.interrupted);
+
+          const childProjection = yield* orchestrator.getThreadProjection(childThreadId);
+          expect(childProjection.runs.find((run) => run.id === repromptRunId)?.status).toBe(
+            "cancelled",
+          );
+          expect(childProjection.runs.filter((run) => run.status === "queued")).toHaveLength(0);
+
+          const parentProjection = yield* orchestrator.getThreadProjection(parentThreadId);
+          expect(parentProjection.runs).toHaveLength(1);
+          expect(
+            parentProjection.subagents.find((s) => s.id === started.taskId)?.completionDelivery
+              ?.state,
+          ).toBe("disposed");
+          const allTurns = yield* Ref.get(harness.startedTurns);
+          expect(allTurns.filter((t) => t.turn.threadId === parentThreadId)).toHaveLength(1);
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }),
+  );
+
+  it.effect(
+    "bounds large completion text to 12,000 UTF-8 bytes, names the runId in the wake, and keeps full result in status",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWorkflowHarness({
+          name: "large-result",
+          runContinuationWorker: true,
+        });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const parentTurn = yield* startParentThreadAndRun(
+            harness.turnQueue,
+            harness.cwd,
+            "large-result",
+          );
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          const script = `
+            export const meta = {
+              name: "LargeResult",
+              description: "Returns a 40 KB payload.",
+            };
+            return { payload: "x".repeat(40 * 1024) };
+          `;
+          const runCall = yield* callTool("t3_workflow_run", { script });
+          expect(runCall.isError).not.toBe(true);
+          const started = yield* decodeRunResult(runCall.structuredContent);
+
+          yield* parentTurn.complete("Waiting for large workflow.");
+          yield* awaitRunStatus(parentThreadId, parentTurn.turn.runId, "completed", beforeSeq);
+
+          const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
+          expect(terminal.status).toBe("completed");
+          expect(terminal.result).not.toBeNull();
+          expect(Buffer.byteLength(terminal.result!, "utf8")).toBeLessThanOrEqual(12_000);
+          expect(terminal.result).toContain(started.runId);
+          expect(terminal.result).toContain("t3_workflow_status");
+          expect(terminal.result).toContain("Usage:");
+          expect(terminal.result).toContain(`Journal: ${started.journalPath}`);
+
+          // Delegated completion delivery inlines the bounded summary rather than dropping to task_status.
+          const wakeTurn = yield* Queue.take(harness.turnQueue);
+          expect(wakeTurn.turn.threadId).toBe(parentThreadId);
+          expect(wakeTurn.turn.message.text).toContain(started.runId);
+          expect(wakeTurn.turn.message.text).toContain("t3_workflow_status");
+          expect(wakeTurn.turn.message.text).not.toContain("Use task_status with taskId");
+          yield* wakeTurn.complete("Acknowledged.");
+
+          const statusCall = yield* callTool("t3_workflow_status", { runId: started.runId });
+          const status = yield* decodeStatusResult(statusCall.structuredContent);
+          expect(status.result).toEqual({ payload: "x".repeat(40 * 1024) });
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }),
+  );
+
+  it.effect(
+    "publishes the final workflow snapshot on stop before the next TestClock progress tick",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWorkflowHarness({ name: "stop-final-snapshot" });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "stop-final-snapshot");
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          const progressQueue = yield* Queue.unbounded<OrchestrationV2Subagent>();
+          const watcher = yield* orchestrator
+            .streamStoredEventsFrom({
+              threadId: parentThreadId,
+              afterSequence: beforeSeq,
+              eventType: "subagent.updated",
+            })
+            .pipe(
+              Stream.filter(
+                (
+                  stored,
+                ): stored is typeof stored & {
+                  readonly event: Extract<
+                    OrchestrationV2DomainEvent,
+                    { readonly type: "subagent.updated" }
+                  >;
+                } =>
+                  stored.event.type === "subagent.updated" &&
+                  stored.event.payload.workflow !== undefined &&
+                  stored.event.payload.progress !== undefined,
+              ),
+              Stream.runForEach(({ event }) => Queue.offer(progressQueue, event.payload)),
+              Effect.forkScoped,
+            );
+
+          const script = `
+            export const meta = {
+              name: "StopSnapshot",
+              description: "Stops before the next progress tick.",
+            };
+            log("boot");
+            await agent("First step", { label: "First" });
+            await agent("Second step", { label: "Second" });
+            return "done";
+          `;
+          const runCall = yield* callTool("t3_workflow_run", { script });
+          expect(runCall.isError).not.toBe(true);
+          const started = yield* decodeRunResult(runCall.structuredContent);
+
+          // Consume the initial T=0 progress tick so subsequent updates wait for the 1s coalescing window.
+          const firstTick = yield* Queue.take(progressQueue);
+          expect(firstTick.progress).toBe("boot");
+
+          const firstTurn = yield* Queue.take(harness.turnQueue);
+          yield* firstTurn.complete("done-1");
+
+          const secondTurn = yield* Queue.take(harness.turnQueue);
+          expect(secondTurn.turn.message.text).toContain("Second step");
+
+          // Before stopping (still at T=0), the coalesced row has not yet recorded the second agent.
+          const beforeStopTask = (yield* orchestrator.getThreadProjection(
+            parentThreadId,
+          )).subagents.find((candidate) => candidate.id === started.taskId);
+          expect(beforeStopTask?.workflow?.agents.some((agent) => agent.label === "Second")).toBe(
+            false,
+          );
+
+          const stopCall = yield* callTool("t3_workflow_stop", { runId: started.runId });
+          expect(stopCall.isError).not.toBe(true);
+          expect(stopCall.structuredContent).toEqual({
+            runId: started.runId,
+            status: "cancelled",
+          });
+          yield* Deferred.await(secondTurn.interrupted);
+
+          const terminalTask = (yield* orchestrator.getThreadProjection(
+            parentThreadId,
+          )).subagents.find((candidate) => candidate.id === started.taskId);
+          expect(terminalTask?.status).toBe("cancelled");
+          expect(terminalTask?.workflow?.agents).toEqual(
+            expect.arrayContaining([
+              expect.objectContaining({ label: "First", state: "completed" }),
+              expect.objectContaining({
+                label: "Second",
+                state: "failed",
+                childThreadId: secondTurn.turn.threadId,
+              }),
+            ]),
+          );
+          yield* Fiber.interrupt(watcher);
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }),
   );
 
   it.effect("rejects target.environmentId in OrchestratorMcpService.delegateWorkflowAgent", () =>
