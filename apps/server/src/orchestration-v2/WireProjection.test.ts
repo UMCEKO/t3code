@@ -949,6 +949,7 @@ describe("orchestration V2 wire projection", () => {
           const layer = Layer.mergeAll(
             Layer.mock(ThreadManagementService.ThreadManagementService)({
               ensureLegacyTranscript: () => Effect.void,
+              getThreadRecords: () => Effect.succeed({ subagents: [memberSubagent] } as never),
               getThreadSnapshot: () =>
                 Effect.succeed({
                   schemaVersion: 1,
@@ -971,12 +972,8 @@ describe("orchestration V2 wire projection", () => {
                   rawPayloadBytes: 1_024,
                   hasCreateEvent: false,
                 }),
-              readAgentEvents: () =>
-                Stream.fromIterable([
-                  deltaStoredEvent,
-                  memberSubagentStoredEvent,
-                  memberItemStoredEvent,
-                ]),
+              // The cursor replay omits the member's subagent record, so only SQL membership bounds its item.
+              readAgentEvents: () => Stream.fromIterable([deltaStoredEvent, memberItemStoredEvent]),
             }),
           );
 
@@ -1020,7 +1017,7 @@ describe("orchestration V2 wire projection", () => {
             threadId: base.threadId,
             afterSequence: 10,
           }).pipe(Effect.flatMap(Stream.runCollect), Effect.provide(layer));
-          const [replayDelta, , replayMemberItem] = Array.from(replayed);
+          const [replayDelta, replayMemberItem] = Array.from(replayed);
           expect(replayDelta?.kind).toBe("event");
           if (replayDelta?.kind === "event" && replayDelta.event.type === "subagent.updated") {
             expect(replayDelta.event.payload.workflow?.agentsDelta).toBe(true);

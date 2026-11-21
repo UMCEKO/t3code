@@ -634,10 +634,10 @@ function remember<K, V>(memory: Map<K, V>, key: K, value: V): void {
 }
 
 /** One per subscription without body dedupe: workflow-member turn items ship as previews. */
-export function makeWorkflowMemberBounder(): (
-  item: OrchestrationV2ThreadStreamItem,
-) => OrchestrationV2ThreadStreamItem {
-  const members = new Set<NodeId>();
+export function makeWorkflowMemberBounder(
+  knownMembers: Iterable<NodeId> = [],
+): (item: OrchestrationV2ThreadStreamItem) => OrchestrationV2ThreadStreamItem {
+  const members = new Set<NodeId>(knownMembers);
   const note = (subagent: OrchestrationV2Subagent) => {
     if (subagent.completionWake === "never") members.add(subagent.id);
   };

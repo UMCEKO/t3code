@@ -1135,7 +1135,35 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
       ) {
         return yield* snapshotThenLive();
       }
-      const replay = coalesceLiveUpdatedEvents(replayed);
+      const coalescedReplay = coalesceLiveUpdatedEvents(replayed);
+      // Cursor-only replays never see a snapshot, so workflow membership comes from SQL before sizing.
+      const replaysSubagentItems = coalescedReplay.some(
+        (item) =>
+          item.kind === "event" &&
+          item.event.type === "turn-item.updated" &&
+          item.event.payload.type === "subagent",
+      );
+      const replaySubagents = replaysSubagentItems
+        ? (yield* threadManagement.getThreadRecords(input.threadId, ["subagents"]).pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationV2GetThreadProjectionError({
+                  threadId: input.threadId,
+                  message: `Failed to prepare orchestration V2 thread ${input.threadId} replay`,
+                  cause,
+                }),
+            ),
+          )).subagents
+        : [];
+      const replay = replaysSubagentItems
+        ? coalescedReplay.map(
+            makeWorkflowMemberBounder(
+              replaySubagents.flatMap((subagent) =>
+                subagent.completionWake === "never" ? [subagent.id] : [],
+              ),
+            ),
+          )
+        : coalescedReplay;
       const plan = decideThreadResume({
         afterSequence: input.afterSequence,
         highWater,
