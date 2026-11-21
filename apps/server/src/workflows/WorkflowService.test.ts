@@ -159,6 +159,7 @@ interface HarnessOptions {
   readonly wrapThreadManagement?: (
     service: ThreadManagementService.ThreadManagementService["Service"],
   ) => ThreadManagementService.ThreadManagementService["Service"];
+  readonly wrapFileSystem?: (service: FileSystem.FileSystem) => FileSystem.FileSystem;
 }
 
 const makeWorkflowHarness = (options: HarnessOptions) =>
@@ -440,6 +441,13 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
       cwd,
       options.baseDir ?? { prefix: `t3-workflow-${options.name}-` },
     ).pipe(Layer.provide(NodeServices.layer));
+    const layerNodeServices =
+      options.wrapFileSystem === undefined
+        ? NodeServices.layer
+        : Layer.effect(
+            FileSystem.FileSystem,
+            Effect.map(FileSystem.FileSystem, options.wrapFileSystem),
+          ).pipe(Layer.provideMerge(NodeServices.layer));
     const layerToolkit = Layer.merge(
       McpHttpServer.layerOrchestratorToolkit,
       OrchestratorMcpService.layer,
@@ -461,7 +469,7 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
       ),
       Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
       Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
-      Layer.provideMerge(Layer.mergeAll(NodeServices.layer, NodeCrypto.layer)),
+      Layer.provideMerge(Layer.mergeAll(layerNodeServices, NodeCrypto.layer)),
     );
 
     return {
@@ -535,9 +543,15 @@ const awaitWorkflowTerminal = (taskId: NodeId, afterSequence: number) =>
         subagent.status === "failed" ||
         subagent.status === "cancelled" ||
         subagent.status === "interrupted");
-    const current = (yield* orchestrator.getThreadProjection(parentThreadId)).subagents.find(
-      (candidate) => candidate.id === taskId,
-    );
+    const readCurrent = () =>
+      orchestrator
+        .getThreadProjection(parentThreadId)
+        .pipe(
+          Effect.map((projection) =>
+            projection.subagents.find((candidate) => candidate.id === taskId),
+          ),
+        );
+    const current = yield* readCurrent();
     if (isTerminal(current)) return current!;
     const matched = yield* orchestrator
       .streamStoredEventsFrom({
@@ -557,7 +571,8 @@ const awaitWorkflowTerminal = (taskId: NodeId, afterSequence: number) =>
     if (Option.isNone(matched) || matched.value.event.type !== "subagent.updated") {
       throw new Error(`Workflow task ${taskId} did not settle`);
     }
-    return matched.value.event.payload;
+    // Streamed subagent.updated events carry wire deltas, so read the full persisted projection.
+    return (yield* readCurrent()) ?? matched.value.event.payload;
   });
 
 const awaitRunStatus = (threadId: ThreadId, runId: string, status: string, afterSequence: number) =>
@@ -1943,7 +1958,7 @@ describe("WorkflowService and workflow MCP tools", () => {
 
           const started = yield* orchestrator.dispatch({
             type: "workflow.start",
-            commandId: CommandId.make("command:sql-recovery:start"),
+            commandId: CommandId.make("command:sql-recovery:workflow-start"),
             parentThreadId,
             parentRunId: parentRun.id,
             parentNodeId: parentRun.rootNodeId!,
@@ -2423,6 +2438,7 @@ describe("WorkflowService and workflow MCP tools", () => {
         const path = yield* Path.Path;
         let completeAttempts = 0;
         const completeFailedOnce = yield* Deferred.make<void>();
+        const terminalMetaWritten = yield* Deferred.make<void>();
         const sharedBaseDir = yield* fs.realPath(
           yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-medium3-" }),
         );
@@ -2434,6 +2450,19 @@ describe("WorkflowService and workflow MCP tools", () => {
           name: "medium3-live",
           databaseLayer,
           baseDir: sharedBaseDir,
+          wrapFileSystem: (fsService) => ({
+            ...fsService,
+            rename: (oldPath, newPath) =>
+              fsService
+                .rename(oldPath, newPath)
+                .pipe(
+                  Effect.tap(() =>
+                    completeAttempts >= 2 && path.basename(newPath) === "run.json"
+                      ? Deferred.succeed(terminalMetaWritten, undefined)
+                      : Effect.void,
+                  ),
+                ),
+          }),
           wrapThreadManagement: (tm) => ({
             ...tm,
             dispatch: (command) =>
@@ -2482,6 +2511,8 @@ describe("WorkflowService and workflow MCP tools", () => {
           yield* TestClock.adjust("50 millis");
           const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
           expect(terminal.status).toBe("completed");
+          // Terminal run.json writes asynchronously after SQL commit; await its atomic rename.
+          yield* Deferred.await(terminalMetaWritten);
           const finalStatus = yield* decodeStatusResult(
             (yield* callTool("t3_workflow_status", { runId: started.runId })).structuredContent,
           );
