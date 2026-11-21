@@ -1,9 +1,14 @@
-import { describe, expect, it } from "vite-plus/test";
+import { describe, expect, it } from "@effect/vitest";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
+import * as Fiber from "effect/Fiber";
 
 import {
+  MAX_PENDING_JOURNAL_ENTRIES,
   agentCallKey,
   decodeJournal,
   encodeJournalEntry,
+  makeJournalWriter,
   replayCursor,
   type JournalEntry,
 } from "./journal.ts";
@@ -181,5 +186,70 @@ describe("journal", () => {
       expect(() => cursor.take(0, "k0")).toThrow(/expected index 1, got 0/i);
       expect(() => cursor.take(2, "k2")).toThrow(/expected index 1, got 2/i);
     });
+  });
+
+  describe("makeJournalWriter", () => {
+    it.effect(
+      "bounds pending entries under a burst beyond 1,024 without losing ordering and rejects entries after close",
+      () =>
+        Effect.gen(function* () {
+          const total = MAX_PENDING_JOURNAL_ENTRIES + 500;
+          const firstWriteStarted = yield* Deferred.make<void>();
+          const releaseWrites = yield* Deferred.make<void>();
+          const queueFilled = yield* Deferred.make<void>();
+          const written: Array<string> = [];
+          let blockedPastCap = false;
+
+          const writer = yield* makeJournalWriter({
+            writeLine: (line) =>
+              Effect.gen(function* () {
+                if (written.length === 0) {
+                  yield* Deferred.succeed(firstWriteStarted, undefined);
+                  yield* Deferred.await(releaseWrites);
+                }
+                written.push(line);
+              }),
+          });
+
+          const producer = yield* Effect.gen(function* () {
+            for (let i = 0; i < total; i += 1) {
+              const accepted = yield* writer.append({ type: "log", message: `msg-${i}` });
+              expect(accepted).toBe(true);
+              if (i === MAX_PENDING_JOURNAL_ENTRIES) {
+                yield* Deferred.succeed(queueFilled, undefined);
+              }
+              if (i === MAX_PENDING_JOURNAL_ENTRIES + 1) {
+                blockedPastCap = true;
+              }
+            }
+          }).pipe(Effect.forkScoped);
+
+          yield* Deferred.await(firstWriteStarted);
+          yield* Deferred.await(queueFilled);
+          yield* Effect.yieldNow;
+
+          // Pending entries stay bounded to 1 in-flight + MAX_PENDING_JOURNAL_ENTRIES queued.
+          expect(yield* writer.pendingCount).toBe(MAX_PENDING_JOURNAL_ENTRIES + 1);
+          expect(blockedPastCap).toBe(false);
+          expect(writer.tryAppend({ type: "log", message: "overflow" })).toBe(false);
+
+          yield* Deferred.succeed(releaseWrites, undefined);
+          yield* Fiber.join(producer);
+          yield* writer.flush;
+
+          expect(blockedPastCap).toBe(true);
+          expect(written).toHaveLength(total);
+          const decoded = decodeJournal(written.join(""));
+          expect(decoded).toHaveLength(total);
+          for (let i = 0; i < total; i += 1) {
+            expect(decoded[i]).toEqual({ type: "log", message: `msg-${i}` });
+          }
+
+          yield* writer.close;
+          expect(yield* writer.append({ type: "log", message: "after-close" })).toBe(false);
+          expect(writer.tryAppend({ type: "log", message: "after-close-sync" })).toBe(false);
+          expect(written).toHaveLength(total);
+        }),
+    );
   });
 });

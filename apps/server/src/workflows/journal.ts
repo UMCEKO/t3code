@@ -1,5 +1,21 @@
 // @effect-diagnostics-next-line nodeBuiltinImport:off -- deterministic SHA-256 hashing has no synchronous Effect equivalent.
 import * as NodeCrypto from "node:crypto";
+import * as Deferred from "effect/Deferred";
+import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
+import * as Fiber from "effect/Fiber";
+import * as Queue from "effect/Queue";
+import * as Schema from "effect/Schema";
+import type * as Scope from "effect/Scope";
+
+export const MAX_PENDING_JOURNAL_ENTRIES = 1_024;
+
+export class JournalEncodeError extends Schema.TaggedError<JournalEncodeError>()(
+  "JournalEncodeError",
+  {
+    cause: Schema.Defect(),
+  },
+) {}
 
 export type JournalEntry =
   | {
@@ -245,3 +261,106 @@ export function replayCursor(previous: ReadonlyArray<JournalEntry>): ReplayCurso
     },
   };
 }
+
+type JournalQueueItem =
+  | { readonly _tag: "entry"; readonly entry: JournalEntry }
+  | { readonly _tag: "flush"; readonly done: Deferred.Deferred<void> };
+
+export interface JournalWriter {
+  readonly append: (entry: JournalEntry) => Effect.Effect<boolean>;
+  readonly tryAppend: (entry: JournalEntry) => boolean;
+  readonly flush: Effect.Effect<void>;
+  readonly close: Effect.Effect<void>;
+  readonly pendingCount: Effect.Effect<number>;
+}
+
+export const makeJournalWriter = Effect.fn("WorkflowJournal.makeJournalWriter")(function* <
+  E,
+>(input: {
+  readonly writeLine: (line: string) => Effect.Effect<void, E>;
+  readonly onWriteError?: (error: E | JournalEncodeError) => Effect.Effect<void>;
+  readonly maxPending?: number;
+}): Effect.fn.Return<JournalWriter, never, Scope.Scope> {
+  const capacity = Math.max(1, Math.trunc(input.maxPending ?? MAX_PENDING_JOURNAL_ENTRIES));
+  const queue = yield* Queue.bounded<JournalQueueItem>(capacity);
+  let closed = false;
+  let inFlight = 0;
+  const pendingFlushes = new Set<Deferred.Deferred<void>>();
+
+  const resolvePendingFlushes = Effect.sync(() => {
+    for (const done of pendingFlushes) {
+      Deferred.doneUnsafe(done, Exit.void);
+    }
+    pendingFlushes.clear();
+  });
+
+  const writerFiber = yield* Effect.gen(function* () {
+    while (true) {
+      const taken = yield* Queue.take(queue).pipe(Effect.exit);
+      if (Exit.isFailure(taken)) return;
+      const item = taken.value;
+      if (item._tag === "flush") {
+        pendingFlushes.delete(item.done);
+        Deferred.doneUnsafe(item.done, Exit.void);
+        continue;
+      }
+      inFlight += 1;
+      yield* Effect.try({
+        try: () => encodeJournalEntry(item.entry),
+        catch: (cause) => new JournalEncodeError({ cause }),
+      }).pipe(
+        Effect.flatMap((line) => input.writeLine(line)),
+        Effect.catch((error) =>
+          input.onWriteError !== undefined ? input.onWriteError(error) : Effect.void,
+        ),
+        Effect.ensuring(
+          Effect.sync(() => {
+            inFlight -= 1;
+          }),
+        ),
+      );
+    }
+  }).pipe(Effect.ensuring(resolvePendingFlushes), Effect.forkScoped);
+
+  const close = Effect.gen(function* () {
+    if (closed) return;
+    closed = true;
+    yield* Queue.shutdown(queue);
+    yield* Fiber.interrupt(writerFiber);
+    yield* resolvePendingFlushes;
+  });
+
+  yield* Effect.addFinalizer(() => close);
+
+  const append = (entry: JournalEntry): Effect.Effect<boolean> =>
+    Effect.suspend(() =>
+      closed ? Effect.succeed(false) : Queue.offer(queue, { _tag: "entry", entry }),
+    );
+
+  const tryAppend = (entry: JournalEntry): boolean => {
+    if (closed) return false;
+    return Queue.offerUnsafe(queue, { _tag: "entry", entry });
+  };
+
+  const flush: Effect.Effect<void> = Effect.gen(function* () {
+    if (closed) return;
+    const done = yield* Deferred.make<void>();
+    pendingFlushes.add(done);
+    const offered = yield* Queue.offer(queue, { _tag: "flush", done });
+    if (!offered) {
+      pendingFlushes.delete(done);
+      return;
+    }
+    yield* Deferred.await(done);
+  });
+
+  const pendingCount = Queue.size(queue).pipe(Effect.map((size) => size + inFlight));
+
+  return {
+    append,
+    tryAppend,
+    flush,
+    close,
+    pendingCount,
+  };
+});

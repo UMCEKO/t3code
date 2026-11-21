@@ -18,6 +18,7 @@ import {
   TurnItemId,
   type ModelSelection,
   type OrchestrationV2DomainEvent,
+  type OrchestrationV2PendingBackgroundTask,
   type OrchestrationV2Subagent,
   type ServerProvider,
   type TurnTokenUsage,
@@ -133,6 +134,9 @@ interface ActiveTurnHandle {
   readonly turn: ProviderAdapter.ProviderAdapterV2TurnInput;
   readonly providerTurnId: ProviderTurnId;
   readonly interrupted: Deferred.Deferred<void>;
+  readonly setPendingBackgroundTasks: (
+    tasks: ReadonlyArray<OrchestrationV2PendingBackgroundTask>,
+  ) => Effect.Effect<void>;
   readonly complete: (
     text: string,
     options?: { readonly turnTokenUsage?: TurnTokenUsage },
@@ -184,6 +188,7 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
           readonly startedAt: DateTime.Utc;
         };
         readonly events: Queue.Queue<ProviderAdapter.ProviderAdapterV2Event>;
+        terminal: boolean;
       }
     >();
 
@@ -259,8 +264,24 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
                   turn,
                   providerTurnId,
                   interrupted,
+                  setPendingBackgroundTasks: (pendingBackgroundTasks) =>
+                    Effect.gen(function* () {
+                      const updatedAt = yield* DateTime.now;
+                      yield* Queue.offer(events, {
+                        type: "provider_thread.updated",
+                        driver,
+                        providerThread: {
+                          ...turn.providerThread,
+                          status: "active",
+                          pendingBackgroundTasks,
+                          updatedAt,
+                        },
+                      });
+                    }),
                   complete: (text, opts) =>
                     Effect.gen(function* () {
+                      const entry = turnsByProviderTurnId.get(providerTurnId);
+                      if (entry !== undefined) entry.terminal = true;
                       const doneAt = yield* DateTime.now;
                       const messageId = MessageId.make(`msg:assistant:${turn.attemptId}`);
                       if (text.length > 0) {
@@ -332,6 +353,8 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
                     }),
                   failUsageLimit: () =>
                     Effect.gen(function* () {
+                      const entry = turnsByProviderTurnId.get(providerTurnId);
+                      if (entry !== undefined) entry.terminal = true;
                       const doneAt = yield* DateTime.now;
                       yield* Queue.offer(events, {
                         type: "provider_turn.updated",
@@ -361,7 +384,12 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
                       });
                     }),
                 };
-                turnsByProviderTurnId.set(providerTurnId, { handle, baseProviderTurn, events });
+                turnsByProviderTurnId.set(providerTurnId, {
+                  handle,
+                  baseProviderTurn,
+                  events,
+                  terminal: false,
+                });
                 yield* Ref.update(startedTurns, (list) => [...list, handle]);
                 yield* Queue.offer(turnQueue, handle);
               }),
@@ -370,8 +398,9 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
               Effect.gen(function* () {
                 const entry = turnsByProviderTurnId.get(providerTurnId);
                 if (entry === undefined) return;
-                const doneAt = yield* DateTime.now;
                 yield* Deferred.succeed(entry.handle.interrupted, undefined);
+                if (entry.terminal) return;
+                const doneAt = yield* DateTime.now;
                 yield* Queue.offer(entry.events, {
                   type: "provider_turn.updated",
                   driver,
@@ -2274,6 +2303,7 @@ describe("WorkflowService and workflow MCP tools", () => {
             export const meta = { name: "OneStopPath", description: "Keeps late child on stop." };
             log("boot");
             await agent("Step 1", { label: "First" });
+            log("running step 2");
             await agent("Step 2", { label: "Second" });
             return "done";
           `;
@@ -2293,11 +2323,12 @@ describe("WorkflowService and workflow MCP tools", () => {
           const secondTurn = yield* Queue.take(harness.turnQueue);
           expect(secondTurn.turn.message.text).toContain("Step 2");
 
-          // Confirm the coalesced row has not yet published the second child.
+          // Confirm the coalesced row has not yet published the second child or newest log.
           const beforeStopTask = (yield* orchestrator.getThreadProjection(
             parentThreadId,
           )).subagents.find((s) => s.id === started.taskId);
           expect(beforeStopTask?.workflow?.agents.some((a) => a.label === "Second")).toBe(false);
+          expect(beforeStopTask?.progress).toBe("boot");
 
           if (mode === "client-stop-request") {
             yield* orchestrator.dispatch({
@@ -2339,6 +2370,7 @@ describe("WorkflowService and workflow MCP tools", () => {
           const parentProjection = yield* orchestrator.getThreadProjection(parentThreadId);
           const terminalTask = parentProjection.subagents.find((s) => s.id === started.taskId);
           expect(terminalTask?.status).toBe("cancelled");
+          expect(terminalTask?.progress).toBe("running step 2");
           expect(terminalTask?.workflow?.agents).toEqual(
             expect.arrayContaining([
               expect.objectContaining({ label: "First", state: "completed" }),
@@ -2839,5 +2871,488 @@ describe("WorkflowService and workflow MCP tools", () => {
           expect(taskStatusFailure.message).not.toContain("task_status");
         }).pipe(Effect.provide(harness.layerToolkit));
       }),
+  );
+
+  it.effect(
+    "stops pending provider background work on a completed child before completing the workflow",
+    () =>
+      Effect.gen(function* () {
+        let childThreadId: ThreadId | undefined;
+        let childInterruptedDeferred: Deferred.Deferred<void> | undefined;
+        let childInterruptedBeforeComplete = false;
+        let childPendingBgBeforeComplete: number | undefined;
+        const harness = yield* makeWorkflowHarness({
+          name: "completed-child-bg-work",
+          wrapThreadManagement: (tm) => ({
+            ...tm,
+            dispatch: (command) =>
+              command.type === "workflow.complete"
+                ? Effect.gen(function* () {
+                    if (childInterruptedDeferred !== undefined) {
+                      childInterruptedBeforeComplete =
+                        yield* Deferred.isDone(childInterruptedDeferred);
+                    }
+                    if (childThreadId !== undefined) {
+                      const shell = yield* tm.getThreadShell(childThreadId);
+                      childPendingBgBeforeComplete = shell?.pendingBackgroundTasks?.length ?? 0;
+                    }
+                    return yield* tm.dispatch(command);
+                  })
+                : tm.dispatch(command),
+          }),
+        });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "completed-child-bg-work");
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          const script = `
+            export const meta = {
+              name: "BackgroundChild",
+              description: "Child finishes its turn with pending background command.",
+            };
+            const out = await agent("Start a background process");
+            return { out };
+          `;
+          const runCall = yield* callTool("t3_workflow_run", { script });
+          expect(runCall.isError).not.toBe(true);
+          const started = yield* decodeRunResult(runCall.structuredContent);
+
+          const childTurn = yield* Queue.take(harness.turnQueue);
+          childThreadId = childTurn.turn.threadId;
+          childInterruptedDeferred = childTurn.interrupted;
+          yield* childTurn.setPendingBackgroundTasks([
+            { taskId: "bg-shell-1", kind: "command", description: "sleep 60" },
+          ]);
+          yield* childTurn.complete("child-done");
+
+          const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
+          expect(terminal.status).toBe("completed");
+          expect(terminal.result).toContain('"out":"child-done"');
+
+          // The child's pending background work must have been interrupted and settled before workflow.complete.
+          expect(childInterruptedBeforeComplete).toBe(true);
+          expect(childPendingBgBeforeComplete).toBe(0);
+
+          const childShell = yield* orchestrator.getThreadShell(childTurn.turn.threadId);
+          expect(childShell?.pendingBackgroundTasks ?? []).toHaveLength(0);
+          const childProjection = yield* orchestrator.getThreadProjection(childTurn.turn.threadId);
+          expect(
+            childProjection.providerThreads.every(
+              (pt) => (pt.pendingBackgroundTasks?.length ?? 0) === 0,
+            ),
+          ).toBe(true);
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }),
+  );
+
+  it.effect(
+    "deferred startup sweep marks workflow stop-requested and cleanupPending, refuses resume until background retry confirms child stop, then completes and allows resume",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedBaseDir = yield* fs.realPath(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-cleanup-pending-" }),
+        );
+        const sharedDbContext = yield* Layer.build(SqlitePersistence.layerMemory);
+        const databaseLayer = Layer.succeedContext(sharedDbContext);
+
+        const harness1 = yield* makeWorkflowHarness({
+          name: "cleanup-pending-seed",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+        });
+
+        const seeded = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcpService = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const config = yield* ServerConfig.ServerConfig;
+          const parentTurn = yield* startParentThreadAndRun(
+            harness1.turnQueue,
+            harness1.cwd,
+            "cleanup-pending",
+          );
+          const parentRun = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
+            (r) => r.id === parentTurn.turn.runId,
+          )!;
+
+          const runId = "wf_cleanpend001";
+          const dir = path.join(config.workflowsDir, runId);
+          const scriptPath = path.join(dir, "script.js");
+          const journalPath = path.join(dir, "journal.jsonl");
+          yield* fs.makeDirectory(dir, { recursive: true });
+          const scriptText = `
+            export const meta = { name: "CleanupPending", description: "Fails initial sweep stops." };
+            const r = await agent("Work to resume");
+            return { r };
+          `;
+          yield* fs.writeFileString(scriptPath, scriptText);
+          yield* fs.writeFileString(journalPath, "");
+
+          const started = yield* orchestrator.dispatch({
+            type: "workflow.start",
+            commandId: CommandId.make("command:cleanup-pending:workflow-start"),
+            parentThreadId,
+            parentRunId: parentRun.id,
+            parentNodeId: parentRun.rootNodeId!,
+            title: "CleanupPending",
+            description: "Fails initial sweep stops.",
+            modelSelection,
+            workflow: {
+              name: "CleanupPending",
+              runHandles: { runId, scriptPath, transcriptDir: dir },
+              phases: [],
+              agents: [],
+            },
+          });
+          const taskEvent = started.storedEvents.find(
+            (s) => s.event.type === "subagent.updated" && s.event.payload.origin === "app_owned",
+          );
+          if (taskEvent?.event.type !== "subagent.updated") {
+            throw new Error("missing workflow task");
+          }
+          const taskId = taskEvent.event.payload.id;
+          const child = yield* mcpService.delegateWorkflowAgent(parentScope, {
+            parentRunId: parentRun.id,
+            workflowNodeId: taskId,
+            requestKey: `${runId}:0`,
+            task: { task: "Work to resume", title: "Worker" },
+          });
+          yield* Queue.take(harness1.turnQueue);
+
+          const metaPath = path.join(dir, "run.json");
+          yield* fs.writeFileString(
+            metaPath,
+            JSON.stringify({
+              runId,
+              threadId: parentThreadId,
+              taskId,
+              name: "CleanupPending",
+              scriptPath,
+              journalPath,
+              startedAt: 0,
+              status: "running",
+              usage: {
+                agents: 1,
+                done: 0,
+                errors: 0,
+                empty: 0,
+                cached: 0,
+                tokens: 0,
+                durationMs: 0,
+              },
+            }),
+          );
+
+          return {
+            runId,
+            taskId,
+            childThreadId: child.childThreadId,
+            scriptPath,
+            metaPath,
+          };
+        }).pipe(Effect.provide(harness1.layerToolkit));
+
+        let failChildStops = true;
+        const stopAttemptFailed = yield* Queue.unbounded<void>();
+        const finalMetaWritten = yield* Deferred.make<void>();
+        const harness2 = yield* makeWorkflowHarness({
+          name: "cleanup-pending-recover",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+          wrapFileSystem: (fsService) => ({
+            ...fsService,
+            rename: (oldPath, newPath) =>
+              fsService
+                .rename(oldPath, newPath)
+                .pipe(
+                  Effect.tap(() =>
+                    !failChildStops && newPath === seeded.metaPath
+                      ? Deferred.succeed(finalMetaWritten, undefined)
+                      : Effect.void,
+                  ),
+                ),
+          }),
+          wrapThreadManagement: (tm) => ({
+            ...tm,
+            cancelDelegatedTask: (input) =>
+              failChildStops
+                ? Queue.offer(stopAttemptFailed, undefined).pipe(
+                    Effect.andThen(
+                      Effect.fail(
+                        new Orchestrator.OrchestratorDispatchError({
+                          commandId: input.command.commandId,
+                          commandType: input.command.type,
+                          cause: "child stop temporarily unavailable",
+                        }),
+                      ),
+                    ),
+                  )
+                : tm.cancelDelegatedTask(input),
+          }),
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const beforeRecoverSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          // Step deterministically through each bounded retry failure before advancing TestClock.
+          const sweepFiber = yield* WorkflowService.recoverInterruptedWorkflows.pipe(
+            Effect.forkScoped,
+          );
+          for (const delay of [50, 100, 200, 400, 800]) {
+            yield* Queue.take(stopAttemptFailed);
+            yield* TestClock.adjust(`${delay} millis`);
+          }
+          yield* Queue.take(stopAttemptFailed);
+          yield* Fiber.join(sweepFiber);
+
+          // Workflow stays running in SQL, is stop-requested, and run.json is marked cleanupPending.
+          const midTask = (yield* orchestrator.getThreadProjection(parentThreadId)).subagents.find(
+            (s) => s.id === seeded.taskId,
+          );
+          expect(midTask?.status).toBe("running");
+          expect(midTask?.workflow?.stopRequestedAt).toBeDefined();
+
+          const midMeta = JSON.parse(yield* fs.readFileString(seeded.metaPath)) as {
+            status: string;
+            cleanupPending?: boolean;
+          };
+          expect(midMeta.status).toBe("running");
+          expect(midMeta.cleanupPending).toBe(true);
+
+          // Resume must be refused while cleanupPending.
+          const refusedResume = yield* callTool("t3_workflow_run", {
+            scriptPath: seeded.scriptPath,
+            resumeFromRunId: seeded.runId,
+          });
+          const refusedFailure = declaredFailure(refusedResume);
+          expect(refusedFailure.code).toBe("invalid_request");
+          expect(refusedFailure.message).toMatch(/cleanup pending/i);
+
+          // Lift the stop failure and advance TestClock so the background retry fiber completes cleanup.
+          failChildStops = false;
+          yield* TestClock.adjust("50 millis");
+
+          const terminalTask = yield* awaitWorkflowTerminal(seeded.taskId, beforeRecoverSeq);
+          expect(terminalTask.status).toBe("failed");
+          expect(terminalTask.result).toContain(`resumeFromRunId=${seeded.runId}`);
+
+          yield* Deferred.await(finalMetaWritten);
+          const finalMeta = JSON.parse(yield* fs.readFileString(seeded.metaPath)) as {
+            status: string;
+            cleanupPending?: boolean;
+          };
+          expect(finalMeta.status).toBe("failed");
+          expect(finalMeta.cleanupPending).toBeUndefined();
+
+          const childProjection = yield* orchestrator.getThreadProjection(seeded.childThreadId);
+          expect(
+            childProjection.runs.every(
+              (run) =>
+                run.status === "interrupted" ||
+                run.status === "cancelled" ||
+                run.status === "failed",
+            ),
+          ).toBe(true);
+
+          // Resume now succeeds once cleanup is confirmed, while resuming a live running workflow is refused.
+          const beforeResumeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+          const resumedCall = yield* callTool("t3_workflow_run", {
+            scriptPath: seeded.scriptPath,
+            resumeFromRunId: seeded.runId,
+          });
+          expect(resumedCall.isError).not.toBe(true);
+          const resumed = yield* decodeRunResult(resumedCall.structuredContent);
+
+          const resumedTurn = yield* Queue.take(harness2.turnQueue);
+          const refusedLiveResume = yield* callTool("t3_workflow_run", {
+            scriptPath: seeded.scriptPath,
+            resumeFromRunId: resumed.runId,
+          });
+          expect(declaredFailure(refusedLiveResume).code).toBe("invalid_request");
+          expect(declaredFailure(refusedLiveResume).message).toMatch(/still running/i);
+
+          yield* resumedTurn.complete("resumed-ok");
+          const resumedTerminal = yield* awaitWorkflowTerminal(resumed.taskId, beforeResumeSeq);
+          expect(resumedTerminal.status).toBe("completed");
+          expect(resumedTerminal.result).toContain('"r":"resumed-ok"');
+        }).pipe(Effect.provide(harness2.layerToolkit));
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "caps distinct phases at 256 and fails the run when exceeded (including via agent opts inside try/catch)",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        let runMetaWrites = 0;
+        const terminalMetaWritten = yield* Deferred.make<void>();
+        const harness = yield* makeWorkflowHarness({
+          name: "phase-cap",
+          wrapFileSystem: (fsService) => ({
+            ...fsService,
+            rename: (oldPath, newPath) =>
+              fsService.rename(oldPath, newPath).pipe(
+                Effect.tap(() => {
+                  if (path.basename(newPath) === "run.json") {
+                    runMetaWrites += 1;
+                    if (runMetaWrites >= 2) {
+                      return Deferred.succeed(terminalMetaWritten, undefined);
+                    }
+                  }
+                  return Effect.void;
+                }),
+              ),
+          }),
+        });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "phase-cap");
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          // Declaring > 256 distinct phases in meta.phases is rejected at launch.
+          const declaredPhases = Array.from({ length: 257 }, (_, i) => ({
+            title: `declared-${i}`,
+          }));
+          const tooManyDeclared = yield* callTool("t3_workflow_run", {
+            script: `export const meta = { name: "TooManyDeclared", description: "Over phase cap.", phases: ${JSON.stringify(declaredPhases)} }; return 1;`,
+          });
+          expect(declaredFailure(tooManyDeclared).code).toBe("invalid_request");
+          expect(declaredFailure(tooManyDeclared).message).toContain("256");
+
+          // Recording 256 phases then passing a 257th phase on agent() inside try/catch fails the run.
+          const script = `
+            export const meta = { name: "RuntimePhaseCap", description: "Exceeds 256 distinct phases at runtime." };
+            for (let i = 0; i < 256; i += 1) {
+              phase("p-" + i);
+            }
+            try {
+              await agent("Past cap", { phase: "p-256" });
+            } catch {
+              // Ignored by script; host cap must still fail the run.
+            }
+            return "should-not-succeed";
+          `;
+          const runCall = yield* callTool("t3_workflow_run", { script });
+          expect(runCall.isError).not.toBe(true);
+          const started = yield* decodeRunResult(runCall.structuredContent);
+
+          const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
+          expect(terminal.status).toBe("failed");
+          expect(terminal.result).toContain("256");
+          expect(terminal.workflow?.phases.length ?? 0).toBeLessThanOrEqual(256);
+
+          yield* Deferred.await(terminalMetaWritten);
+          const status = yield* decodeStatusResult(
+            (yield* callTool("t3_workflow_status", { runId: started.runId })).structuredContent,
+          );
+          expect(status.status).toBe("failed");
+          expect(status.phases.length).toBeLessThanOrEqual(256);
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "fails the workflow and stops accepting worker entries when a log burst overflows the 1,024-entry journal backlog",
+    () =>
+      Effect.gen(function* () {
+        const path = yield* Path.Path;
+        const journalWriteBlocked = yield* Deferred.make<void>();
+        const releaseJournalWrites = yield* Deferred.make<void>();
+        const terminalMetaWritten = yield* Deferred.make<void>();
+        let blockedFirstJournalAppend = false;
+        let runMetaWrites = 0;
+
+        const harness = yield* makeWorkflowHarness({
+          name: "journal-backlog-cap",
+          wrapFileSystem: (fsService) => ({
+            ...fsService,
+            rename: (oldPath, newPath) =>
+              fsService.rename(oldPath, newPath).pipe(
+                Effect.tap(() => {
+                  if (path.basename(newPath) === "run.json") {
+                    runMetaWrites += 1;
+                    if (runMetaWrites >= 2) {
+                      return Deferred.succeed(terminalMetaWritten, undefined);
+                    }
+                  }
+                  return Effect.void;
+                }),
+              ),
+            writeFileString: (filePath, data, options) =>
+              options?.flag === "a" &&
+              filePath.endsWith("journal.jsonl") &&
+              !blockedFirstJournalAppend
+                ? Effect.gen(function* () {
+                    blockedFirstJournalAppend = true;
+                    yield* Deferred.succeed(journalWriteBlocked, undefined);
+                    yield* Deferred.await(releaseJournalWrites);
+                    return yield* fsService.writeFileString(filePath, data, options);
+                  })
+                : fsService.writeFileString(filePath, data, options),
+          }),
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const fs = yield* FileSystem.FileSystem;
+          yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "journal-backlog-cap");
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          const script = `
+            export const meta = { name: "LogBurst", description: "Bursts logs past journal backlog limit." };
+            for (let i = 0; i < 2000; i += 1) {
+              log("burst-" + i);
+            }
+            return "should-not-succeed";
+          `;
+          const runCall = yield* callTool("t3_workflow_run", { script });
+          expect(runCall.isError).not.toBe(true);
+          const started = yield* decodeRunResult(runCall.structuredContent);
+
+          // Wait until the first journal append is blocked AND the 1,024-entry backlog has filled and failed the worker.
+          yield* Deferred.await(journalWriteBlocked);
+          const overflowFlushed = yield* orchestrator
+            .streamStoredEventsFrom({
+              threadId: parentThreadId,
+              afterSequence: beforeSeq,
+              eventType: "subagent.updated",
+            })
+            .pipe(
+              Stream.filter(
+                ({ event }) =>
+                  event.type === "subagent.updated" &&
+                  event.payload.id === started.taskId &&
+                  (event.payload.progress === "burst-1023" ||
+                    event.payload.progress === "burst-1024"),
+              ),
+              Stream.runHead,
+            );
+          expect(Option.isSome(overflowFlushed)).toBe(true);
+          yield* Deferred.succeed(releaseJournalWrites, undefined);
+
+          const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
+          expect(terminal.status).toBe("failed");
+          expect(terminal.result).toContain("1024-entry limit");
+
+          const journalEntries = decodeJournal(yield* fs.readFileString(started.journalPath));
+          const logEntries = journalEntries.filter((entry) => entry.type === "log");
+          expect(logEntries.length).toBeGreaterThan(0);
+          expect(logEntries.length).toBeLessThanOrEqual(1_025);
+          for (let i = 0; i < logEntries.length; i += 1) {
+            expect(logEntries[i]).toEqual({ type: "log", message: `burst-${i}` });
+          }
+          expect(journalEntries.at(-1)).toMatchObject({ type: "end", status: "failed" });
+
+          yield* Deferred.await(terminalMetaWritten);
+          const status = yield* decodeStatusResult(
+            (yield* callTool("t3_workflow_status", { runId: started.runId })).structuredContent,
+          );
+          expect(status.status).toBe("failed");
+          expect(status.logs).toHaveLength(50);
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
