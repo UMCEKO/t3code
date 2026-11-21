@@ -17,6 +17,8 @@ export const WORKFLOW_PROGRESS_LIMITS = {
   maxLogs: 10_000,
   maxLogBytes: 4 * 1024 * 1024,
   maxPhaseTitles: 256,
+  maxPhaseTitleBytes: 1024,
+  maxPhaseTitleTotalBytes: 64 * 1024,
   maxPhaseSwitches: 100_000,
 } as const;
 
