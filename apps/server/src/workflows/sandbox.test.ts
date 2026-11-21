@@ -114,11 +114,14 @@ describe("sandbox", () => {
   });
 
   describe("determinism and isolation", () => {
-    it("throws resume-breaking error on Date.now(), new Date(), Date(), and Math.random()", async () => {
+    it("throws resume-breaking error on Date.now(), new Date(), Date(), new Date(0).constructor, and Math.random()", async () => {
       const cases = [
         { code: "return Date.now();", api: "Date.now" },
         { code: "return new Date();", api: "new Date()" },
         { code: "return Date();", api: "Date()" },
+        { code: "return new Date(0).constructor.now();", api: "Date.now" },
+        { code: "return new (new Date(0).constructor)();", api: "new Date()" },
+        { code: "return (new Date(0).constructor)();", api: "Date()" },
         { code: "return Math.random();", api: "Math.random" },
       ];
 
@@ -136,6 +139,215 @@ describe("sandbox", () => {
           ),
         );
       }
+    });
+
+    it("keeps hooks, promises, errors, Date.prototype.constructor, and codegen guards inside the script realm", async () => {
+      const result = await runWorkflowScript({
+        script: makeScript(`
+          const agentPromise = agent("hello");
+          const parallelPromise = parallel([() => 1]);
+          const pipelinePromise = pipeline([1], (x) => x + 1);
+          const agentVal = await agentPromise;
+          const parallelVal = await parallelPromise;
+          const pipelineVal = await pipelinePromise;
+
+          const catchKind = async (fn) => {
+            try {
+              await fn();
+              return null;
+            } catch (e) {
+              return {
+                isError: e instanceof Error,
+                isTypeError: e instanceof TypeError,
+                ctorMatches: e.constructor === Error || e.constructor === TypeError,
+                ctorCtorIsFunction: e.constructor.constructor === Function,
+                message: e.message,
+              };
+            }
+          };
+
+          const badOptsErr = await catchKind(() => agent("x", { bogus: true }));
+          const hostFailErr = await catchKind(() => agent("fail-host"));
+          const badPhaseErr = await catchKind(() => phase(""));
+          const dateErr = await catchKind(() => new Date(0).constructor.now());
+
+          let asyncFnCtorThrew = false;
+          try {
+            (async () => {}).constructor("return 1")();
+          } catch {
+            asyncFnCtorThrew = true;
+          }
+
+          let agentCtorThrew = false;
+          try {
+            agent.constructor("return 1")();
+          } catch {
+            agentCtorThrew = true;
+          }
+
+          return {
+            constructors: {
+              agent: agent.constructor === Function,
+              parallel: parallel.constructor === Function,
+              pipeline: pipeline.constructor === Function,
+              phase: phase.constructor === Function,
+              log: log.constructor === Function,
+              workflow: workflow.constructor === Function,
+              budgetSpent: budget.spent.constructor === Function,
+              budgetRemaining: budget.remaining.constructor === Function,
+              dateCtorIsDate: new Date(0).constructor === Date,
+            },
+            promises: {
+              agent: agentPromise instanceof Promise,
+              parallel: parallelPromise instanceof Promise,
+              pipeline: pipelinePromise instanceof Promise,
+            },
+            values: { agentVal, parallelVal, pipelineVal },
+            errors: { badOptsErr, hostFailErr, badPhaseErr, dateErr },
+            codegenBlocked: { asyncFnCtorThrew, agentCtorThrew },
+          };
+        `),
+        args: {},
+        host: makeHost({
+          runAgent: async (call) => {
+            if (call.prompt === "fail-host") {
+              throw new Error("host boom");
+            }
+            return `ok:${call.prompt}`;
+          },
+        }),
+        concurrency: 2,
+      });
+
+      expect(result).toEqual({
+        constructors: {
+          agent: true,
+          parallel: true,
+          pipeline: true,
+          phase: true,
+          log: true,
+          workflow: true,
+          budgetSpent: true,
+          budgetRemaining: true,
+          dateCtorIsDate: true,
+        },
+        promises: {
+          agent: true,
+          parallel: true,
+          pipeline: true,
+        },
+        values: {
+          agentVal: "ok:hello",
+          parallelVal: [1],
+          pipelineVal: [2],
+        },
+        errors: {
+          badOptsErr: {
+            isError: true,
+            isTypeError: true,
+            ctorMatches: true,
+            ctorCtorIsFunction: true,
+            message: 'Unknown agent() option: "bogus"',
+          },
+          hostFailErr: {
+            isError: true,
+            isTypeError: false,
+            ctorMatches: true,
+            ctorCtorIsFunction: true,
+            message: "host boom",
+          },
+          badPhaseErr: {
+            isError: true,
+            isTypeError: true,
+            ctorMatches: true,
+            ctorCtorIsFunction: true,
+            message: "phase() title must be a non-empty string",
+          },
+          dateErr: {
+            isError: true,
+            isTypeError: false,
+            ctorMatches: true,
+            ctorCtorIsFunction: true,
+            message: "Date.now() is not available in workflow scripts: it would break resume.",
+          },
+        },
+        codegenBlocked: {
+          asyncFnCtorThrew: true,
+          agentCtorThrew: true,
+        },
+      });
+    });
+
+    it("stops top-level and post-await infinite loops while normal multi-await, parallel, and pipeline scripts complete", async () => {
+      const timeoutError =
+        "The workflow script ran for more than 50 ms without waiting; it was stopped.";
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`while (true) {}`),
+          args: {},
+          host: makeHost(),
+          concurrency: 2,
+          syncTimeoutMs: 50,
+        }),
+      ).rejects.toThrow(new WorkflowScriptError(timeoutError));
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            await agent("first");
+            while (true) {}
+          `),
+          args: {},
+          host: makeHost(),
+          concurrency: 2,
+          syncTimeoutMs: 50,
+        }),
+      ).rejects.toThrow(new WorkflowScriptError(timeoutError));
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            return await parallel([
+              async () => {
+                await agent("inside-parallel");
+                while (true) {}
+              },
+            ]);
+          `),
+          args: {},
+          host: makeHost(),
+          concurrency: 2,
+          syncTimeoutMs: 50,
+        }),
+      ).rejects.toThrow(new WorkflowScriptError(timeoutError));
+
+      const multiAwait = await runWorkflowScript({
+        script: makeScript(`
+          const first = await agent("step-1");
+          const second = await agent("step-2");
+          const third = await agent("step-3");
+          const par = await parallel([() => agent("par-a"), () => agent("par-b")]);
+          const pipe = await pipeline(
+            ["x", "y"],
+            async (item) => await agent("pipe-1:" + item),
+            async (prev) => await agent("pipe-2:" + prev),
+          );
+          return { first, second, third, par, pipe };
+        `),
+        args: {},
+        host: makeHost(),
+        concurrency: 2,
+        syncTimeoutMs: 50,
+      });
+
+      expect(multiAwait).toEqual({
+        first: "res:0:step-1",
+        second: "res:1:step-2",
+        third: "res:2:step-3",
+        par: ["res:3:par-a", "res:4:par-b"],
+        pipe: ["res:7:pipe-2:res:5:pipe-1:x", "res:8:pipe-2:res:6:pipe-1:y"],
+      });
     });
 
     it("allows deterministic dated new Date(x), Date.parse, and Date.UTC", async () => {

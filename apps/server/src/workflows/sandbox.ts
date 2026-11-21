@@ -64,6 +64,7 @@ export function workflowConcurrency(cpus: number): number {
 }
 
 const MAX_LOG_CHARS = 2000;
+const DEFAULT_SYNC_TIMEOUT_MS = 5_000;
 
 const ALLOWED_AGENT_OPT_KEYS = new Set([
   "label",
@@ -482,8 +483,11 @@ function parseMetaAndBody(script: string): ParsedMetaScript {
   try {
     const metaContext = NodeVM.createContext(Object.create(null), {
       codeGeneration: { strings: false, wasm: false },
+      microtaskMode: "afterEvaluate",
     });
-    evaluated = NodeVM.runInContext(`(${metaLiteralText})`, metaContext);
+    evaluated = NodeVM.runInContext(`(${metaLiteralText})`, metaContext, {
+      timeout: DEFAULT_SYNC_TIMEOUT_MS,
+    });
   } catch (err) {
     throw new WorkflowScriptError(`Failed to evaluate meta literal: ${extractErrorMessage(err)}`);
   }
@@ -788,85 +792,447 @@ interface SharedRunState {
   readonly host: WorkflowHost;
   readonly semaphore: FifoSemaphore;
   readonly abortHub: AbortHub;
+  readonly syncTimeoutMs: number;
   agentCount: number;
 }
 
-interface ContextBuiltins {
-  readonly jsonParse: (text: string) => unknown;
-  readonly objectPrototype: unknown;
-  readonly createArray: (items: ReadonlyArray<unknown>) => unknown;
+type RealmErrorKind = "Error" | "TypeError" | "WorkflowScriptError";
+
+interface RealmErrorSpec {
+  readonly kind: RealmErrorKind;
+  readonly message: string;
 }
 
-const CONTEXT_SETUP_SOURCE = `(function(makeError, hooks, budgetConfig) {
+type BridgeSyncOutcome<T> =
+  | { readonly ok: true; readonly value: T }
+  | {
+      readonly ok: false;
+      readonly errorKind: RealmErrorKind;
+      readonly errorMessage: string;
+    };
+
+type SerializedReturnOutcome =
+  | { readonly ok: true; readonly json: string | undefined }
+  | { readonly ok: false; readonly errorMessage: string };
+
+interface ContextDeferred {
+  readonly rejectSpecSync: (kind: RealmErrorKind, message: string) => void;
+  readonly enqueueResolveJson: (json: string | undefined) => void;
+  readonly enqueueRejectSpec: (kind: RealmErrorKind, message: string) => void;
+}
+
+interface ContextHostBridge {
+  readonly startAgent: (prompt: unknown, rawOpts: unknown, deferred: ContextDeferred) => void;
+  readonly startWorkflow: (ref: unknown, rawArgs: unknown, deferred: ContextDeferred) => void;
+  readonly onPhase: (title: string) => BridgeSyncOutcome<void>;
+  readonly onLog: (message: string) => BridgeSyncOutcome<void>;
+  readonly budgetSpent: () => BridgeSyncOutcome<number>;
+  readonly budgetRemaining: () => BridgeSyncOutcome<number>;
+}
+
+interface ContextSetupConfig {
+  readonly argsJson: string | undefined;
+  readonly budgetTotal: number | null;
+  readonly maxItems: number;
+}
+
+interface ContextRuntime {
+  readonly objectPrototype: unknown;
+  readonly hasQueuedSteps: () => boolean;
+  readonly isContextTypeError: (err: unknown) => boolean;
+  readonly enqueueAbort: (message: string) => void;
+  readonly enqueueStartBody: (
+    bodyFn: unknown,
+    onResolve: (outcome: SerializedReturnOutcome) => void,
+    onReject: (err: unknown) => void,
+  ) => void;
+}
+
+const CONTEXT_SETUP_SOURCE = `
+const __t3StepQueue = [];
+const __t3ShiftStep = Array.prototype.shift.bind(__t3StepQueue);
+const __t3DrainSteps = () => {
+  while (__t3StepQueue.length > 0) {
+    __t3ShiftStep()();
+  }
+};
+(function(bridge, config) {
   "use strict";
+  const ContextError = Error;
+  const ContextTypeError = TypeError;
+  const ContextPromise = Promise;
+  const ContextArray = Array;
+  const ContextObject = Object;
+  const ContextReflect = Reflect;
+  const ContextString = String;
+  const jsonParse = JSON.parse;
+  const jsonStringify = JSON.stringify;
+  const objectPrototype = ContextObject.prototype;
+  const isArray = ContextArray.isArray;
+  const promiseThen = ContextPromise.prototype.then;
+  const promiseCatch = ContextPromise.prototype.catch;
+  const promiseAll = ContextPromise.all.bind(ContextPromise);
+  const promiseRace = ContextPromise.race.bind(ContextPromise);
+  const promiseReject = ContextPromise.reject.bind(ContextPromise);
+  const defineProperty = ContextObject.defineProperty;
+  const freeze = ContextObject.freeze;
+  const pushStep = ContextArray.prototype.push.bind(__t3StepQueue);
+  const maxItems = config.maxItems;
+
+  const makeContextError = (kind, message) => {
+    if (kind === "TypeError") {
+      return new ContextTypeError(message);
+    }
+    const err = new ContextError(message);
+    if (kind === "WorkflowScriptError") {
+      err.name = "WorkflowScriptError";
+    }
+    return err;
+  };
+
   const OriginalDate = globalThis.Date;
   const GuardedDate = new Proxy(OriginalDate, {
     apply() {
-      throw makeError("Date() is not available in workflow scripts: it would break resume.");
+      throw makeContextError(
+        "WorkflowScriptError",
+        "Date() is not available in workflow scripts: it would break resume.",
+      );
     },
     construct(target, args, newTarget) {
       if (args.length === 0) {
-        throw makeError("new Date() is not available in workflow scripts: it would break resume.");
+        throw makeContextError(
+          "WorkflowScriptError",
+          "new Date() is not available in workflow scripts: it would break resume.",
+        );
       }
-      return Reflect.construct(target, args, newTarget === GuardedDate ? target : newTarget);
+      return ContextReflect.construct(target, args, newTarget === GuardedDate ? target : newTarget);
     },
   });
-  Object.defineProperty(OriginalDate, "now", {
-    value() {
-      throw makeError("Date.now() is not available in workflow scripts: it would break resume.");
+  defineProperty(OriginalDate, "now", {
+    value: function now() {
+      throw makeContextError(
+        "WorkflowScriptError",
+        "Date.now() is not available in workflow scripts: it would break resume.",
+      );
     },
     configurable: false,
     writable: false,
   });
-  Object.defineProperty(globalThis, "Date", {
+  defineProperty(OriginalDate.prototype, "constructor", {
     value: GuardedDate,
     configurable: false,
     writable: false,
   });
-  Object.defineProperty(Math, "random", {
-    value() {
-      throw makeError("Math.random() is not available in workflow scripts: it would break resume.");
+  defineProperty(globalThis, "Date", {
+    value: GuardedDate,
+    configurable: false,
+    writable: false,
+  });
+  defineProperty(Math, "random", {
+    value: function random() {
+      throw makeContextError(
+        "WorkflowScriptError",
+        "Math.random() is not available in workflow scripts: it would break resume.",
+      );
     },
     configurable: false,
     writable: false,
   });
 
-  const jsonParse = JSON.parse;
-  const objectPrototype = Object.prototype;
-  const ContextArray = Array;
-  const createArray = (items) => {
-    const out = new ContextArray(items.length);
-    for (let i = 0; i < items.length; i += 1) {
-      out[i] = items[i];
-    }
-    return out;
+  let aborted = false;
+  let abortError = null;
+  let rejectAbort;
+  const abortPromise = new ContextPromise((_, rej) => {
+    rejectAbort = rej;
+  });
+  promiseCatch.call(abortPromise, () => {});
+
+  const makeDeferred = () => {
+    let resolve;
+    let reject;
+    const promise = new ContextPromise((res, rej) => {
+      resolve = res;
+      reject = rej;
+    });
+    return {
+      promise,
+      rejectSpecSync(kind, message) {
+        reject(makeContextError(kind, message));
+      },
+      enqueueResolveJson(json) {
+        pushStep(() => {
+          resolve(json === undefined ? undefined : jsonParse(json));
+        });
+      },
+      enqueueRejectSpec(kind, message) {
+        pushStep(() => {
+          reject(makeContextError(kind, message));
+        });
+      },
+    };
   };
 
-  globalThis.agent = hooks.agent;
-  globalThis.parallel = hooks.parallel;
-  globalThis.pipeline = hooks.pipeline;
-  globalThis.phase = hooks.phase;
-  globalThis.log = hooks.log;
-  globalThis.workflow = hooks.workflow;
-  globalThis.args = hooks.argsJson === undefined ? undefined : jsonParse(hooks.argsJson);
-  globalThis.budget = Object.freeze({
-    total: budgetConfig.total,
-    spent: budgetConfig.spent,
-    remaining: budgetConfig.remaining,
+  const callSync = (fn, arg) => {
+    const outcome = fn(arg);
+    if (outcome.ok) return outcome.value;
+    throw makeContextError(outcome.errorKind, outcome.errorMessage);
+  };
+
+  const raceAbort = (promise) => {
+    promiseCatch.call(promise, () => {});
+    if (aborted) {
+      return promiseReject(abortError);
+    }
+    return promiseRace([promise, abortPromise]);
+  };
+
+  const runParallel = async (thunks) => {
+    if (!isArray(thunks)) {
+      throw new ContextTypeError("parallel() requires an array of functions");
+    }
+    if (thunks.length > maxItems) {
+      throw makeContextError(
+        "WorkflowScriptError",
+        "parallel() accepts at most " + maxItems + " items",
+      );
+    }
+    const fns = new ContextArray(thunks.length);
+    for (let i = 0; i < thunks.length; i += 1) {
+      const thunk = thunks[i];
+      if (typeof thunk !== "function") {
+        throw new ContextTypeError("parallel() item at index " + i + " must be a function");
+      }
+      fns[i] = thunk;
+    }
+    if (aborted) {
+      throw abortError;
+    }
+
+    const promises = new ContextArray(fns.length);
+    for (let i = 0; i < fns.length; i += 1) {
+      const thunk = fns[i];
+      promises[i] = (async () => {
+        try {
+          return await thunk();
+        } catch {
+          if (aborted) {
+            throw abortError;
+          }
+          return null;
+        }
+      })();
+    }
+
+    return await raceAbort(promiseAll(promises));
+  };
+
+  const runPipeline = async (items, rawStages) => {
+    if (!isArray(items)) {
+      throw new ContextTypeError("pipeline() requires an array of items");
+    }
+    if (items.length > maxItems) {
+      throw makeContextError(
+        "WorkflowScriptError",
+        "pipeline() accepts at most " + maxItems + " items",
+      );
+    }
+    if (rawStages.length === 0) {
+      throw new ContextTypeError("pipeline() requires at least one stage function");
+    }
+    const stages = new ContextArray(rawStages.length);
+    for (let i = 0; i < rawStages.length; i += 1) {
+      const stage = rawStages[i];
+      if (typeof stage !== "function") {
+        throw new ContextTypeError("pipeline() stage at index " + i + " must be a function");
+      }
+      stages[i] = stage;
+    }
+    if (aborted) {
+      throw abortError;
+    }
+
+    const itemPromises = new ContextArray(items.length);
+    for (let i = 0; i < items.length; i += 1) {
+      const item = items[i];
+      itemPromises[i] = (async () => {
+        let current = item;
+        for (let s = 0; s < stages.length; s += 1) {
+          if (aborted) {
+            throw abortError;
+          }
+          try {
+            current = await stages[s](current, item, i);
+          } catch {
+            if (aborted) {
+              throw abortError;
+            }
+            return null;
+          }
+        }
+        return current;
+      })();
+    }
+
+    return await raceAbort(promiseAll(itemPromises));
+  };
+
+  // Regular functions (not async) so their constructor is the context's Function.
+  function agent(prompt, rawOpts) {
+    const deferred = makeDeferred();
+    bridge.startAgent(prompt, rawOpts, deferred);
+    return deferred.promise;
+  }
+
+  function parallel(thunks) {
+    return runParallel(thunks);
+  }
+
+  function pipeline(items, ...rawStages) {
+    return runPipeline(items, rawStages);
+  }
+
+  function phase(title) {
+    if (typeof title !== "string" || title.trim().length === 0) {
+      throw new ContextTypeError("phase() title must be a non-empty string");
+    }
+    callSync(bridge.onPhase, title);
+  }
+
+  function log(message) {
+    callSync(bridge.onLog, ContextString(message));
+  }
+
+  function workflow(ref, rawArgs) {
+    const deferred = makeDeferred();
+    bridge.startWorkflow(ref, rawArgs, deferred);
+    return deferred.promise;
+  }
+
+  globalThis.agent = agent;
+  globalThis.parallel = parallel;
+  globalThis.pipeline = pipeline;
+  globalThis.phase = phase;
+  globalThis.log = log;
+  globalThis.workflow = workflow;
+  globalThis.args = config.argsJson === undefined ? undefined : jsonParse(config.argsJson);
+  globalThis.budget = freeze({
+    total: config.budgetTotal,
+    spent: function spent() {
+      return callSync(bridge.budgetSpent);
+    },
+    remaining: function remaining() {
+      return callSync(bridge.budgetRemaining);
+    },
   });
 
-  return { jsonParse, objectPrototype, createArray };
+  const stringifyReturnValue = (value) => {
+    if (value === undefined) {
+      return { ok: true, json: undefined };
+    }
+    try {
+      const serialized = jsonStringify(value, (_key, v) => {
+        if (typeof v === "function" || typeof v === "symbol" || typeof v === "bigint") {
+          throw makeContextError(
+            "WorkflowScriptError",
+            "Workflow return value is not JSON-serializable",
+          );
+        }
+        return v;
+      });
+      if (serialized === undefined) {
+        return { ok: false, errorMessage: "Workflow return value is not JSON-serializable" };
+      }
+      return { ok: true, json: serialized };
+    } catch (err) {
+      const msg =
+        typeof err === "object" && err !== null && typeof err.message === "string"
+          ? err.message
+          : ContextString(err);
+      return {
+        ok: false,
+        errorMessage:
+          msg === "Workflow return value is not JSON-serializable"
+            ? msg
+            : "Workflow return value is not JSON-serializable: " + msg,
+      };
+    }
+  };
+
+  return {
+    objectPrototype,
+    hasQueuedSteps: () => __t3StepQueue.length > 0,
+    isContextTypeError: (err) => err instanceof ContextTypeError,
+    enqueueAbort: (message) => {
+      pushStep(() => {
+        if (aborted) return;
+        aborted = true;
+        abortError = makeContextError("Error", message);
+        rejectAbort(abortError);
+      });
+    },
+    enqueueStartBody: (bodyFn, onResolve, onReject) => {
+      pushStep(() => {
+        try {
+          const runPromise = bodyFn();
+          // Context-realm reactions ensure completion runs inside the context's afterEvaluate drain.
+          promiseThen.call(
+            runPromise,
+            (value) => {
+              onResolve(stringifyReturnValue(value));
+            },
+            (err) => {
+              onReject(err);
+            },
+          );
+        } catch (err) {
+          onReject(err);
+        }
+      });
+    },
+  };
 })`;
 
-function normalizeScriptFailure(err: unknown, abortHub: AbortHub): unknown {
+const CONTEXT_SETUP_SCRIPT = new NodeVM.Script(CONTEXT_SETUP_SOURCE);
+const DRAIN_STEPS_SCRIPT = new NodeVM.Script("__t3DrainSteps()");
+
+function toRealmErrorSpec(err: unknown, abortHub: AbortHub): RealmErrorSpec {
   if (abortHub.aborted && err === abortHub.reason()) {
-    return err;
+    return { kind: "Error", message: extractErrorMessage(err) };
+  }
+  if (err instanceof WorkflowScriptError) {
+    return { kind: "WorkflowScriptError", message: err.message };
+  }
+  if (err instanceof TypeError) {
+    return { kind: "TypeError", message: err.message };
+  }
+  return { kind: "Error", message: extractErrorMessage(err) };
+}
+
+function serializeHostValue(value: unknown): string | undefined {
+  if (value === undefined) return undefined;
+  const serialized = JSON.stringify(value);
+  if (serialized === undefined) {
+    throw new WorkflowScriptError("Host return value is not JSON-serializable");
+  }
+  return serialized;
+}
+
+function normalizeScriptFailure(
+  err: unknown,
+  abortHub: AbortHub,
+  isContextTypeError: (value: unknown) => boolean,
+): unknown {
+  if (abortHub.aborted) {
+    return abortHub.reason();
   }
   if (err instanceof WorkflowScriptError) {
     return err;
   }
   if (extractErrorCode(err) === "ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING") {
     return new WorkflowScriptError("import() is not available in workflow scripts.");
+  }
+  if (err instanceof TypeError || isContextTypeError(err)) {
+    return new TypeError(extractErrorMessage(err));
   }
   if (err instanceof Error) {
     return err;
@@ -887,224 +1253,9 @@ async function executeScriptInContext(
   const parsed = parseMetaAndBody(script);
   const argsJson = args === undefined ? undefined : strictJsonStringify(args, "Workflow args");
 
-  // vm is a determinism guard, not a security boundary; script authors already have shell access.
-  const context = NodeVM.createContext(Object.create(null), {
-    codeGeneration: { strings: false, wasm: false },
-  });
-
-  let currentPhase: string | undefined;
-  let builtins!: ContextBuiltins;
-
-  const cloneIntoContext = (value: unknown): unknown => {
-    if (value === undefined) return undefined;
-    const serialized = JSON.stringify(value);
-    if (serialized === undefined) {
-      throw new WorkflowScriptError("Host return value is not JSON-serializable");
-    }
-    return builtins.jsonParse(serialized);
-  };
-
-  const checkBudget = (): void => {
-    const { total, spent } = shared.host.budget;
-    if (total !== null && spent() >= total) {
-      throw new Error("The workflow's token budget is spent.");
-    }
-  };
-
-  const agent = async (prompt: unknown, rawOpts?: unknown): Promise<unknown> => {
-    if (shared.abortHub.aborted) {
-      throw shared.abortHub.reason();
-    }
-    if (typeof prompt !== "string" || prompt.trim().length === 0) {
-      throw new TypeError("agent() prompt must be a non-empty string");
-    }
-    const opts = validateAgentOpts(rawOpts, builtins.objectPrototype);
-    checkBudget();
-
-    if (shared.agentCount >= WORKFLOW_LIMITS.maxAgents) {
-      throw new WorkflowScriptError(`A workflow runs at most ${WORKFLOW_LIMITS.maxAgents} agents`);
-    }
-    const index = shared.agentCount;
-    shared.agentCount += 1;
-
-    const call: WorkflowAgentCall = {
-      index,
-      prompt,
-      opts,
-      phase: opts.phase ?? currentPhase,
-    };
-
-    if (!shared.semaphore.tryAcquire()) {
-      await shared.semaphore.acquire();
-    }
-    try {
-      if (shared.abortHub.aborted) {
-        throw shared.abortHub.reason();
-      }
-      checkBudget();
-      const result = await raceWithAbort(shared.host.runAgent(call), shared.abortHub);
-      return cloneIntoContext(result);
-    } finally {
-      shared.semaphore.release();
-    }
-  };
-
-  const parallel = async (thunks: unknown): Promise<unknown> => {
-    if (!Array.isArray(thunks)) {
-      throw new TypeError("parallel() requires an array of functions");
-    }
-    if (thunks.length > WORKFLOW_LIMITS.maxItems) {
-      throw new WorkflowScriptError(`parallel() accepts at most ${WORKFLOW_LIMITS.maxItems} items`);
-    }
-    const fns: Array<() => unknown> = [];
-    for (let i = 0; i < thunks.length; i += 1) {
-      const thunk: unknown = thunks[i];
-      if (typeof thunk !== "function") {
-        throw new TypeError(`parallel() item at index ${i} must be a function`);
-      }
-      fns.push(thunk as () => unknown);
-    }
-    if (shared.abortHub.aborted) {
-      throw shared.abortHub.reason();
-    }
-
-    const promises = fns.map(async (thunk): Promise<unknown> => {
-      try {
-        return await thunk();
-      } catch {
-        if (shared.abortHub.aborted) {
-          throw shared.abortHub.reason();
-        }
-        return null;
-      }
-    });
-
-    const results = await raceWithAbort(Promise.all(promises), shared.abortHub);
-    return builtins.createArray(results);
-  };
-
-  const pipeline = async (
-    items: unknown,
-    ...rawStages: ReadonlyArray<unknown>
-  ): Promise<unknown> => {
-    if (!Array.isArray(items)) {
-      throw new TypeError("pipeline() requires an array of items");
-    }
-    if (items.length > WORKFLOW_LIMITS.maxItems) {
-      throw new WorkflowScriptError(`pipeline() accepts at most ${WORKFLOW_LIMITS.maxItems} items`);
-    }
-    if (rawStages.length === 0) {
-      throw new TypeError("pipeline() requires at least one stage function");
-    }
-    const stages: Array<(prev: unknown, item: unknown, index: number) => unknown> = [];
-    for (let i = 0; i < rawStages.length; i += 1) {
-      const stage = rawStages[i];
-      if (typeof stage !== "function") {
-        throw new TypeError(`pipeline() stage at index ${i} must be a function`);
-      }
-      stages.push(stage as (prev: unknown, item: unknown, index: number) => unknown);
-    }
-    if (shared.abortHub.aborted) {
-      throw shared.abortHub.reason();
-    }
-
-    const itemPromises = items.map(async (item: unknown, index: number): Promise<unknown> => {
-      let current = item;
-      for (const stage of stages) {
-        if (shared.abortHub.aborted) {
-          throw shared.abortHub.reason();
-        }
-        try {
-          current = await stage(current, item, index);
-        } catch {
-          if (shared.abortHub.aborted) {
-            throw shared.abortHub.reason();
-          }
-          return null;
-        }
-      }
-      return current;
-    });
-
-    const results = await raceWithAbort(Promise.all(itemPromises), shared.abortHub);
-    return builtins.createArray(results);
-  };
-
-  const phase = (title: unknown): void => {
-    if (typeof title !== "string" || title.trim().length === 0) {
-      throw new TypeError("phase() title must be a non-empty string");
-    }
-    currentPhase = title;
-    shared.host.onPhase(title);
-  };
-
-  const log = (message: unknown): void => {
-    const text = String(message);
-    shared.host.onLog(text.length > MAX_LOG_CHARS ? text.slice(0, MAX_LOG_CHARS) : text);
-  };
-
-  const workflow = async (ref: unknown, rawArgs?: unknown): Promise<unknown> => {
-    if (shared.abortHub.aborted) {
-      throw shared.abortHub.reason();
-    }
-    if (depth >= 1) {
-      throw new WorkflowScriptError("Nested workflow() calls are supported one level only.");
-    }
-    if (typeof ref === "string") {
-      throw new WorkflowScriptError("Saved workflows are not supported; pass {scriptPath}.");
-    }
-    if (!isPlainObject(ref, builtins.objectPrototype)) {
-      throw new WorkflowScriptError("workflow() requires { scriptPath: string }");
-    }
-    const scriptPath = ownProperty(ref, "scriptPath");
-    if (typeof scriptPath !== "string" || scriptPath.trim().length === 0) {
-      throw new WorkflowScriptError("workflow() requires { scriptPath: string }");
-    }
-    const childArgs =
-      rawArgs === undefined ? undefined : cloneJsonToHost(rawArgs, "workflow() args");
-    const childScript = await raceWithAbort(
-      shared.host.loadScript({ scriptPath }),
-      shared.abortHub,
-    );
-    const childResult = await executeScriptInContext(childScript, childArgs, shared, depth + 1);
-    return cloneIntoContext(childResult);
-  };
-
-  const setupContext = NodeVM.runInContext(CONTEXT_SETUP_SOURCE, context) as (
-    makeError: (message: string) => Error,
-    hooks: {
-      readonly agent: typeof agent;
-      readonly parallel: typeof parallel;
-      readonly pipeline: typeof pipeline;
-      readonly phase: typeof phase;
-      readonly log: typeof log;
-      readonly workflow: typeof workflow;
-      readonly argsJson: string | undefined;
-    },
-    budgetConfig: {
-      readonly total: number | null;
-      readonly spent: () => number;
-      readonly remaining: () => number;
-    },
-  ) => ContextBuiltins;
-
-  const budgetTotal = shared.host.budget.total;
-  builtins = setupContext(
-    (message) => new WorkflowScriptError(message),
-    { agent, parallel, pipeline, phase, log, workflow, argsJson },
-    {
-      total: budgetTotal,
-      spent: () => shared.host.budget.spent(),
-      remaining: () =>
-        budgetTotal === null
-          ? Number.POSITIVE_INFINITY
-          : Math.max(0, budgetTotal - shared.host.budget.spent()),
-    },
-  );
-
   let compiled: NodeVM.Script;
   try {
-    compiled = new NodeVM.Script(`(async () => { "use strict"; ${parsed.body}\n})()`, {
+    compiled = new NodeVM.Script(`(async () => { "use strict"; ${parsed.body}\n})`, {
       filename: `${parsed.meta.name}.workflow.js`,
       lineOffset: parsed.bodyStartLine,
     });
@@ -1116,18 +1267,331 @@ async function executeScriptInContext(
     throw new WorkflowScriptError(`Syntax error in workflow script: ${message}`);
   }
 
-  let rawResult: unknown;
-  try {
-    const runPromise = compiled.runInContext(context) as Promise<unknown>;
-    rawResult = await raceWithAbort(runPromise, shared.abortHub);
-  } catch (err) {
-    throw normalizeScriptFailure(err, shared.abortHub);
-  }
+  // vm is a determinism guard, not a security boundary; script authors already have shell access.
+  const context = NodeVM.createContext(Object.create(null), {
+    codeGeneration: { strings: false, wasm: false },
+    microtaskMode: "afterEvaluate",
+  });
 
-  if (rawResult === undefined) {
-    return null;
+  let currentPhase: string | undefined;
+  let runtime!: ContextRuntime;
+  let contextClosed = false;
+  let inSlice = false;
+  let postSliceDrainScheduled = false;
+  const runDeferred = Promise.withResolvers<unknown>();
+
+  const finishWithValue = (value: unknown): void => {
+    if (contextClosed) return;
+    contextClosed = true;
+    runDeferred.resolve(value);
+  };
+
+  const finishWithError = (err: unknown): void => {
+    if (contextClosed) return;
+    contextClosed = true;
+    runDeferred.reject(err);
+  };
+
+  const schedulePostSliceDrain = (): void => {
+    if (contextClosed || postSliceDrainScheduled) return;
+    postSliceDrainScheduled = true;
+    // Dynamic import() rejects on Node's host microtask queue two hops after invocation.
+    queueMicrotask(() => {
+      queueMicrotask(() => {
+        postSliceDrainScheduled = false;
+        if (!contextClosed && !inSlice) {
+          drainContext(false);
+        }
+      });
+    });
+  };
+
+  const isClosed = (): boolean => contextClosed;
+
+  const drainContext = (scheduleFollowUp = true): void => {
+    if (contextClosed || inSlice) return;
+    inSlice = true;
+    try {
+      while (true) {
+        DRAIN_STEPS_SCRIPT.runInContext(context, { timeout: shared.syncTimeoutMs });
+        if (isClosed() || !runtime.hasQueuedSteps()) break;
+      }
+    } catch (err) {
+      if (extractErrorCode(err) === "ERR_SCRIPT_EXECUTION_TIMEOUT") {
+        finishWithError(
+          new WorkflowScriptError(
+            `The workflow script ran for more than ${shared.syncTimeoutMs} ms without waiting; it was stopped.`,
+          ),
+        );
+      } else {
+        finishWithError(normalizeScriptFailure(err, shared.abortHub, runtime.isContextTypeError));
+      }
+      return;
+    } finally {
+      inSlice = false;
+    }
+    if (!contextClosed && shared.abortHub.aborted) {
+      finishWithError(shared.abortHub.reason());
+      return;
+    }
+    if (scheduleFollowUp && !contextClosed) {
+      schedulePostSliceDrain();
+    }
+  };
+
+  const settleDeferredWithValue = (deferred: ContextDeferred, value: unknown): void => {
+    if (contextClosed) return;
+    try {
+      const json = serializeHostValue(value);
+      deferred.enqueueResolveJson(json);
+    } catch (err) {
+      const spec = toRealmErrorSpec(err, shared.abortHub);
+      deferred.enqueueRejectSpec(spec.kind, spec.message);
+    }
+    drainContext();
+  };
+
+  const settleDeferredWithError = (deferred: ContextDeferred, err: unknown): void => {
+    if (contextClosed) return;
+    const spec = toRealmErrorSpec(err, shared.abortHub);
+    deferred.enqueueRejectSpec(spec.kind, spec.message);
+    drainContext();
+  };
+
+  const runBridgeSync = <T>(fn: () => T): BridgeSyncOutcome<T> => {
+    try {
+      return { ok: true, value: fn() };
+    } catch (err) {
+      const spec = toRealmErrorSpec(err, shared.abortHub);
+      return { ok: false, errorKind: spec.kind, errorMessage: spec.message };
+    }
+  };
+
+  const checkBudget = (): void => {
+    const { total, spent } = shared.host.budget;
+    if (total !== null && spent() >= total) {
+      throw new Error("The workflow's token budget is spent.");
+    }
+  };
+
+  const startAgent = (prompt: unknown, rawOpts: unknown, deferred: ContextDeferred): void => {
+    try {
+      if (shared.abortHub.aborted) {
+        deferred.rejectSpecSync("Error", extractErrorMessage(shared.abortHub.reason()));
+        return;
+      }
+      if (typeof prompt !== "string" || prompt.trim().length === 0) {
+        deferred.rejectSpecSync("TypeError", "agent() prompt must be a non-empty string");
+        return;
+      }
+      const opts = validateAgentOpts(rawOpts, runtime.objectPrototype);
+      checkBudget();
+
+      if (shared.agentCount >= WORKFLOW_LIMITS.maxAgents) {
+        deferred.rejectSpecSync(
+          "WorkflowScriptError",
+          `A workflow runs at most ${WORKFLOW_LIMITS.maxAgents} agents`,
+        );
+        return;
+      }
+      const index = shared.agentCount;
+      shared.agentCount += 1;
+
+      const call: WorkflowAgentCall = {
+        index,
+        prompt,
+        opts,
+        phase: opts.phase ?? currentPhase,
+      };
+
+      const runWithSlot = (): void => {
+        if (contextClosed) {
+          shared.semaphore.release();
+          return;
+        }
+        let agentPromise: Promise<unknown>;
+        try {
+          if (shared.abortHub.aborted) {
+            throw shared.abortHub.reason();
+          }
+          checkBudget();
+          agentPromise = raceWithAbort(shared.host.runAgent(call), shared.abortHub);
+        } catch (err) {
+          shared.semaphore.release();
+          if (inSlice) {
+            const spec = toRealmErrorSpec(err, shared.abortHub);
+            deferred.rejectSpecSync(spec.kind, spec.message);
+          } else {
+            settleDeferredWithError(deferred, err);
+          }
+          return;
+        }
+
+        agentPromise.then(
+          (result) => {
+            shared.semaphore.release();
+            settleDeferredWithValue(deferred, result);
+          },
+          (err) => {
+            shared.semaphore.release();
+            settleDeferredWithError(deferred, err);
+          },
+        );
+      };
+
+      if (shared.semaphore.tryAcquire()) {
+        runWithSlot();
+        return;
+      }
+
+      shared.semaphore.acquire().then(
+        () => {
+          runWithSlot();
+        },
+        (err) => {
+          settleDeferredWithError(deferred, err);
+        },
+      );
+    } catch (err) {
+      const spec = toRealmErrorSpec(err, shared.abortHub);
+      deferred.rejectSpecSync(spec.kind, spec.message);
+    }
+  };
+
+  const startWorkflow = (ref: unknown, rawArgs: unknown, deferred: ContextDeferred): void => {
+    try {
+      if (shared.abortHub.aborted) {
+        deferred.rejectSpecSync("Error", extractErrorMessage(shared.abortHub.reason()));
+        return;
+      }
+      if (depth >= 1) {
+        deferred.rejectSpecSync(
+          "WorkflowScriptError",
+          "Nested workflow() calls are supported one level only.",
+        );
+        return;
+      }
+      if (typeof ref === "string") {
+        deferred.rejectSpecSync(
+          "WorkflowScriptError",
+          "Saved workflows are not supported; pass {scriptPath}.",
+        );
+        return;
+      }
+      if (!isPlainObject(ref, runtime.objectPrototype)) {
+        deferred.rejectSpecSync(
+          "WorkflowScriptError",
+          "workflow() requires { scriptPath: string }",
+        );
+        return;
+      }
+      const scriptPath = ownProperty(ref, "scriptPath");
+      if (typeof scriptPath !== "string" || scriptPath.trim().length === 0) {
+        deferred.rejectSpecSync(
+          "WorkflowScriptError",
+          "workflow() requires { scriptPath: string }",
+        );
+        return;
+      }
+      const childArgs =
+        rawArgs === undefined ? undefined : cloneJsonToHost(rawArgs, "workflow() args");
+
+      void (async () => {
+        try {
+          const childScript = await raceWithAbort(
+            shared.host.loadScript({ scriptPath }),
+            shared.abortHub,
+          );
+          const childResult = await executeScriptInContext(
+            childScript,
+            childArgs,
+            shared,
+            depth + 1,
+          );
+          settleDeferredWithValue(deferred, childResult);
+        } catch (err) {
+          settleDeferredWithError(deferred, err);
+        }
+      })();
+    } catch (err) {
+      const spec = toRealmErrorSpec(err, shared.abortHub);
+      deferred.rejectSpecSync(spec.kind, spec.message);
+    }
+  };
+
+  const budgetTotal = shared.host.budget.total;
+  const bridge: ContextHostBridge = {
+    startAgent,
+    startWorkflow,
+    onPhase: (title) =>
+      runBridgeSync(() => {
+        currentPhase = title;
+        shared.host.onPhase(title);
+      }),
+    onLog: (message) =>
+      runBridgeSync(() => {
+        shared.host.onLog(
+          message.length > MAX_LOG_CHARS ? message.slice(0, MAX_LOG_CHARS) : message,
+        );
+      }),
+    budgetSpent: () => runBridgeSync(() => shared.host.budget.spent()),
+    budgetRemaining: () =>
+      runBridgeSync(() =>
+        budgetTotal === null
+          ? Number.POSITIVE_INFINITY
+          : Math.max(0, budgetTotal - shared.host.budget.spent()),
+      ),
+  };
+
+  const setupContext = CONTEXT_SETUP_SCRIPT.runInContext(context, {
+    timeout: shared.syncTimeoutMs,
+  }) as (bridge: ContextHostBridge, config: ContextSetupConfig) => ContextRuntime;
+
+  runtime = setupContext(bridge, {
+    argsJson,
+    budgetTotal,
+    maxItems: WORKFLOW_LIMITS.maxItems,
+  });
+
+  const unsubAbort = shared.abortHub.onAbort((reason) => {
+    if (contextClosed) return;
+    runtime.enqueueAbort(extractErrorMessage(reason));
+    if (!inSlice) {
+      drainContext(false);
+      if (!contextClosed) {
+        finishWithError(reason);
+      }
+    }
+  });
+
+  try {
+    const bodyFn: unknown = compiled.runInContext(context, { timeout: shared.syncTimeoutMs });
+    runtime.enqueueStartBody(
+      bodyFn,
+      (outcome) => {
+        if (shared.abortHub.aborted) {
+          finishWithError(shared.abortHub.reason());
+          return;
+        }
+        if (!outcome.ok) {
+          finishWithError(new WorkflowScriptError(outcome.errorMessage));
+          return;
+        }
+        if (outcome.json === undefined) {
+          finishWithValue(null);
+          return;
+        }
+        finishWithValue(JSON.parse(outcome.json));
+      },
+      (err) => {
+        finishWithError(normalizeScriptFailure(err, shared.abortHub, runtime.isContextTypeError));
+      },
+    );
+    drainContext();
+    return await runDeferred.promise;
+  } finally {
+    unsubAbort();
   }
-  return cloneJsonToHost(rawResult, "Workflow return value");
 }
 
 export async function runWorkflowScript(input: {
@@ -1135,14 +1599,20 @@ export async function runWorkflowScript(input: {
   readonly args: unknown;
   readonly host: WorkflowHost;
   readonly concurrency: number;
+  readonly syncTimeoutMs?: number;
 }): Promise<unknown> {
   const limit = Number.isFinite(input.concurrency) ? Math.max(1, Math.trunc(input.concurrency)) : 1;
+  const syncTimeoutMs =
+    input.syncTimeoutMs !== undefined && Number.isFinite(input.syncTimeoutMs)
+      ? Math.max(1, Math.trunc(input.syncTimeoutMs))
+      : DEFAULT_SYNC_TIMEOUT_MS;
   const abortHub = createAbortHub(input.host.signal);
   try {
     const shared: SharedRunState = {
       host: input.host,
       semaphore: new FifoSemaphore(limit, abortHub),
       abortHub,
+      syncTimeoutMs,
       agentCount: 0,
     };
     return await executeScriptInContext(input.script, input.args, shared, 0);
