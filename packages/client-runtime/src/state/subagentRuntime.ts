@@ -99,6 +99,65 @@ export function isLiveSubagentTurnItem(item: OrchestrationV2TurnItem): boolean {
   return item.type === "subagent" && isOrchestrationV2WorkActive(item.status);
 }
 
+export function isServerWorkflow<
+  T extends Pick<OrchestrationV2Subagent, "origin" | "childThreadId" | "workflow">,
+>(subagent: T): subagent is T & { readonly workflow: OrchestrationV2SubagentWorkflow } {
+  return (
+    subagent.workflow !== undefined &&
+    subagent.origin === "app_owned" &&
+    subagent.childThreadId === null
+  );
+}
+
+export function isStoppableWorkflow(
+  subagent: Pick<
+    OrchestrationV2Subagent,
+    "status" | "origin" | "driver" | "childThreadId" | "nativeTaskRef" | "workflow"
+  >,
+): boolean {
+  if (subagent.workflow === undefined || subagent.status !== "running") return false;
+  if (isServerWorkflow(subagent)) return true;
+  return (
+    subagent.origin === "provider_native" &&
+    subagent.driver === "claudeAgent" &&
+    Boolean(subagent.nativeTaskRef?.nativeId)
+  );
+}
+
+type WorkflowMemberCandidate = {
+  readonly id: string;
+  readonly origin?: OrchestrationV2Subagent["origin"] | undefined;
+  readonly parentNodeId?: string | undefined;
+  readonly workflow?: OrchestrationV2SubagentWorkflow | undefined;
+};
+
+function isWorkflowMemberSubagent(
+  subagent: Pick<WorkflowMemberCandidate, "origin" | "parentNodeId" | "workflow">,
+  workflowIds: ReadonlySet<string>,
+): boolean {
+  return (
+    subagent.origin === "app_owned" &&
+    subagent.workflow === undefined &&
+    subagent.parentNodeId !== undefined &&
+    workflowIds.has(subagent.parentNodeId)
+  );
+}
+
+/**
+ * Drops app-owned subagent rows spawned under a workflow task: those agents already appear inside
+ * the workflow's `workflow.agents` list, so listing both would duplicate every member.
+ */
+export function excludeWorkflowMemberSubagents<T extends WorkflowMemberCandidate>(
+  subagents: ReadonlyArray<T>,
+): ReadonlyArray<T> {
+  const workflowIds = new Set<string>();
+  for (const subagent of subagents) {
+    if (subagent.workflow !== undefined) workflowIds.add(subagent.id);
+  }
+  if (workflowIds.size === 0) return subagents;
+  return subagents.filter((subagent) => !isWorkflowMemberSubagent(subagent, workflowIds));
+}
+
 export function waitingOnSubagentsLabel(count: number, resolve: MFunctionType = mFallback): string {
   return resolve(
     msg("{count, plural, =1 {Waiting on a subagent} other {Waiting on {count} subagents}}", {
@@ -215,6 +274,8 @@ export function workflowMemberModelSelection(
 export function projectedSubagentsToRuntime(
   subagents: ReadonlyArray<{
     readonly id: string;
+    readonly origin?: OrchestrationV2Subagent["origin"] | undefined;
+    readonly parentNodeId?: string | undefined;
     readonly title: string | null;
     readonly prompt: string;
     readonly model: string | null;
@@ -228,7 +289,7 @@ export function projectedSubagentsToRuntime(
     readonly updatedAt: DateTime.Utc;
   }>,
 ): ReadonlyArray<RuntimeSubagent> {
-  return subagents.flatMap((subagent) => {
+  return excludeWorkflowMemberSubagents(subagents).flatMap((subagent) => {
     const updatedAt = DateTime.formatIso(subagent.updatedAt);
     const startedAt = subagent.startedAt === null ? null : DateTime.formatIso(subagent.startedAt);
     const firstSeenAt = startedAt ?? updatedAt;

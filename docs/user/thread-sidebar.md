@@ -316,6 +316,68 @@ To choose what the thread details card shows, right-click the card or open
 shortcuts, such as Open in editor and project scripts. **Reset to default** brings
 back the standard rows.
 
+## Workflows
+
+A workflow runs a deterministic JavaScript script on the T3 Code server to coordinate
+many agents across parallel batches or staged pipelines, then wakes the thread once
+with the final result. Ask an agent in a thread to run a workflow (or pass it a script
+file); it starts the run with `t3_workflow_run` and receives a run ID immediately.
+
+```js
+export const meta = {
+  name: "audit-modules",
+  description: "Review modules in parallel and summarize findings",
+  phases: [{ title: "Review" }, { title: "Summarize" }],
+};
+
+phase("Review");
+const findings = await parallel(
+  args.modules.map(
+    (mod) => () =>
+      agent(`Audit ${mod} for bugs.`, {
+        label: mod,
+        schema: {
+          type: "object",
+          properties: { summary: { type: "string" } },
+          required: ["summary"],
+        },
+      }),
+  ),
+);
+
+phase("Summarize");
+log(`Reviewed ${findings.filter(Boolean).length} modules`);
+return await agent(`Combine these findings:\n${JSON.stringify(findings)}`, {
+  label: "summary",
+});
+```
+
+Scripts start with a literal `export const meta = { name, description, phases? }` header
+followed by plain JavaScript with top-level `await` and `return`. Available hooks are
+`agent(prompt, opts?)`, `parallel(thunks)`, `pipeline(items, ...stages)`, `phase(title)`,
+`log(message)`, `args`, `budget`, and `workflow({ scriptPath }, args?)` (one level deep).
+Node and filesystem APIs, `Date.now()`, `Math.random()`, and argless `new Date()` are
+blocked so runs remain replayable.
+
+Each `agent()` call runs as a T3 subagent on any configured provider—inheriting the
+thread's provider by default or overriding it with `target`, `model`, or `effort`—and
+supports structured output via `schema` on every provider. Because the server owns the
+workflow, its agents keep running after the calling turn ends.
+
+Track progress and open individual agent threads from **Lineage** on web and desktop or
+**Agents** on mobile. Stop a running workflow from its stop control, by stopping the
+thread, or by asking an agent to call `t3_workflow_stop`; stopping a workflow cancels its
+active agents without stopping the thread. To resume a stopped or failed run, edit the
+saved script file and ask the agent to resume from the previous run ID (`resumeFromRunId`
+with `scriptPath`): the longest unchanged prefix of `agent()` calls replays from the
+run's journal (calls stopped by a usage limit rerun without breaking replay), and later
+calls run live.
+
+Limits per run: at most 1,000 `agent()` calls, at most 4,096 items per `parallel()` or
+`pipeline()` call, and at most `min(16, cpus - 2)` concurrent agents (excess calls queue).
+Exceeding a total cap fails the run explicitly. If the server restarts while a workflow is
+running, that run ends as failed on startup so you can resume it from its run ID.
+
 ## Open a thread beside the one you are in
 
 On web and desktop, a subagent, a side chat, and a

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vite-plus/test";
-import { ThreadId } from "@t3tools/contracts";
+import { NodeId, ThreadId } from "@t3tools/contracts";
 import * as DateTime from "effect/DateTime";
 
 import {
@@ -253,6 +253,85 @@ describe("thread relationships", () => {
       }),
     ]);
     expect(graph.nodes.has(staleParent)).toBe(false);
+  });
+
+  it("hides workflow-owned child subagents and their result transfers on the parent thread", () => {
+    const parent = ThreadId.make("thread-parent");
+    const workflowMember = ThreadId.make("thread-wf-member");
+    const standalone = ThreadId.make("thread-standalone");
+    const workflowNodeId = NodeId.make("wf-node");
+    const shells = [
+      {
+        id: parent,
+        title: "Parent",
+        status: "completed",
+        forkedFrom: null,
+        lineage: { rootThreadId: parent, parentThreadId: null, relationshipToParent: null },
+      },
+      {
+        id: workflowMember,
+        title: "Workflow member",
+        status: "completed",
+        forkedFrom: null,
+        lineage: { rootThreadId: parent, parentThreadId: parent, relationshipToParent: "subagent" },
+      },
+      {
+        id: standalone,
+        title: "Standalone",
+        status: "running",
+        forkedFrom: null,
+        lineage: { rootThreadId: parent, parentThreadId: parent, relationshipToParent: "subagent" },
+      },
+    ];
+
+    const parentGraph = deriveThreadRelationshipGraph({
+      threads: shells as never,
+      projection: {
+        thread: { id: parent },
+        subagents: [
+          {
+            id: workflowNodeId,
+            origin: "app_owned",
+            parentNodeId: NodeId.make("root-node"),
+            childThreadId: null,
+            status: "running",
+            workflow: { phases: [], agents: [] },
+          },
+          {
+            id: NodeId.make("wf-member-task"),
+            origin: "app_owned",
+            parentNodeId: workflowNodeId,
+            childThreadId: workflowMember,
+            status: "completed",
+          },
+          {
+            id: NodeId.make("standalone-task"),
+            origin: "app_owned",
+            parentNodeId: NodeId.make("root-node"),
+            childThreadId: standalone,
+            status: "running",
+          },
+        ],
+        contextTransfers: [
+          { sourceThreadId: workflowMember, targetThreadId: parent, status: "consumed" },
+        ],
+      } as never,
+    });
+    expect(immediateThreadRelationships(parentGraph, parent).map((row) => row.threadId)).toEqual([
+      standalone,
+    ]);
+
+    const childGraph = deriveThreadRelationshipGraph({
+      threads: shells as never,
+      projection: {
+        thread: { id: workflowMember },
+        subagents: [],
+        contextTransfers: [],
+      } as never,
+    });
+    expect(
+      immediateThreadRelationships(childGraph, workflowMember).map((row) => row.threadId),
+    ).toEqual([parent]);
   });
 
   it("resolves merge-back only for forks and prefers the recorded fork source", () => {

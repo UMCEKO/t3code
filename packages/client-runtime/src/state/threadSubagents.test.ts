@@ -323,4 +323,49 @@ describe("deriveThreadTurnSubagents", () => {
       accessibilityLabel: "1 agent done",
     });
   });
+
+  it("hides app-owned subagents spawned under a server workflow from the turn roster", () => {
+    const turn = deriveThreadTurnSubagents({
+      runs: [finishedRun],
+      subagents: [
+        subagent({
+          id: "wf-1",
+          origin: "app_owned",
+          childThreadId: null,
+          status: "running",
+          workflow: {
+            name: "audit",
+            phases: [{ index: 0, title: "Review" }],
+            agents: [
+              {
+                index: 0,
+                label: "worker-1",
+                state: "running",
+                childThreadId: ThreadId.make("child-1"),
+              },
+            ],
+          },
+        }),
+        subagent({
+          id: "wf-agent-1",
+          origin: "app_owned",
+          parentNodeId: NodeId.make("wf-1"),
+          childThreadId: ThreadId.make("child-1"),
+          status: "running",
+        }),
+        subagent({
+          id: "standalone",
+          origin: "app_owned",
+          parentNodeId: NodeId.make("node-1"),
+          childThreadId: ThreadId.make("child-2"),
+          status: "completed",
+        }),
+      ],
+    });
+
+    expect(turn?.subagents.map((entry) => entry.id)).toEqual(["standalone", "wf-1"]);
+    expect(turn?.liveCount).toBe(1);
+    expect(turn?.settledCount).toBe(1);
+    expect(resolveSubagentPillSegment(turn)?.label).toBe("1/2");
+  });
 });

@@ -10,6 +10,9 @@ import * as DateTime from "effect/DateTime";
 
 import {
   deriveWorkflowGroups,
+  excludeWorkflowMemberSubagents,
+  isServerWorkflow,
+  isStoppableWorkflow,
   isWorkflowScriptMessage,
   projectedSubagentsToRuntime,
   resolveWorkflowOpening,
@@ -164,6 +167,114 @@ describe("projectedSubagentsToRuntime workflow expansion", () => {
       subagent({ title: null, prompt: `${"a".repeat(76)}😀 and more work.` }),
     ]);
     expect(untitled?.title).toBe(`${"a".repeat(76)}...`);
+  });
+
+  it("hides app-owned subagents whose parentNodeId is a workflow task", () => {
+    const workflow = subagent({
+      id: "wf-1",
+      origin: "app_owned",
+      parentNodeId: "root-node",
+      childThreadId: null,
+      workflow: {
+        name: "audit",
+        phases: [{ index: 0, title: "Review" }],
+        agents: [
+          member({
+            index: 0,
+            label: "mod-a",
+            phaseIndex: 0,
+            childThreadId: ThreadId.make("child-a"),
+          }),
+        ],
+      },
+    });
+    const workflowChild = subagent({
+      id: "task-a",
+      origin: "app_owned",
+      parentNodeId: "wf-1",
+      childThreadId: ThreadId.make("child-a"),
+    });
+    const standalone = subagent({
+      id: "task-b",
+      origin: "app_owned",
+      parentNodeId: "root-node",
+      childThreadId: ThreadId.make("child-b"),
+    });
+    const nativeUnderSameParent = subagent({
+      id: "native-c",
+      origin: "provider_native",
+      parentNodeId: "wf-1",
+      childThreadId: null,
+    });
+
+    const filtered = excludeWorkflowMemberSubagents([
+      workflow,
+      workflowChild,
+      standalone,
+      nativeUnderSameParent,
+    ]);
+    expect(filtered.map((entry) => entry.id)).toEqual(["wf-1", "task-b", "native-c"]);
+
+    const runtime = projectedSubagentsToRuntime([
+      workflow,
+      workflowChild,
+      standalone,
+      nativeUnderSameParent,
+    ]);
+    expect(runtime.map((entry) => [entry.id, entry.kind])).toEqual([
+      ["wf-1", "workflow"],
+      ["wf-1:agent:0", "workflow_agent"],
+      ["task-b", "subagent"],
+      ["native-c", "subagent"],
+    ]);
+  });
+});
+
+describe("server workflow predicates", () => {
+  const workflow = { name: "audit", phases: [], agents: [] };
+  const base = {
+    status: "running" as const,
+    origin: "app_owned" as const,
+    driver: ProviderDriverKind.make("codex"),
+    childThreadId: null as ThreadId | null,
+    nativeTaskRef: null as OrchestrationV2Subagent["nativeTaskRef"],
+    workflow,
+  };
+
+  it("identifies server workflows and gates workflow Stop across server and Claude workflows", () => {
+    expect(isServerWorkflow(base)).toBe(true);
+    expect(isServerWorkflow({ ...base, childThreadId: ThreadId.make("child") })).toBe(false);
+    expect(isServerWorkflow({ ...base, origin: "provider_native" })).toBe(false);
+    expect(isServerWorkflow({ ...base, workflow: undefined })).toBe(false);
+
+    expect(isStoppableWorkflow(base)).toBe(true);
+    expect(isStoppableWorkflow({ ...base, status: "waiting" })).toBe(false);
+    expect(isStoppableWorkflow({ ...base, status: "completed" })).toBe(false);
+    expect(isStoppableWorkflow({ ...base, childThreadId: ThreadId.make("child") })).toBe(false);
+    expect(isStoppableWorkflow({ ...base, workflow: undefined })).toBe(false);
+
+    const claudeNative = {
+      ...base,
+      origin: "provider_native" as const,
+      driver: ProviderDriverKind.make("claudeAgent"),
+      childThreadId: ThreadId.make("coord"),
+      nativeTaskRef: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        strength: "strong" as const,
+        nativeId: "native-wf",
+      },
+    };
+    expect(isStoppableWorkflow(claudeNative)).toBe(true);
+    expect(isStoppableWorkflow({ ...claudeNative, driver: ProviderDriverKind.make("codex") })).toBe(
+      false,
+    );
+    expect(isStoppableWorkflow({ ...claudeNative, nativeTaskRef: null })).toBe(false);
+    expect(
+      isStoppableWorkflow({
+        ...claudeNative,
+        nativeTaskRef: { ...claudeNative.nativeTaskRef, nativeId: "" },
+      }),
+    ).toBe(false);
   });
 });
 

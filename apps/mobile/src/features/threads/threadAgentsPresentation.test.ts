@@ -344,6 +344,13 @@ describe("resolveSubagentStopTarget", () => {
       input: { threadId: native.threadId, subagentId: native.id },
     });
     expect(resolveSubagentStopTarget({ ...native, workflow, status: "waiting" })).toBeNull();
+    expect(resolveSubagentStopTarget({ ...stopAgent, childThreadId: null, workflow })).toEqual({
+      kind: "workflow",
+      input: { threadId: stopAgent.threadId, subagentId: stopAgent.id },
+    });
+    expect(
+      resolveSubagentStopTarget({ ...stopAgent, childThreadId: null, workflow, status: "waiting" }),
+    ).toBeNull();
     expect(resolveSubagentStopTarget({ ...stopAgent, workflow })).toBeNull();
     expect(resolveSubagentStopTarget({ ...native, workflow, nativeTaskRef: null })).toBeNull();
     expect(

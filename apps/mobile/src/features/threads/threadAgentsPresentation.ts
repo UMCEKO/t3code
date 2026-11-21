@@ -7,6 +7,7 @@ import {
 } from "@t3tools/client-runtime/state/subagent-display";
 import {
   isActiveSubagentStatus,
+  isStoppableWorkflow,
   promptTitle,
   type RuntimeSubagent,
   type SubagentWorkflowGroup,
@@ -255,10 +256,7 @@ export function resolveSubagentStopTarget(
 ) {
   if (!isActiveSubagentStatus(subagent.status)) return null;
   if (subagent.workflow !== undefined) {
-    return subagent.status === "running" &&
-      subagent.origin === "provider_native" &&
-      subagent.driver === "claudeAgent" &&
-      Boolean(subagent.nativeTaskRef?.nativeId)
+    return isStoppableWorkflow(subagent)
       ? {
           kind: "workflow" as const,
           input: { threadId: subagent.threadId, subagentId: subagent.id },
