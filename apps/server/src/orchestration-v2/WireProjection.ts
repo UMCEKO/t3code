@@ -28,7 +28,7 @@ import {
 // A checkpoint over vendored or generated trees can list 15k+ files; the card needs a prefix.
 const MAX_WIRE_CHECKPOINT_FILES = 200;
 const MAX_WIRE_WORKFLOW_AGENTS = 200;
-// Subagents render previews on the wire; full detail loads on demand.
+// Workflow members render from the parent workflow's previews, not their own subagent rows.
 const MAX_WORKFLOW_MEMBER_PREVIEW_CHARS = 500;
 const MAX_WORKFLOW_AGENT_LABEL_CHARS = 200;
 const MAX_DETAIL_STRING_BYTES = 32_768;
@@ -340,7 +340,12 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
         : projected;
     }
     case "subagent":
-      return projectWorkflowMemberSubagentTurnItemForWire(item);
+      return {
+        ...item,
+        prompt: truncateDetail(item.prompt) ?? "",
+        progress: truncateDetail(item.progress),
+        result: item.result === null ? null : (truncateDetail(item.result) ?? null),
+      };
     case "dynamic_tool": {
       const { output: rawOutput, ...projected } = item;
       const output = compactDynamicToolOutput(rawOutput);
@@ -484,6 +489,11 @@ function projectSubagentRecordForWire(
   subagent: OrchestrationV2Subagent,
   allowDelta: boolean,
 ): OrchestrationV2Subagent {
+  if (subagent.completionWake !== "never") {
+    if (subagent.workflow === undefined) return subagent;
+    const workflow = projectWorkflowForWire(subagent.workflow, allowDelta);
+    return workflow === subagent.workflow ? subagent : { ...subagent, workflow };
+  }
   const title =
     subagent.title === null ? null : truncateChars(subagent.title, MAX_WORKFLOW_AGENT_LABEL_CHARS);
   const prompt = truncateChars(subagent.prompt, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);
@@ -522,13 +532,22 @@ export function projectSubagentForWire(subagent: OrchestrationV2Subagent): Orche
 export function projectThreadProjectionForWire(
   projection: OrchestrationV2ThreadProjection,
 ): OrchestrationV2ThreadProjection {
-  const subagents = projection.subagents.map(projectSubagentForWire);
+  const workflowMemberSubagentIds = new Set<string>();
+  const subagents = projection.subagents.map((subagent) => {
+    if (subagent.completionWake === "never") workflowMemberSubagentIds.add(subagent.id);
+    return projectSubagentForWire(subagent);
+  });
   const projectedById = new Map<string, OrchestrationV2TurnItem>();
   const project = (item: OrchestrationV2TurnItem) => {
     const key = `${item.threadId}:${item.id}`;
     const existing = projectedById.get(key);
     if (existing !== undefined) return existing;
-    const projected = projectTurnItemForWire(item);
+    const projected =
+      item.type === "subagent" &&
+      item.threadId === projection.thread.id &&
+      workflowMemberSubagentIds.has(item.subagentId)
+        ? projectWorkflowMemberSubagentTurnItemForWire(item)
+        : projectTurnItemForWire(item);
     projectedById.set(key, projected);
     return projected;
   };
@@ -609,6 +628,37 @@ function remember<K, V>(memory: Map<K, V>, key: K, value: V): void {
   if (memory.size > LIVE_DEDUPE_MEMORY) memory.delete(memory.keys().next().value as K);
 }
 
+/** One per subscription without body dedupe: workflow-member turn items ship as previews. */
+export function makeWorkflowMemberBounder(): (
+  item: OrchestrationV2ThreadStreamItem,
+) => OrchestrationV2ThreadStreamItem {
+  const members = new Set<NodeId>();
+  const note = (subagent: OrchestrationV2Subagent) => {
+    if (subagent.completionWake === "never") members.add(subagent.id);
+  };
+  return (item) => {
+    if (item.kind === "snapshot") {
+      for (const subagent of item.projection.subagents) note(subagent);
+      return item;
+    }
+    if (item.kind !== "event") return item;
+    const { event } = item;
+    if (event.type === "subagent.updated") {
+      note(event.payload);
+      return item;
+    }
+    if (
+      event.type !== "turn-item.updated" ||
+      event.payload.type !== "subagent" ||
+      !members.has(event.payload.subagentId)
+    ) {
+      return item;
+    }
+    const payload = projectWorkflowMemberSubagentTurnItemForWire(event.payload);
+    return payload === event.payload ? item : { ...item, event: { ...event, payload } };
+  };
+}
+
 /**
  * One per subscription, after coalescing, so it remembers only records the client received. A
  * record event comes before the turn item that repeats its body, so the item (or a repeated
@@ -620,14 +670,21 @@ export function makeLiveBodyDeduper(): (
 ) => OrchestrationV2ThreadStreamItem {
   const messageText = new Map<MessageId, string>();
   const checkpointFiles = new Map<CheckpointId, OrchestrationV2Checkpoint["files"]>();
-  const subagents = new Map<NodeId, Pick<OrchestrationV2Subagent, "prompt" | "result">>();
+  const subagents = new Map<
+    NodeId,
+    Pick<OrchestrationV2Subagent, "prompt" | "result" | "completionWake">
+  >();
   const source = {
     messageText: (id: MessageId) => messageText.get(id),
     checkpointFiles: (id: CheckpointId) => checkpointFiles.get(id),
     subagent: (id: NodeId) => subagents.get(id),
   };
-  const rememberSubagent = ({ id, prompt, result }: OrchestrationV2Subagent) =>
-    remember(subagents, id, { prompt, result });
+  const rememberSubagent = ({ id, prompt, result, completionWake }: OrchestrationV2Subagent) =>
+    remember(subagents, id, {
+      prompt,
+      result,
+      ...(completionWake === undefined ? {} : { completionWake }),
+    });
   return (item) => {
     if (item.kind === "snapshot") {
       // The client now holds exactly these records; their bodies are never blanked.
@@ -653,7 +710,12 @@ export function makeLiveBodyDeduper(): (
         return payload === event.payload ? item : { ...item, event: { ...event, payload } };
       }
       case "turn-item.updated": {
-        const payload = dedupeTurnItemBodies(event.payload, source);
+        const bounded =
+          event.payload.type === "subagent" &&
+          subagents.get(event.payload.subagentId)?.completionWake === "never"
+            ? projectWorkflowMemberSubagentTurnItemForWire(event.payload)
+            : event.payload;
+        const payload = dedupeTurnItemBodies(bounded, source);
         return payload === event.payload ? item : { ...item, event: { ...event, payload } };
       }
       default:

@@ -42,6 +42,7 @@ import { coalesceLiveUpdatedEvents } from "./ThreadLiveEventCoalescer.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import {
   makeLiveBodyDeduper,
+  makeWorkflowMemberBounder,
   projectTurnItemForWire,
   projectTurnItemForDetail,
   projectDomainEventForWire,
@@ -438,7 +439,7 @@ describe("orchestration V2 wire projection", () => {
     expect(projectStoredEventForWire(detached)).toBe(detached);
   });
 
-  it("bounds subagent prompts, results, and titles statelessly across events, snapshots, and dedup", () => {
+  it("bounds workflow-member prompts, results, and titles across events, snapshots, and dedup", () => {
     const longPrompt = "a".repeat(498) + "😀" + "b".repeat(1_000);
     const longResult = "r".repeat(501);
     const longTitle = "t".repeat(198) + "😀" + "z".repeat(50);
@@ -527,13 +528,32 @@ describe("orchestration V2 wire projection", () => {
       payload: memberItem,
     };
     const projectedItemEvent = projectDomainEventForWire(memberItemEvent);
-    expect(projectedItemEvent.type === "turn-item.updated" && projectedItemEvent.payload).toEqual({
-      ...memberItem,
-      title: expectedTitle,
-      prompt: expectedPrompt,
-      result: expectedResult,
-    });
-    expect(projectDomainEventForWire(projectedItemEvent)).toBe(projectedItemEvent);
+    expect(
+      projectedItemEvent.type === "turn-item.updated" && projectedItemEvent.payload,
+    ).toMatchObject({ prompt: longPrompt, result: longResult });
+    const bound = makeWorkflowMemberBounder();
+    bound({ kind: "event", sequence: 1, event: memberEvent } as OrchestrationV2ThreadStreamItem);
+    const boundedItem = bound({
+      kind: "event",
+      sequence: 2,
+      event: projectedItemEvent,
+    } as OrchestrationV2ThreadStreamItem);
+    expect(
+      boundedItem.kind === "event" &&
+        boundedItem.event.type === "turn-item.updated" &&
+        boundedItem.event.payload,
+    ).toMatchObject({ title: expectedTitle, prompt: expectedPrompt, result: expectedResult });
+    const ordinaryItemEvent = {
+      ...memberItemEvent,
+      id: EventId.make("ordinary-item-event"),
+      payload: makeSubagentItem("item-ordinary-live", ordinaryTask),
+    };
+    const ordinaryStreamItem = {
+      kind: "event",
+      sequence: 3,
+      event: ordinaryItemEvent,
+    } as OrchestrationV2ThreadStreamItem;
+    expect(bound(ordinaryStreamItem)).toBe(ordinaryStreamItem);
 
     const snapshot = {
       thread: { id: base.threadId },
@@ -554,7 +574,7 @@ describe("orchestration V2 wire projection", () => {
     const projected = projectThreadProjectionForWire(snapshot);
     expect(projected.subagents).toEqual([
       { ...workflowMember, title: expectedTitle, prompt: expectedPrompt, result: expectedResult },
-      { ...ordinaryTask, title: expectedTitle, prompt: expectedPrompt, result: expectedResult },
+      ordinaryTask,
     ]);
     expect(projected.turnItems[0]).toEqual({
       ...memberItem,
@@ -563,11 +583,10 @@ describe("orchestration V2 wire projection", () => {
       result: expectedResult,
     });
     expect(projected.visibleTurnItems[0]?.item).toBe(projected.turnItems[0]);
-    expect(projected.turnItems[1]).toEqual({
-      ...ordinaryItem,
-      title: expectedTitle,
-      prompt: expectedPrompt,
-      result: expectedResult,
+    expect(projected.turnItems[1]).toMatchObject({
+      title: longTitle,
+      prompt: longPrompt,
+      result: longResult,
     });
 
     const deduped = dedupeSnapshotBodies(projected);
@@ -876,8 +895,19 @@ describe("orchestration V2 wire projection", () => {
               }),
             },
           };
-          const memberItemStoredEvent: OrchestrationV2StoredEvent = {
+          const memberSubagentStoredEvent: OrchestrationV2StoredEvent = {
             sequence: 12,
+            commandId: null,
+            event: {
+              id: EventId.make("ev-member-subagent"),
+              type: "subagent.updated",
+              threadId: base.threadId,
+              occurredAt: base.updatedAt,
+              payload: memberSubagent,
+            },
+          };
+          const memberItemStoredEvent: OrchestrationV2StoredEvent = {
+            sequence: 13,
             commandId: null,
             event: {
               id: EventId.make("ev-member-item"),
@@ -926,10 +956,14 @@ describe("orchestration V2 wire projection", () => {
                   projection: snapshotProjection,
                 }),
               streamStoredEventsFrom: () =>
-                Stream.fromIterable([deltaStoredEvent, memberItemStoredEvent]),
+                Stream.fromIterable([
+                  deltaStoredEvent,
+                  memberSubagentStoredEvent,
+                  memberItemStoredEvent,
+                ]),
             }),
             Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({
-              latestAgentSequence: () => Effect.succeed(12),
+              latestAgentSequence: () => Effect.succeed(13),
               prunedThroughSequence: Effect.succeed(0),
               getAgentReplayStats: () =>
                 Effect.succeed({
@@ -937,7 +971,12 @@ describe("orchestration V2 wire projection", () => {
                   rawPayloadBytes: 1_024,
                   hasCreateEvent: false,
                 }),
-              readAgentEvents: () => Stream.fromIterable([deltaStoredEvent, memberItemStoredEvent]),
+              readAgentEvents: () =>
+                Stream.fromIterable([
+                  deltaStoredEvent,
+                  memberSubagentStoredEvent,
+                  memberItemStoredEvent,
+                ]),
             }),
           );
 
@@ -945,7 +984,7 @@ describe("orchestration V2 wire projection", () => {
           const snapshotAndLive = yield* subscribeOrchestrationV2Thread({
             threadId: base.threadId,
           }).pipe(Effect.flatMap(Stream.runCollect), Effect.provide(layer));
-          const [snap, liveDelta, liveMemberItem] = Array.from(snapshotAndLive);
+          const [snap, liveDelta, , liveMemberItem] = Array.from(snapshotAndLive);
           expect(snap?.kind).toBe("snapshot");
           if (snap?.kind === "snapshot") {
             expect(snap.projection.subagents[0]?.workflow?.agents).toHaveLength(200);
@@ -981,7 +1020,7 @@ describe("orchestration V2 wire projection", () => {
             threadId: base.threadId,
             afterSequence: 10,
           }).pipe(Effect.flatMap(Stream.runCollect), Effect.provide(layer));
-          const [replayDelta, replayMemberItem] = Array.from(replayed);
+          const [replayDelta, , replayMemberItem] = Array.from(replayed);
           expect(replayDelta?.kind).toBe("event");
           if (replayDelta?.kind === "event" && replayDelta.event.type === "subagent.updated") {
             expect(replayDelta.event.payload.workflow?.agentsDelta).toBe(true);

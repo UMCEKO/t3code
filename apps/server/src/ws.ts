@@ -175,6 +175,7 @@ import {
 } from "./orchestration-v2/threadHistoryPaging.ts";
 import {
   makeLiveBodyDeduper,
+  makeWorkflowMemberBounder,
   projectDomainEventForWire,
   projectStoredEventForWire,
   projectThreadProjectionForWire,
@@ -934,7 +935,9 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
     const dedupeBodies = input.acceptDedupedBodies === true;
     // Replay, snapshot, and live tail share one deduper: it must see every delivered record.
     const withLiveDedupe = <E, R>(stream: Stream.Stream<OrchestrationV2ThreadStreamItem, E, R>) =>
-      dedupeBodies ? Stream.suspend(() => Stream.map(stream, makeLiveBodyDeduper())) : stream;
+      Stream.suspend(() =>
+        Stream.map(stream, dedupeBodies ? makeLiveBodyDeduper() : makeWorkflowMemberBounder()),
+      );
     const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
 
     yield* Effect.annotateCurrentSpan({
