@@ -176,6 +176,7 @@ import {
 import {
   makeLiveBodyDeduper,
   projectDomainEventForWire,
+  projectStoredEventForWire,
   projectThreadProjectionForWire,
   threadStreamEventItem,
 } from "./orchestration-v2/WireProjection.ts";
@@ -957,6 +958,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
           afterSequence,
         })
         .pipe(
+          Stream.map(projectStoredEventForWire),
           Stream.map(threadStreamEventItem),
           coalesceThreadLiveStream,
           Stream.mapError(

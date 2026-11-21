@@ -6,6 +6,8 @@ import {
 import type {
   OrchestrationV2DomainEvent,
   OrchestrationV2Run,
+  OrchestrationV2Subagent,
+  OrchestrationV2SubagentWorkflow,
   OrchestrationV2ThreadProjection,
   OrchestrationV2TurnItem,
 } from "@t3tools/contracts";
@@ -63,6 +65,39 @@ function upsertEntity<T extends { readonly id: unknown }>(
   const next = [...items];
   next[index] = item;
   return next;
+}
+
+function mergeSubagentWorkflow(
+  incoming: OrchestrationV2Subagent,
+  previous: OrchestrationV2Subagent | undefined,
+): OrchestrationV2Subagent {
+  const workflow = incoming.workflow;
+  if (workflow?.agentsDelta !== true) return incoming;
+  const { agentsDelta: _agentsDelta, ...nextWorkflow } = workflow;
+  const existingAgents = previous?.workflow?.agents;
+  if (existingAgents === undefined || existingAgents.length === 0) {
+    return { ...incoming, workflow: nextWorkflow };
+  }
+  if (workflow.agents.length === 0) {
+    return {
+      ...incoming,
+      workflow: {
+        ...nextWorkflow,
+        agents: existingAgents,
+      },
+    };
+  }
+  const byIndex = new Map<number, OrchestrationV2SubagentWorkflow["agents"][number]>();
+  for (const agent of existingAgents) byIndex.set(agent.index, agent);
+  for (const agent of workflow.agents) byIndex.set(agent.index, agent);
+  const agents = Array.from(byIndex.values()).sort((left, right) => left.index - right.index);
+  return {
+    ...incoming,
+    workflow: {
+      ...nextWorkflow,
+      agents,
+    },
+  };
 }
 
 // A deduped item repeats a record the stream just sent, so search newest first.
@@ -373,17 +408,16 @@ export function applyOrchestrationV2ProjectionEvent(
     }
     case "node.updated":
       return { ...base, nodes: upsertEntity(base.nodes, event.payload) };
-    case "subagent.updated":
+    case "subagent.updated": {
+      const previous = base.subagents.find((subagent) => subagent.id === event.payload.id);
       return {
         ...base,
         subagents: upsertEntity(
           base.subagents,
-          restoreSubagentBodies(
-            event.payload,
-            base.subagents.find((subagent) => subagent.id === event.payload.id),
-          ),
+          mergeSubagentWorkflow(restoreSubagentBodies(event.payload, previous), previous),
         ),
       };
+    }
     case "provider-session.attached":
     case "provider-session.updated":
       return {

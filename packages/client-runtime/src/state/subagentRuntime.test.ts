@@ -17,6 +17,7 @@ import {
   projectedSubagentsToRuntime,
   resolveWorkflowOpening,
   workflowMemberModelSelection,
+  workflowOpeningHeadline,
 } from "./subagentRuntime.ts";
 import { resolveSubagentMetadata } from "./subagentDisplay.ts";
 import { formatSubagentEffort } from "./threadExecution.ts";
@@ -310,7 +311,27 @@ describe("deriveWorkflowGroups over a dynamic workflow", () => {
     ]);
     expect(group?.phases.map((phase) => phase.settledCount)).toEqual([2, 0]);
     expect(group?.phases.flatMap((phase) => phase.members)).toHaveLength(4);
+    expect(group?.agentCount).toBe(4);
     expect(group?.unphasedMembers).toEqual([]);
+  });
+
+  it("uses workflow.agentCount for totals and headline text when agents is a bounded subset", () => {
+    const groups = groupsOf([
+      subagent({
+        workflow: {
+          name: "fan-out",
+          phases: [{ index: 0, title: "Scan" }],
+          agents: [
+            member({ index: 0, state: "running", phaseIndex: 0 }),
+            member({ index: 1, state: "completed", phaseIndex: 0 }),
+          ],
+          agentCount: 1_000,
+        },
+      }),
+    ]);
+    expect(groups[0]?.workflow.agentCount).toBe(1_000);
+    expect(groups[0]?.agentCount).toBe(1_000);
+    expect(groups[0]?.phases[0]?.members[0]?.agentCount).toBeUndefined();
   });
 
   it.each([false, true])("keeps a reported phase title, missing title first=%s", (missingFirst) => {
@@ -439,5 +460,67 @@ describe("resolveWorkflowOpening", () => {
     expect(
       isWorkflowScriptMessage({ role: "user", text: `${"/**/".repeat(200)}const x = 1;` }),
     ).toBe(false);
+  });
+
+  it("formats opening headline agent counts from agentCount ?? agents.length", () => {
+    const full = resolveWorkflowOpening({
+      thread: childThread,
+      messages: [brief(SCRIPT, true)],
+      parentSubagents: [
+        coordinator({
+          name: "probe-wf",
+          phases: [{ index: 1, title: "Alpha" }],
+          agents: [
+            member({ index: 0, state: "running" }),
+            member({ index: 1, state: "completed" }),
+          ],
+        }),
+      ],
+    });
+    expect(workflowOpeningHeadline(full!).agents).toBe("2 agents · 1 working · 1 done");
+
+    const bounded = resolveWorkflowOpening({
+      thread: childThread,
+      messages: [brief(SCRIPT, true)],
+      parentSubagents: [
+        coordinator({
+          name: "probe-wf",
+          phases: [{ index: 1, title: "Alpha" }],
+          agents: [
+            member({ index: 0, state: "running" }),
+            member({ index: 1, state: "completed" }),
+          ],
+          agentCount: 1_000,
+        }),
+      ],
+    });
+    expect(workflowOpeningHeadline(bounded!).agents).toBe("1000 agents");
+
+    const emptyDelta = resolveWorkflowOpening({
+      thread: childThread,
+      messages: [brief(SCRIPT, true)],
+      parentSubagents: [
+        coordinator({
+          name: "probe-wf",
+          phases: [],
+          agents: [],
+          agentCount: 1,
+        }),
+      ],
+    });
+    expect(workflowOpeningHeadline(emptyDelta!).agents).toBe("1 agent");
+
+    const empty = resolveWorkflowOpening({
+      thread: childThread,
+      messages: [brief(SCRIPT, true)],
+      parentSubagents: [
+        coordinator({
+          name: "probe-wf",
+          phases: [],
+          agents: [],
+        }),
+      ],
+    });
+    expect(workflowOpeningHeadline(empty!).agents).toBeNull();
   });
 });

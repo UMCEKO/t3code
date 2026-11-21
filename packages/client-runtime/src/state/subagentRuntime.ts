@@ -70,6 +70,7 @@ export interface RuntimeSubagent {
   readonly phaseTitle: string | null;
   readonly attempt: number | null;
   readonly workflowName: string | null;
+  readonly agentCount?: number | undefined;
   readonly phases: ReadonlyArray<SubagentWorkflowPhase>;
   readonly runHandles: SubagentRunHandles | null;
   readonly childThreadId: string | null;
@@ -168,6 +169,7 @@ export function waitingOnSubagentsLabel(count: number, resolve: MFunctionType = 
 
 export interface SubagentWorkflowGroup {
   readonly workflow: RuntimeSubagent;
+  readonly agentCount: number;
   readonly phases: ReadonlyArray<{
     readonly index: number;
     readonly title: string;
@@ -199,6 +201,7 @@ function workflowMembersToRuntime(
   coordinator: RuntimeSubagent,
   workflow: OrchestrationV2SubagentWorkflow,
 ): ReadonlyArray<RuntimeSubagent> {
+  const { agentCount: _agentCount, ...memberBase } = coordinator;
   return workflow.agents.map((agent) => {
     const status =
       (agent.state === "queued" || agent.state === "running") &&
@@ -216,7 +219,7 @@ function workflowMembersToRuntime(
           : coordinator.completedAt))
       : null;
     return {
-      ...coordinator,
+      ...memberBase,
       id: `${coordinator.id}:agent:${agent.index}`,
       kind: "workflow_agent" as const,
       title: agent.label,
@@ -316,6 +319,9 @@ export function projectedSubagentsToRuntime(
       phaseTitle: null,
       attempt: null,
       workflowName: workflow?.name ?? null,
+      ...(workflow === undefined
+        ? {}
+        : { agentCount: workflow.agentCount ?? workflow.agents.length }),
       phases: workflow?.phases ?? [],
       runHandles,
       childThreadId: subagent.childThreadId ?? null,
@@ -390,7 +396,12 @@ export function deriveWorkflowGroups(
       .filter((member) => member.phaseIndex === null)
       .sort((a, b) => (a.agentIndex ?? 0) - (b.agentIndex ?? 0));
 
-    return { workflow, phases, unphasedMembers };
+    return {
+      workflow,
+      agentCount: Math.max(workflow.agentCount ?? 0, workflowMembers.length),
+      phases,
+      unphasedMembers,
+    };
   });
 }
 
@@ -507,6 +518,7 @@ export function workflowOpeningHeadline(
           ...opening.group.phases.flatMap((phase) => phase.members),
           ...opening.group.unphasedMembers,
         ];
+  const totalAgents = opening.group?.agentCount ?? members.length;
   const counts = new Map<string, number>();
   for (const member of members) {
     const key = isTerminalSubagentStatus(member.status)
@@ -518,18 +530,21 @@ export function workflowOpeningHeadline(
       : "working";
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
+  // Omit per-status counts when the snapshot holds a subset so settled totals never undercount.
   const agents =
-    members.length === 0
+    totalAgents === 0
       ? null
       : [
           resolve(
             msg("{count, plural, one {{count} agent} other {{count} agents}}", {
-              count: members.length,
+              count: totalAgents,
             }),
           ),
-          ...(["working", "done", "failed", "stopped"] as const)
-            .filter((key) => counts.has(key))
-            .map((key) => resolve(WORKFLOW_AGENT_COUNTS[key], { count: counts.get(key)! })),
+          ...(totalAgents === members.length
+            ? (["working", "done", "failed", "stopped"] as const)
+                .filter((key) => counts.has(key))
+                .map((key) => resolve(WORKFLOW_AGENT_COUNTS[key], { count: counts.get(key)! }))
+            : []),
         ].join(" · ");
   return {
     title,
