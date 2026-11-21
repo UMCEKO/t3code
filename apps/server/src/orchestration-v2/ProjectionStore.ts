@@ -1,7 +1,11 @@
 import type { ProjectThreadAwarenessV2Input } from "@t3tools/shared/agentAwareness";
 import { applyOrchestrationV2ThreadVisit, pendingGuestMessageCount } from "@t3tools/contracts";
 import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
-import { projectTurnItemForWire } from "./WireProjection.ts";
+import {
+  projectSubagentForWire,
+  projectTurnItemForWire,
+  projectWorkflowMemberSubagentTurnItemForWire,
+} from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { makeThreadFind } from "./ThreadFind.ts";
@@ -7966,7 +7970,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
             const subagentIds = rows.flatMap(({ sourceThreadId, item }) =>
               item.type === "subagent" && sourceThreadId === threadId ? [item.subagentId] : [],
             );
-            const subagents =
+            const rawSubagents =
               subagentIds.length === 0
                 ? []
                 : yield* sql<PayloadRow>`
@@ -7975,9 +7979,29 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               AND subagent_id IN (SELECT value FROM json_each(${encodeIdList(subagentIds)}))
             ORDER BY COALESCE(started_at, ''), subagent_id ASC
           `.pipe(Effect.flatMap(decodeRows(decodeSubagentPayload, threadId)));
+            const workflowMemberSubagentIds = new Set(
+              rawSubagents
+                .filter((subagent) => subagent.completionWake === "never")
+                .map((subagent) => subagent.id),
+            );
+            const subagents = rawSubagents.map(projectSubagentForWire);
+            const projectedRows =
+              workflowMemberSubagentIds.size === 0
+                ? rows
+                : rows.map((row) => {
+                    if (
+                      row.sourceThreadId !== threadId ||
+                      row.item.type !== "subagent" ||
+                      !workflowMemberSubagentIds.has(row.item.subagentId)
+                    ) {
+                      return row;
+                    }
+                    const item = projectWorkflowMemberSubagentTurnItemForWire(row.item);
+                    return item === row.item ? row : { ...row, item };
+                  });
             return {
               snapshotSequence,
-              items: rows,
+              items: projectedRows,
               nextCursor: bounded.hasMoreHistory ? bounded.nextCursor : page.nextCursor,
               hasMoreHistory: bounded.hasMoreHistory || page.hasMoreHistory,
               ...(subagents.length === 0 ? {} : { subagents }),

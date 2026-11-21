@@ -15,11 +15,18 @@ import {
   TurnItemId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2StoredEvent,
+  type OrchestrationV2Subagent,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadStreamItem,
   OrchestrationV2TurnItem,
   OrchestrationV2TurnItemJson,
 } from "@t3tools/contracts";
+import {
+  dedupeSnapshotBodies,
+  restoreSnapshotBodies,
+  restoreSubagentBodies,
+  restoreTurnItemBodies,
+} from "@t3tools/shared/orchestrationV2DedupedBodies";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
 import * as Schema from "effect/Schema";
@@ -31,6 +38,7 @@ import {
   projectTurnItemForDetail,
   projectDomainEventForWire,
   projectStoredEventForWire,
+  projectThreadProjectionForWire,
 } from "./WireProjection.ts";
 import { threadShellFromProjection } from "./ProjectionStore.ts";
 import { MAX_TOOL_OUTPUT_IMAGES, toolOutputImages } from "@t3tools/shared/toolOutput";
@@ -421,6 +429,128 @@ describe("orchestration V2 wire projection", () => {
     };
     expect(projectStoredEventForWire(detached)).toBe(detached);
   });
+
+  it("bounds workflow-member subagent prompts and results on the wire while leaving ordinary tasks untouched", () => {
+    const longPrompt = "a".repeat(498) + "😀" + "b".repeat(1_000);
+    const longResult = "r".repeat(501);
+    const expectedPrompt = "a".repeat(498) + "…";
+    const expectedResult = "r".repeat(499) + "…";
+    const makeSubagent = (
+      id: string,
+      overrides: Partial<OrchestrationV2Subagent>,
+    ): OrchestrationV2Subagent => ({
+      id: NodeId.make(id),
+      threadId: base.threadId,
+      runId: null,
+      parentNodeId: NodeId.make("workflow-node"),
+      origin: "app_owned",
+      createdBy: "agent",
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      providerThreadId: null,
+      childThreadId: ThreadId.make(`child-${id}`),
+      nativeTaskRef: null,
+      prompt: longPrompt,
+      title: "Agent",
+      model: "gpt-5",
+      status: "completed",
+      result: longResult,
+      startedAt: base.startedAt,
+      completedAt: base.completedAt,
+      updatedAt: base.updatedAt,
+      ...overrides,
+    });
+    const makeSubagentItem = (id: string, subagent: OrchestrationV2Subagent) =>
+      ({
+        ...base,
+        id: TurnItemId.make(id),
+        type: "subagent" as const,
+        subagentId: subagent.id,
+        origin: "app_owned" as const,
+        driver: subagent.driver,
+        providerInstanceId: subagent.providerInstanceId,
+        childThreadId: subagent.childThreadId,
+        prompt: subagent.prompt,
+        result: subagent.result,
+      }) satisfies OrchestrationV2TurnItem;
+
+    const workflowMember = makeSubagent("wf-member", { completionWake: "never" });
+    const shortMember = makeSubagent("wf-member-short", {
+      completionWake: "never",
+      prompt: "s".repeat(500),
+      result: "d".repeat(500),
+    });
+    const ordinaryTask = makeSubagent("ordinary-task", { completionWake: "always" });
+
+    const memberEvent = {
+      id: EventId.make("wf-member-event"),
+      type: "subagent.updated" as const,
+      threadId: base.threadId,
+      occurredAt: base.updatedAt,
+      payload: workflowMember,
+    };
+    const projectedMemberEvent = projectDomainEventForWire(memberEvent);
+    expect(
+      projectedMemberEvent.type === "subagent.updated" && projectedMemberEvent.payload,
+    ).toEqual({
+      ...workflowMember,
+      prompt: expectedPrompt,
+      result: expectedResult,
+    });
+    expect(projectDomainEventForWire(projectedMemberEvent)).toBe(projectedMemberEvent);
+    expect(workflowMember.prompt).toBe(longPrompt);
+    expect(workflowMember.result).toBe(longResult);
+
+    const shortEvent = { ...memberEvent, id: EventId.make("short-event"), payload: shortMember };
+    expect(projectDomainEventForWire(shortEvent)).toBe(shortEvent);
+
+    const ordinaryEvent = {
+      ...memberEvent,
+      id: EventId.make("ordinary-event"),
+      payload: ordinaryTask,
+    };
+    expect(projectDomainEventForWire(ordinaryEvent)).toBe(ordinaryEvent);
+
+    const memberItem = makeSubagentItem("item-wf-member", workflowMember);
+    const ordinaryItem = makeSubagentItem("item-ordinary", ordinaryTask);
+    const snapshot = {
+      thread: { id: base.threadId },
+      checkpoints: [],
+      contextHandoffs: [],
+      messages: [],
+      subagents: [workflowMember, ordinaryTask],
+      turnItems: [memberItem, ordinaryItem],
+      visibleTurnItems: [memberItem, ordinaryItem].map((item, position) => ({
+        position,
+        visibility: "local" as const,
+        sourceThreadId: base.threadId,
+        sourceItemId: item.id,
+        item,
+      })),
+    } as unknown as OrchestrationV2ThreadProjection;
+
+    const projected = projectThreadProjectionForWire(snapshot);
+    expect(projected.subagents).toEqual([
+      { ...workflowMember, prompt: expectedPrompt, result: expectedResult },
+      ordinaryTask,
+    ]);
+    expect(projected.turnItems[0]).toEqual({
+      ...memberItem,
+      prompt: expectedPrompt,
+      result: expectedResult,
+    });
+    expect(projected.visibleTurnItems[0]?.item).toBe(projected.turnItems[0]);
+    expect(projected.turnItems[1]).toMatchObject({ prompt: longPrompt, result: longResult });
+
+    const deduped = dedupeSnapshotBodies(projected);
+    expect(deduped.turnItems[0]).toMatchObject({
+      prompt: "",
+      promptOmitted: true,
+      result: null,
+      resultOmitted: true,
+    });
+    expect(restoreSnapshotBodies(deduped)).toEqual(projected);
+  });
 });
 
 describe("live body deduper", () => {
@@ -531,5 +661,101 @@ describe("live body deduper", () => {
   it("ships a reply whole when its message arrives after it", () => {
     const first = reply(1, "a");
     expect([first, message(2, "a")].map(makeLiveBodyDeduper())[0]).toBe(first);
+  });
+
+  it("bounds workflow-member subagent updates and still dedupes repeated records and turn items", () => {
+    const subagentId = NodeId.make("wf-member-live");
+    const longPrompt = "p".repeat(40_000);
+    const longResult = "r".repeat(40_000);
+    const previewPrompt = "p".repeat(499) + "…";
+    const previewResult = "r".repeat(499) + "…";
+    const subagentRecord = (
+      status: OrchestrationV2Subagent["status"],
+      result: string | null,
+    ): OrchestrationV2Subagent => ({
+      id: subagentId,
+      threadId: base.threadId,
+      runId: null,
+      parentNodeId: NodeId.make("workflow-node"),
+      origin: "app_owned",
+      createdBy: "agent",
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      providerThreadId: null,
+      childThreadId: ThreadId.make("child-wf-member-live"),
+      nativeTaskRef: null,
+      prompt: longPrompt,
+      title: "Worker",
+      model: "gpt-5",
+      completionWake: "never",
+      status,
+      result,
+      startedAt: at,
+      completedAt: status === "completed" ? at : null,
+      updatedAt: at,
+    });
+    const subagentItem = (
+      status: OrchestrationV2TurnItem["status"],
+      result: string | null,
+    ): OrchestrationV2TurnItem => ({
+      ...base,
+      id: TurnItemId.make("turn-item-wf-member-live"),
+      type: "subagent",
+      subagentId,
+      origin: "app_owned",
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      childThreadId: ThreadId.make("child-wf-member-live"),
+      status,
+      prompt: longPrompt,
+      result,
+    });
+
+    const raw = [
+      event(1, { type: "subagent.updated", payload: subagentRecord("running", null) }),
+      event(2, { type: "turn-item.updated", payload: subagentItem("running", null) }),
+      event(3, { type: "subagent.updated", payload: subagentRecord("completed", longResult) }),
+      event(4, { type: "turn-item.updated", payload: subagentItem("completed", longResult) }),
+    ];
+    const dedupe = makeLiveBodyDeduper();
+    const [startedRecord, startedCard, completedRecord, completedCard] = raw.map((streamed) =>
+      dedupe({ ...streamed, event: projectDomainEventForWire(streamed.event) }),
+    );
+
+    const startedPayload = payloadOf(startedRecord!) as OrchestrationV2Subagent;
+    expect(startedPayload).toMatchObject({ prompt: previewPrompt, result: null });
+    expect(startedPayload).not.toHaveProperty("promptOmitted");
+
+    const startedCardPayload = payloadOf(startedCard!) as OrchestrationV2TurnItem;
+    expect(startedCardPayload).toMatchObject({
+      prompt: "",
+      promptOmitted: true,
+      result: null,
+    });
+
+    const completedPayload = payloadOf(completedRecord!) as OrchestrationV2Subagent;
+    expect(completedPayload).toMatchObject({
+      prompt: "",
+      promptOmitted: true,
+      result: previewResult,
+    });
+    expect(completedPayload).not.toHaveProperty("resultOmitted");
+
+    const completedCardPayload = payloadOf(completedCard!) as OrchestrationV2TurnItem;
+    expect(completedCardPayload).toMatchObject({
+      prompt: "",
+      promptOmitted: true,
+      result: null,
+      resultOmitted: true,
+    });
+
+    const restoredSubagent = restoreSubagentBodies(completedPayload, startedPayload);
+    expect(restoredSubagent).toMatchObject({ prompt: previewPrompt, result: previewResult });
+    const restoredCard = restoreTurnItemBodies(completedCardPayload, {
+      messageText: () => undefined,
+      checkpointFiles: () => undefined,
+      subagent: (id) => (id === subagentId ? restoredSubagent : undefined),
+    });
+    expect(restoredCard).toMatchObject({ prompt: previewPrompt, result: previewResult });
   });
 });

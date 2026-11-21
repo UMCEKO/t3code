@@ -25,6 +25,8 @@ import {
 
 // A checkpoint over vendored or generated trees can list 15k+ files; the card needs a prefix.
 const MAX_WIRE_CHECKPOINT_FILES = 200;
+// Workflow members render from the parent workflow's previews, not their own subagent rows.
+const MAX_WORKFLOW_MEMBER_PREVIEW_CHARS = 500;
 const MAX_DETAIL_STRING_BYTES = 32_768;
 const MAX_DYNAMIC_VALUE_BYTES = 16_384;
 const MAX_ON_DEMAND_BYTES = 256 * 1024;
@@ -49,6 +51,16 @@ function truncateDetail(
     .toString("utf8")
     .replace(/\uFFFD$/u, "");
   return `${prefix}${TRUNCATION_MARKER}`;
+}
+
+function truncateWorkflowMemberPreview(value: string): string {
+  if (value.length <= MAX_WORKFLOW_MEMBER_PREVIEW_CHARS) return value;
+  let end = MAX_WORKFLOW_MEMBER_PREVIEW_CHARS - 1;
+  const last = value.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) {
+    end -= 1;
+  }
+  return `${value.slice(0, end)}…`;
 }
 
 /** Bound stored diffs to the client wire limit to avoid retaining invisible data in SQLite and heap. */
@@ -202,6 +214,24 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
   }
 }
 
+type SubagentTurnItem = Extract<OrchestrationV2TurnItem, { readonly type: "subagent" }>;
+
+export function projectWorkflowMemberSubagentTurnItemForWire(
+  item: SubagentTurnItem,
+): SubagentTurnItem {
+  const prompt = truncateWorkflowMemberPreview(item.prompt);
+  const progress = truncateDetail(item.progress);
+  const result = item.result === null ? null : truncateWorkflowMemberPreview(item.result);
+  return prompt === item.prompt && progress === item.progress && result === item.result
+    ? item
+    : {
+        ...item,
+        prompt,
+        ...(progress === undefined ? {} : { progress }),
+        result,
+      };
+}
+
 function hasDynamicValue(value: unknown): boolean {
   if (value === undefined || value === null) return false;
   if (typeof value === "string") return value.trim().length > 0;
@@ -301,15 +331,34 @@ export function projectContextHandoffForWire(
   return { ...projected, summaryText: "" };
 }
 
+export function projectSubagentForWire(subagent: OrchestrationV2Subagent): OrchestrationV2Subagent {
+  if (subagent.completionWake !== "never") return subagent;
+  const prompt = truncateWorkflowMemberPreview(subagent.prompt);
+  const result = subagent.result === null ? null : truncateWorkflowMemberPreview(subagent.result);
+  return prompt === subagent.prompt && result === subagent.result
+    ? subagent
+    : { ...subagent, prompt, result };
+}
+
 export function projectThreadProjectionForWire(
   projection: OrchestrationV2ThreadProjection,
 ): OrchestrationV2ThreadProjection {
+  const workflowMemberSubagentIds = new Set<NodeId>();
+  const subagents = projection.subagents.map((subagent) => {
+    if (subagent.completionWake === "never") workflowMemberSubagentIds.add(subagent.id);
+    return projectSubagentForWire(subagent);
+  });
   const projectedById = new Map<string, OrchestrationV2TurnItem>();
   const project = (item: OrchestrationV2TurnItem) => {
     const key = `${item.threadId}:${item.id}`;
     const existing = projectedById.get(key);
     if (existing !== undefined) return existing;
-    const projected = projectTurnItemForWire(item);
+    const projected =
+      item.type === "subagent" &&
+      item.threadId === projection.thread.id &&
+      workflowMemberSubagentIds.has(item.subagentId)
+        ? projectWorkflowMemberSubagentTurnItemForWire(item)
+        : projectTurnItemForWire(item);
     projectedById.set(key, projected);
     return projected;
   };
@@ -317,6 +366,7 @@ export function projectThreadProjectionForWire(
     ...projection,
     checkpoints: projection.checkpoints.map(capCheckpointFiles),
     contextHandoffs: projection.contextHandoffs.map(projectContextHandoffForWire),
+    subagents,
     turnItems: projection.turnItems.map(project),
     visibleTurnItems: projection.visibleTurnItems.map((row) => ({
       ...row,
@@ -328,13 +378,20 @@ export function projectThreadProjectionForWire(
 export function projectDomainEventForWire(
   event: OrchestrationV2DomainEvent,
 ): OrchestrationV2DomainEvent {
-  return event.type === "turn-item.updated"
-    ? { ...event, payload: projectTurnItemForWire(event.payload) }
-    : event.type === "context-handoff.updated"
-      ? { ...event, payload: projectContextHandoffForWire(event.payload) }
-      : event.type === "checkpoint.captured"
-        ? { ...event, payload: capCheckpointFiles(event.payload) }
-        : event;
+  switch (event.type) {
+    case "turn-item.updated":
+      return { ...event, payload: projectTurnItemForWire(event.payload) };
+    case "context-handoff.updated":
+      return { ...event, payload: projectContextHandoffForWire(event.payload) };
+    case "checkpoint.captured":
+      return { ...event, payload: capCheckpointFiles(event.payload) };
+    case "subagent.updated": {
+      const payload = projectSubagentForWire(event.payload);
+      return payload === event.payload ? event : { ...event, payload };
+    }
+    default:
+      return event;
+  }
 }
 
 // Keyed on the stored event PubSub hands every subscriber, so all of them share one projection
@@ -385,14 +442,21 @@ export function makeLiveBodyDeduper(): (
 ) => OrchestrationV2ThreadStreamItem {
   const messageText = new Map<MessageId, string>();
   const checkpointFiles = new Map<CheckpointId, OrchestrationV2Checkpoint["files"]>();
-  const subagents = new Map<NodeId, Pick<OrchestrationV2Subagent, "prompt" | "result">>();
+  const subagents = new Map<
+    NodeId,
+    Pick<OrchestrationV2Subagent, "prompt" | "result" | "completionWake">
+  >();
   const source = {
     messageText: (id: MessageId) => messageText.get(id),
     checkpointFiles: (id: CheckpointId) => checkpointFiles.get(id),
     subagent: (id: NodeId) => subagents.get(id),
   };
-  const rememberSubagent = ({ id, prompt, result }: OrchestrationV2Subagent) =>
-    remember(subagents, id, { prompt, result });
+  const rememberSubagent = ({ id, prompt, result, completionWake }: OrchestrationV2Subagent) =>
+    remember(subagents, id, {
+      prompt,
+      result,
+      ...(completionWake === undefined ? {} : { completionWake }),
+    });
   return (item) => {
     if (item.kind === "snapshot") {
       // The client now holds exactly these records; their bodies are never blanked.
@@ -418,7 +482,12 @@ export function makeLiveBodyDeduper(): (
         return payload === event.payload ? item : { ...item, event: { ...event, payload } };
       }
       case "turn-item.updated": {
-        const payload = dedupeTurnItemBodies(event.payload, source);
+        const bounded =
+          event.payload.type === "subagent" &&
+          subagents.get(event.payload.subagentId)?.completionWake === "never"
+            ? projectWorkflowMemberSubagentTurnItemForWire(event.payload)
+            : event.payload;
+        const payload = dedupeTurnItemBodies(bounded, source);
         return payload === event.payload ? item : { ...item, event: { ...event, payload } };
       }
       default:
