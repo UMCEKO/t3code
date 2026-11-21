@@ -1127,8 +1127,8 @@ describe("WorkflowService and workflow MCP tools", () => {
 
         const script = `
           export const meta = { name: "Coalesced", description: "Tests 1s coalescing." };
-          phase("p1");
           log("first");
+          phase("p1");
           const a = await agent("First child");
           log("second");
           log("third");
@@ -1140,7 +1140,7 @@ describe("WorkflowService and workflow MCP tools", () => {
         const started = yield* decodeRunResult(runCall.structuredContent);
 
         const child1 = yield* Queue.take(harness.turnQueue);
-        // First progress event fires immediately at T=0.
+        // First progress event fires immediately at T=0; the log comes first so that event carries it.
         const firstProgress = yield* Queue.take(progressQueue);
         expect(firstProgress.progress).toBe("first");
 
