@@ -2,6 +2,8 @@ import { describe, expect, it } from "vite-plus/test";
 
 import {
   WORKFLOW_LIMITS,
+  WORKFLOW_MESSAGE_LIMITS,
+  WORKFLOW_WORKER_RESOURCE_LIMITS,
   WorkflowScriptError,
   parseWorkflowMeta,
   runWorkflowScript,
@@ -114,7 +116,7 @@ describe("sandbox", () => {
   });
 
   describe("determinism and isolation", () => {
-    it("throws resume-breaking error on Date.now(), new Date(), Date(), new Date(0).constructor, and Math.random()", async () => {
+    it("throws resume-breaking error on Date.now(), new Date(), Date(), new Date(0).constructor, Math.random(), and Intl.DateTimeFormat", async () => {
       const cases = [
         { code: "return Date.now();", api: "Date.now" },
         { code: "return new Date();", api: "new Date()" },
@@ -123,6 +125,11 @@ describe("sandbox", () => {
         { code: "return new (new Date(0).constructor)();", api: "new Date()" },
         { code: "return (new Date(0).constructor)();", api: "Date()" },
         { code: "return Math.random();", api: "Math.random" },
+        { code: "return Intl.DateTimeFormat();", api: "Intl.DateTimeFormat" },
+        { code: "return new Intl.DateTimeFormat();", api: "Intl.DateTimeFormat" },
+        { code: "return Intl.DateTimeFormat().format();", api: "Intl.DateTimeFormat" },
+        { code: 'return new Intl.DateTimeFormat("en-US").format();', api: "Intl.DateTimeFormat" },
+        { code: "return new Intl.DateTimeFormat().formatToParts();", api: "Intl.DateTimeFormat" },
       ];
 
       for (const testCase of cases) {
@@ -314,6 +321,24 @@ describe("sandbox", () => {
                 while (true) {}
               },
             ]);
+          `),
+          args: {},
+          host: makeHost(),
+          concurrency: 2,
+          syncTimeoutMs: 50,
+        }),
+      ).rejects.toThrow(new WorkflowScriptError(timeoutError));
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            await agent("first");
+            Object.defineProperty(Object.prototype, "then", {
+              get() {
+                while (true) {}
+              },
+            });
+            return {};
           `),
           args: {},
           host: makeHost(),
@@ -547,6 +572,7 @@ describe("sandbox", () => {
     it("pipeline has no barrier between stages and drops throwing items to null", async () => {
       const gates = new Map<string, PromiseWithResolvers<string>>();
       const started: Array<string> = [];
+      const stage1Started = Promise.withResolvers<void>();
       const stage2Item0Started = Promise.withResolvers<void>();
       const stage2Item1Started = Promise.withResolvers<void>();
 
@@ -569,6 +595,9 @@ describe("sandbox", () => {
             started.push(call.prompt);
             const gate = Promise.withResolvers<string>();
             gates.set(call.prompt, gate);
+            if (started.length === 2) {
+              stage1Started.resolve();
+            }
             if (call.prompt.startsWith("s2:a:")) {
               stage2Item0Started.resolve();
             }
@@ -580,7 +609,7 @@ describe("sandbox", () => {
       });
 
       // Resolve item 0's stage 1 while item 1 is still blocked in stage 1.
-      await Promise.resolve();
+      await stage1Started.promise;
       expect(started).toEqual(["s1:a", "s1:b"]);
       gates.get("s1:a")!.resolve("r1a");
 
@@ -827,6 +856,297 @@ describe("sandbox", () => {
           concurrency: 2,
         }),
       ).rejects.toThrow(/one level only/i);
+    });
+
+    it("fails the workflow on sticky cap exhaustion in parallel, pipeline, nested workflows, and try/catch", async () => {
+      const overCapMsg = `A workflow runs at most ${WORKFLOW_LIMITS.maxAgents} agents`;
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            const thunks = Array.from({ length: ${WORKFLOW_LIMITS.maxAgents + 1} }, (_, i) => () => agent("p" + i));
+            return await parallel(thunks);
+          `),
+          args: {},
+          host: makeHost({ runAgent: async () => "ok" }),
+          concurrency: 8,
+        }),
+      ).rejects.toThrow(new WorkflowScriptError(overCapMsg));
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            const items = Array.from({ length: ${WORKFLOW_LIMITS.maxAgents + 1} }, (_, i) => i);
+            return await pipeline(items, (i) => agent("p" + i));
+          `),
+          args: {},
+          host: makeHost({ runAgent: async () => "ok" }),
+          concurrency: 8,
+        }),
+      ).rejects.toThrow(new WorkflowScriptError(overCapMsg));
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            const items = Array.from({ length: 501 }, (_, i) => i);
+            return await pipeline(
+              items,
+              (i) => agent("s1:" + i),
+              (_prev, i) => agent("s2:" + i),
+            );
+          `),
+          args: {},
+          host: makeHost({ runAgent: async () => "ok" }),
+          concurrency: 16,
+        }),
+      ).rejects.toThrow(new WorkflowScriptError(overCapMsg));
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            for (let i = 0; i < ${WORKFLOW_LIMITS.maxAgents}; i += 1) {
+              await agent("p" + i);
+            }
+            try {
+              await agent("over-cap");
+            } catch {
+              return "swallowed";
+            }
+            return "ok";
+          `),
+          args: {},
+          host: makeHost({ runAgent: async () => "ok" }),
+          concurrency: 4,
+        }),
+      ).rejects.toThrow(new WorkflowScriptError(overCapMsg));
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            try {
+              await parallel(Array.from({ length: ${WORKFLOW_LIMITS.maxItems + 1} }, () => () => 1));
+            } catch {
+              return "swallowed";
+            }
+            return "ok";
+          `),
+          args: {},
+          host: makeHost(),
+          concurrency: 4,
+        }),
+      ).rejects.toThrow(
+        new WorkflowScriptError(`parallel() accepts at most ${WORKFLOW_LIMITS.maxItems} items`),
+      );
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            try {
+              await pipeline(Array.from({ length: ${WORKFLOW_LIMITS.maxItems + 1} }, (_, i) => i), (x) => x);
+            } catch {
+              return "swallowed";
+            }
+            return "ok";
+          `),
+          args: {},
+          host: makeHost(),
+          concurrency: 4,
+        }),
+      ).rejects.toThrow(
+        new WorkflowScriptError(`pipeline() accepts at most ${WORKFLOW_LIMITS.maxItems} items`),
+      );
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            await agent("parent-0");
+            try {
+              await workflow({ scriptPath: "/over-cap-child.js" });
+            } catch {
+              return "swallowed";
+            }
+            return "ok";
+          `),
+          args: {},
+          host: makeHost({
+            runAgent: async () => "ok",
+            loadScript: async () =>
+              makeScript(
+                `return await parallel(Array.from({ length: ${WORKFLOW_LIMITS.maxAgents} }, (_, i) => () => agent("c" + i)));`,
+                `{ name: "over-cap-child", description: "exceeds parent agent cap" }`,
+              ),
+          }),
+          concurrency: 8,
+        }),
+      ).rejects.toThrow(new WorkflowScriptError(overCapMsg));
+    });
+
+    it("rejects out-of-memory allocations without crashing the host process", async () => {
+      expect(WORKFLOW_WORKER_RESOURCE_LIMITS.maxOldGenerationSizeMb).toBeLessThanOrEqual(256);
+      expect(WORKFLOW_WORKER_RESOURCE_LIMITS.maxYoungGenerationSizeMb).toBeLessThanOrEqual(32);
+      expect(WORKFLOW_WORKER_RESOURCE_LIMITS.codeRangeSizeMb).toBeLessThanOrEqual(16);
+      expect(WORKFLOW_WORKER_RESOURCE_LIMITS.stackSizeMb).toBeLessThanOrEqual(4);
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            const chunks = [];
+            const base = "x".repeat(1024 * 1024);
+            while (true) {
+              chunks.push(chunks.length + base);
+            }
+          `),
+          args: {},
+          host: makeHost(),
+          concurrency: 1,
+          syncTimeoutMs: 5_000,
+        }),
+      ).rejects.toThrow(/ERR_WORKER_OUT_OF_MEMORY|memory limit/i);
+    });
+
+    it("rejects oversized messages on both sides of the worker boundary", async () => {
+      const overPrompt = WORKFLOW_MESSAGE_LIMITS.maxPromptBytes + 1;
+      const overValue = WORKFLOW_MESSAGE_LIMITS.maxValueBytes + 1;
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            try {
+              await agent("a".repeat(${overPrompt}));
+            } catch {
+              return "swallowed";
+            }
+            return "ok";
+          `),
+          args: {},
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).rejects.toThrow(WorkflowScriptError);
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            await agent("ok", {
+              schema: { type: "object", description: "d".repeat(${overPrompt}) },
+            });
+          `),
+          args: {},
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).rejects.toThrow(WorkflowScriptError);
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`return "b".repeat(${overValue});`),
+          args: {},
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).rejects.toThrow(WorkflowScriptError);
+
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`return await agent("big-result");`),
+          args: {},
+          host: makeHost({
+            runAgent: async () => "c".repeat(overValue),
+          }),
+          concurrency: 1,
+        }),
+      ).rejects.toThrow(WorkflowScriptError);
+    });
+
+    it("terminates a busy CPU-spinning worker immediately when host.signal aborts", async () => {
+      const controller = new AbortController();
+      const reason = new Error("abort busy worker");
+
+      const runPromise = runWorkflowScript({
+        script: makeScript(`
+          phase("busy-loop");
+          while (true) {}
+        `),
+        args: {},
+        host: makeHost({
+          signal: controller.signal,
+          onPhase: (title) => {
+            if (title === "busy-loop") {
+              controller.abort(reason);
+            }
+          },
+        }),
+        concurrency: 1,
+        syncTimeoutMs: 10_000,
+      });
+
+      await expect(runPromise).rejects.toBe(reason);
+    });
+
+    it("blocks classic VM escape attempts including values returned from agent()", async () => {
+      const result = await runWorkflowScript({
+        script: makeScript(`
+          const tryEscape = (fn) => {
+            try {
+              const out = fn();
+              return { escaped: true, type: typeof out };
+            } catch (err) {
+              return { escaped: false, name: err?.name ?? null };
+            }
+          };
+
+          const agentObj = await agent("obj");
+          const agentStr = await agent("str");
+
+          return {
+            globals: {
+              process: typeof process,
+              require: typeof require,
+              fs: typeof fs,
+              fetch: typeof fetch,
+            },
+            thisEscape: tryEscape(() => this.constructor.constructor("return process")()),
+            methodThisEscape: tryEscape(() =>
+              ({ run() { return this.constructor.constructor("return process")(); } }).run(),
+            ),
+            globalThisEscape: tryEscape(() => globalThis.constructor.constructor("return process")()),
+            objectLiteralProcess: tryEscape(() => ({}).constructor.constructor("return process")()),
+            objectLiteralFs: tryEscape(() =>
+              ({}).constructor.constructor('return require("node:fs")')(),
+            ),
+            agentObjProcess: tryEscape(() => agentObj.constructor.constructor("return process")()),
+            agentObjNestedFs: tryEscape(() =>
+              agentObj.nested.constructor.constructor('return require("node:fs")')(),
+            ),
+            agentStrProcess: tryEscape(() => agentStr.constructor.constructor("return process")()),
+            argsProcess: tryEscape(() => args.constructor.constructor("return process")()),
+          };
+        `),
+        args: { seed: 1 },
+        host: makeHost({
+          runAgent: async (call) =>
+            call.prompt === "obj" ? { ok: true, nested: [1, 2] } : "plain-text",
+        }),
+        concurrency: 2,
+      });
+
+      expect(result).toEqual({
+        globals: {
+          process: "undefined",
+          require: "undefined",
+          fs: "undefined",
+          fetch: "undefined",
+        },
+        thisEscape: { escaped: false, name: "EvalError" },
+        methodThisEscape: { escaped: false, name: "EvalError" },
+        globalThisEscape: { escaped: false, name: "EvalError" },
+        objectLiteralProcess: { escaped: false, name: "EvalError" },
+        objectLiteralFs: { escaped: false, name: "EvalError" },
+        agentObjProcess: { escaped: false, name: "EvalError" },
+        agentObjNestedFs: { escaped: false, name: "EvalError" },
+        agentStrProcess: { escaped: false, name: "EvalError" },
+        argsProcess: { escaped: false, name: "EvalError" },
+      });
     });
   });
 });

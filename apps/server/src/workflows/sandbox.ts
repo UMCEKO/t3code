@@ -1,4 +1,16 @@
-import * as NodeVM from "node:vm";
+// @effect-diagnostics globalTimers:off -- The sandbox worker host owns its syncTimeoutMs deadline timer outside Effect.
+import * as NodeWorkerThreads from "node:worker_threads";
+
+import {
+  MAX_ERROR_MESSAGE_CHARS,
+  MAX_START_MESSAGE_BYTES,
+  WORKFLOW_MESSAGE_LIMITS,
+  WORKFLOW_SANDBOX_WORKER_SOURCE,
+  WORKFLOW_WORKER_RESOURCE_LIMITS,
+  type RealmErrorKind,
+} from "./sandboxWorker.ts";
+
+export { WORKFLOW_MESSAGE_LIMITS, WORKFLOW_WORKER_RESOURCE_LIMITS };
 
 export interface WorkflowMeta {
   readonly name: string;
@@ -11,7 +23,7 @@ export interface WorkflowMeta {
   }>;
 }
 
-// @effect-diagnostics-next-line extendsNativeError:off - the sandbox is Promise code that runs outside Effect.
+// @effect-diagnostics-next-line extendsNativeError:off -- the sandbox is Promise code that runs outside Effect.
 export class WorkflowScriptError extends Error {
   constructor(message: string, options?: ErrorOptions) {
     super(message, options);
@@ -63,24 +75,14 @@ export function workflowConcurrency(cpus: number): number {
   return Math.min(16, Math.max(1, Math.trunc(cpus) - 2));
 }
 
-const MAX_LOG_CHARS = 2000;
 const DEFAULT_SYNC_TIMEOUT_MS = 5_000;
+const MAX_META_DEPTH = 64;
 
-const ALLOWED_AGENT_OPT_KEYS = new Set([
-  "label",
-  "phase",
-  "schema",
-  "model",
-  "effort",
-  "isolation",
-  "agentType",
-  "target",
-]);
-
-const ALLOWED_TARGET_KEYS = new Set(["providerInstanceId", "driverKind", "model", "options"]);
-
-const IDENT_START = /^[\p{ID_Start}_$]/u;
-const IDENT_CONTINUE = /^[\p{ID_Continue}$]/u;
+const IDENT_START = /[\p{ID_Start}_$]/uy;
+const IDENT_CONTINUE = /[\p{ID_Continue}$]/uy;
+const NUMBER_RE =
+  /(?:0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|0[bB][01](?:_?[01])*|0[oO][0-7](?:_?[0-7])*|(?:(?:0|[1-9](?:_?[0-9])*)(?:\.(?:[0-9](?:_?[0-9])*)?)?|\.[0-9](?:_?[0-9])*)(?:[eE][+-]?[0-9](?:_?[0-9])*)?)/y;
+const HEX_DIGITS = /^[0-9a-fA-F]+$/;
 
 function isLineTerminator(ch: string): boolean {
   return ch === "\n" || ch === "\r" || ch === "\u2028" || ch === "\u2029";
@@ -98,10 +100,32 @@ function isWhitespace(ch: string): boolean {
   );
 }
 
-interface ParsedMetaScript {
-  readonly meta: WorkflowMeta;
-  readonly body: string;
-  readonly bodyStartLine: number;
+function extractErrorMessage(err: unknown): string {
+  if (typeof err === "object" && err !== null && "message" in err) {
+    const msg = (err as { readonly message?: unknown }).message;
+    if (typeof msg === "string") return msg;
+  }
+  return String(err);
+}
+
+function extractErrorCode(err: unknown): string | undefined {
+  if (typeof err === "object" && err !== null && "code" in err) {
+    const code = (err as { readonly code?: unknown }).code;
+    if (typeof code === "string") return code;
+  }
+  return undefined;
+}
+
+function truncateErrorMessage(message: string): string {
+  return message.length > MAX_ERROR_MESSAGE_CHARS
+    ? message.slice(0, MAX_ERROR_MESSAGE_CHARS)
+    : message;
+}
+
+function ownProperty(obj: object, key: string): unknown {
+  return Object.prototype.hasOwnProperty.call(obj, key)
+    ? (obj as Record<string, unknown>)[key]
+    : undefined;
 }
 
 class MetaScanner {
@@ -150,12 +174,14 @@ class MetaScanner {
 
   readIdentifier(): string | null {
     if (this.pos >= this.source.length) return null;
-    const startMatch = IDENT_START.exec(this.source.slice(this.pos));
+    IDENT_START.lastIndex = this.pos;
+    const startMatch = IDENT_START.exec(this.source);
     if (startMatch === null) return null;
     const start = this.pos;
     this.pos += startMatch[0].length;
     while (this.pos < this.source.length) {
-      const contMatch = IDENT_CONTINUE.exec(this.source.slice(this.pos));
+      IDENT_CONTINUE.lastIndex = this.pos;
+      const contMatch = IDENT_CONTINUE.exec(this.source);
       if (contMatch === null) break;
       this.pos += contMatch[0].length;
     }
@@ -170,32 +196,121 @@ class MetaScanner {
     return false;
   }
 
-  scanQuotedString(quote: "'" | '"'): void {
+  readEscapeSequence(): string {
+    if (this.pos >= this.source.length) {
+      throw new WorkflowScriptError("Unterminated string literal in meta");
+    }
+    const esc = this.source[this.pos]!;
     this.pos += 1;
+    switch (esc) {
+      case "\n":
+      case "\u2028":
+      case "\u2029":
+        return "";
+      case "\r":
+        if (this.source[this.pos] === "\n") this.pos += 1;
+        return "";
+      case "n":
+        return "\n";
+      case "r":
+        return "\r";
+      case "t":
+        return "\t";
+      case "b":
+        return "\b";
+      case "f":
+        return "\f";
+      case "v":
+        return "\v";
+      case "\\":
+        return "\\";
+      case "'":
+        return "'";
+      case '"':
+        return '"';
+      case "0": {
+        const next = this.source[this.pos];
+        if (next !== undefined && next >= "0" && next <= "9") {
+          throw new WorkflowScriptError("meta must be a pure literal");
+        }
+        return "\0";
+      }
+      case "1":
+      case "2":
+      case "3":
+      case "4":
+      case "5":
+      case "6":
+      case "7":
+        throw new WorkflowScriptError("meta must be a pure literal");
+      case "x": {
+        const hex = this.source.slice(this.pos, this.pos + 2);
+        if (hex.length !== 2 || !HEX_DIGITS.test(hex)) {
+          throw new WorkflowScriptError("Invalid hex escape in meta");
+        }
+        this.pos += 2;
+        return String.fromCharCode(Number.parseInt(hex, 16));
+      }
+      case "u": {
+        if (this.source[this.pos] === "{") {
+          const close = this.source.indexOf("}", this.pos + 1);
+          if (close === -1) {
+            throw new WorkflowScriptError("Invalid unicode escape in meta");
+          }
+          const hex = this.source.slice(this.pos + 1, close);
+          if (hex.length === 0 || !HEX_DIGITS.test(hex)) {
+            throw new WorkflowScriptError("Invalid unicode escape in meta");
+          }
+          const codePoint = Number.parseInt(hex, 16);
+          if (codePoint > 0x10ffff) {
+            throw new WorkflowScriptError("Invalid unicode escape in meta");
+          }
+          this.pos = close + 1;
+          return String.fromCodePoint(codePoint);
+        }
+        const hex = this.source.slice(this.pos, this.pos + 4);
+        if (hex.length !== 4 || !HEX_DIGITS.test(hex)) {
+          throw new WorkflowScriptError("Invalid unicode escape in meta");
+        }
+        this.pos += 4;
+        return String.fromCharCode(Number.parseInt(hex, 16));
+      }
+      default:
+        return esc;
+    }
+  }
+
+  parseQuotedString(quote: "'" | '"'): string {
+    this.pos += 1;
+    let out = "";
     while (this.pos < this.source.length) {
       const ch = this.source[this.pos]!;
       if (ch === "\\") {
-        this.pos += 2;
+        this.pos += 1;
+        out += this.readEscapeSequence();
         continue;
       }
       if (ch === quote) {
         this.pos += 1;
-        return;
+        return out;
       }
       if (ch === "\n" || ch === "\r") {
         throw new WorkflowScriptError("Unterminated string literal in meta");
       }
+      out += ch;
       this.pos += 1;
     }
     throw new WorkflowScriptError("Unterminated string literal in meta");
   }
 
-  scanPureTemplateLiteral(): void {
+  parsePureTemplateLiteral(): string {
     this.pos += 1;
+    let out = "";
     while (this.pos < this.source.length) {
       const ch = this.source[this.pos]!;
       if (ch === "\\") {
-        this.pos += 2;
+        this.pos += 1;
+        out += this.readEscapeSequence();
         continue;
       }
       if (ch === "$" && this.source[this.pos + 1] === "{") {
@@ -203,34 +318,48 @@ class MetaScanner {
       }
       if (ch === "`") {
         this.pos += 1;
-        return;
+        return out;
       }
+      if (ch === "\r") {
+        if (this.source[this.pos + 1] === "\n") this.pos += 1;
+        out += "\n";
+        this.pos += 1;
+        continue;
+      }
+      out += ch;
       this.pos += 1;
     }
     throw new WorkflowScriptError("Unterminated template literal in meta");
   }
 
-  scanNumber(): boolean {
-    const rest = this.source.slice(this.pos);
-    const match =
-      /^(?:0[xX][0-9a-fA-F](?:_?[0-9a-fA-F])*|0[bB][01](?:_?[01])*|0[oO][0-7](?:_?[0-7])*|(?:(?:0|[1-9](?:_?[0-9])*)(?:\.(?:[0-9](?:_?[0-9])*)?)?|\.[0-9](?:_?[0-9])*)(?:[eE][+-]?[0-9](?:_?[0-9])*)?)/.exec(
-        rest,
-      );
-    if (match === null) return false;
+  parseNumber(): number | undefined {
+    NUMBER_RE.lastIndex = this.pos;
+    const match = NUMBER_RE.exec(this.source);
+    if (match === null) return undefined;
     const end = this.pos + match[0].length;
-    const next = this.source[end];
-    if (next !== undefined && IDENT_START.test(next)) {
+    if (end < this.source.length) {
+      IDENT_START.lastIndex = end;
+      if (IDENT_START.test(this.source)) {
+        throw new WorkflowScriptError("meta must be a pure literal");
+      }
+    }
+    const value = Number(match[0].replaceAll("_", ""));
+    if (Number.isNaN(value)) {
       throw new WorkflowScriptError("meta must be a pure literal");
     }
     this.pos = end;
-    return true;
+    return value;
   }
 
-  parseObjectLiteral(): void {
+  parseObjectLiteral(depth: number): Record<string, unknown> {
+    if (depth > MAX_META_DEPTH) {
+      throw new WorkflowScriptError("meta literal is too deeply nested");
+    }
     if (this.source[this.pos] !== "{") {
       throw new WorkflowScriptError("meta must be a pure literal");
     }
     this.pos += 1;
+    const obj = Object.create(null) as Record<string, unknown>;
 
     while (true) {
       this.skipTrivia();
@@ -239,16 +368,24 @@ class MetaScanner {
       }
       if (this.source[this.pos] === "}") {
         this.pos += 1;
-        return;
+        return obj;
       }
 
+      let key: string;
       const ch = this.source[this.pos]!;
       if (ch === "'" || ch === '"') {
-        this.scanQuotedString(ch);
-      } else if (this.readIdentifier() !== null) {
-        // Identifier key validated; `:` must follow so shorthand/methods/getters are rejected.
-      } else if (!this.scanNumber()) {
-        throw new WorkflowScriptError("meta must be a pure literal");
+        key = this.parseQuotedString(ch);
+      } else {
+        const ident = this.readIdentifier();
+        if (ident !== null) {
+          key = ident;
+        } else {
+          const num = this.parseNumber();
+          if (num === undefined) {
+            throw new WorkflowScriptError("meta must be a pure literal");
+          }
+          key = String(num);
+        }
       }
 
       this.skipTrivia();
@@ -257,7 +394,13 @@ class MetaScanner {
       }
       this.pos += 1;
 
-      this.parseValue();
+      const val = this.parseValue(depth + 1);
+      Object.defineProperty(obj, key, {
+        value: val,
+        writable: true,
+        enumerable: true,
+        configurable: true,
+      });
       this.skipTrivia();
 
       const sep = this.source[this.pos];
@@ -267,14 +410,18 @@ class MetaScanner {
       }
       if (sep === "}") {
         this.pos += 1;
-        return;
+        return obj;
       }
       throw new WorkflowScriptError("meta must be a pure literal");
     }
   }
 
-  parseArrayLiteral(): void {
+  parseArrayLiteral(depth: number): Array<unknown> {
+    if (depth > MAX_META_DEPTH) {
+      throw new WorkflowScriptError("meta literal is too deeply nested");
+    }
     this.pos += 1;
+    const arr: Array<unknown> = [];
     while (true) {
       this.skipTrivia();
       if (this.pos >= this.source.length) {
@@ -282,9 +429,9 @@ class MetaScanner {
       }
       if (this.source[this.pos] === "]") {
         this.pos += 1;
-        return;
+        return arr;
       }
-      this.parseValue();
+      arr.push(this.parseValue(depth + 1));
       this.skipTrivia();
       const sep = this.source[this.pos];
       if (sep === ",") {
@@ -293,73 +440,39 @@ class MetaScanner {
       }
       if (sep === "]") {
         this.pos += 1;
-        return;
+        return arr;
       }
       throw new WorkflowScriptError("meta must be a pure literal");
     }
   }
 
-  parseValue(): void {
+  parseValue(depth: number): unknown {
     this.skipTrivia();
     if (this.pos >= this.source.length) {
       throw new WorkflowScriptError("meta must be a pure literal");
     }
     const ch = this.source[this.pos]!;
-    if (ch === "{") {
-      this.parseObjectLiteral();
-      return;
-    }
-    if (ch === "[") {
-      this.parseArrayLiteral();
-      return;
-    }
-    if (ch === "'" || ch === '"') {
-      this.scanQuotedString(ch);
-      return;
-    }
-    if (ch === "`") {
-      this.scanPureTemplateLiteral();
-      return;
-    }
+    if (ch === "{") return this.parseObjectLiteral(depth);
+    if (ch === "[") return this.parseArrayLiteral(depth);
+    if (ch === "'" || ch === '"') return this.parseQuotedString(ch);
+    if (ch === "`") return this.parsePureTemplateLiteral();
     if (ch === "-" || ch === "+") {
       this.pos += 1;
       this.skipTrivia();
-      if (!this.scanNumber()) {
+      const num = this.parseNumber();
+      if (num === undefined) {
         throw new WorkflowScriptError("meta must be a pure literal");
       }
-      return;
+      return ch === "-" ? -num : num;
     }
-    if (this.scanNumber()) {
-      return;
-    }
+    const num = this.parseNumber();
+    if (num !== undefined) return num;
     const ident = this.readIdentifier();
-    if (ident === "true" || ident === "false" || ident === "null") {
-      return;
-    }
+    if (ident === "true") return true;
+    if (ident === "false") return false;
+    if (ident === "null") return null;
     throw new WorkflowScriptError("meta must be a pure literal");
   }
-}
-
-function extractErrorMessage(err: unknown): string {
-  if (typeof err === "object" && err !== null && "message" in err) {
-    const msg = (err as { readonly message?: unknown }).message;
-    if (typeof msg === "string") return msg;
-  }
-  return String(err);
-}
-
-function extractErrorCode(err: unknown): string | undefined {
-  if (typeof err === "object" && err !== null && "code" in err) {
-    const code = (err as { readonly code?: unknown }).code;
-    if (typeof code === "string") return code;
-  }
-  return undefined;
-}
-
-function ownProperty(obj: object, key: string): unknown {
-  return Object.prototype.hasOwnProperty.call(obj, key)
-    ? (obj as Record<string, unknown>)[key]
-    : undefined;
 }
 
 function validateMetaObject(raw: unknown): WorkflowMeta {
@@ -434,7 +547,7 @@ function validateMetaObject(raw: unknown): WorkflowMeta {
   };
 }
 
-function parseMetaAndBody(script: string): ParsedMetaScript {
+export function parseWorkflowMeta(script: string): WorkflowMeta {
   if (typeof script !== "string") {
     throw new WorkflowScriptError("Workflow script must be a string");
   }
@@ -459,11 +572,7 @@ function parseMetaAndBody(script: string): ParsedMetaScript {
   scanner.pos += 1;
   scanner.skipTrivia();
 
-  const literalStart = scanner.pos;
-  scanner.parseObjectLiteral();
-  const literalEnd = scanner.pos;
-  const metaLiteralText = script.slice(literalStart, literalEnd);
-
+  const evaluated = scanner.parseObjectLiteral(0);
   const afterMetaTrivia = scanner.skipTrivia();
   if (scanner.pos < script.length) {
     const nextChar = script[scanner.pos]!;
@@ -479,186 +588,7 @@ function parseMetaAndBody(script: string): ParsedMetaScript {
     }
   }
 
-  let evaluated: unknown;
-  try {
-    const metaContext = NodeVM.createContext(Object.create(null), {
-      codeGeneration: { strings: false, wasm: false },
-      microtaskMode: "afterEvaluate",
-    });
-    evaluated = NodeVM.runInContext(`(${metaLiteralText})`, metaContext, {
-      timeout: DEFAULT_SYNC_TIMEOUT_MS,
-    });
-  } catch (err) {
-    throw new WorkflowScriptError(`Failed to evaluate meta literal: ${extractErrorMessage(err)}`);
-  }
-
-  const meta = validateMetaObject(evaluated);
-  const bodyStart = scanner.pos;
-  let bodyStartLine = 0;
-  for (let i = 0; i < bodyStart; i += 1) {
-    if (script[i] === "\n") bodyStartLine += 1;
-  }
-
-  return {
-    meta,
-    body: script.slice(bodyStart),
-    bodyStartLine,
-  };
-}
-
-export function parseWorkflowMeta(script: string): WorkflowMeta {
-  return parseMetaAndBody(script).meta;
-}
-
-interface AbortHub {
-  readonly aborted: boolean;
-  readonly reason: () => unknown;
-  readonly onAbort: (listener: (reason: unknown) => void) => () => void;
-  readonly dispose: () => void;
-}
-
-function createAbortHub(signal: AbortSignal): AbortHub {
-  const listeners = new Set<(reason: unknown) => void>();
-  const getReason = (): unknown =>
-    signal.reason !== undefined ? signal.reason : new Error("Workflow aborted");
-
-  const handleAbort = (): void => {
-    const reason = getReason();
-    for (const listener of Array.from(listeners)) {
-      listener(reason);
-    }
-    listeners.clear();
-  };
-
-  if (!signal.aborted) {
-    signal.addEventListener("abort", handleAbort, { once: true });
-  }
-
-  return {
-    get aborted() {
-      return signal.aborted;
-    },
-    reason: getReason,
-    onAbort(listener) {
-      if (signal.aborted) {
-        listener(getReason());
-        return () => {};
-      }
-      listeners.add(listener);
-      return () => {
-        listeners.delete(listener);
-      };
-    },
-    dispose() {
-      signal.removeEventListener("abort", handleAbort);
-      listeners.clear();
-    },
-  };
-}
-
-function raceWithAbort<T>(promise: Promise<T>, abortHub: AbortHub): Promise<T> {
-  if (abortHub.aborted) {
-    promise.catch(() => {});
-    return Promise.reject(abortHub.reason());
-  }
-  return new Promise<T>((resolve, reject) => {
-    let settled = false;
-    const unsub = abortHub.onAbort((reason) => {
-      if (settled) return;
-      settled = true;
-      promise.catch(() => {});
-      reject(reason);
-    });
-    promise.then(
-      (value) => {
-        if (settled) return;
-        settled = true;
-        unsub();
-        resolve(value);
-      },
-      (err) => {
-        if (settled) return;
-        settled = true;
-        unsub();
-        reject(err);
-      },
-    );
-  });
-}
-
-interface SemaphoreWaiter {
-  readonly resolve: () => void;
-  readonly reject: (reason: unknown) => void;
-  unsubAbort: () => void;
-}
-
-class FifoSemaphore {
-  private readonly limit: number;
-  private readonly abortHub: AbortHub;
-  private active = 0;
-  private readonly queue: Array<SemaphoreWaiter> = [];
-
-  constructor(limit: number, abortHub: AbortHub) {
-    this.limit = limit;
-    this.abortHub = abortHub;
-  }
-
-  tryAcquire(): boolean {
-    if (this.abortHub.aborted || this.active >= this.limit) {
-      return false;
-    }
-    this.active += 1;
-    return true;
-  }
-
-  acquire(): Promise<void> {
-    if (this.abortHub.aborted) {
-      return Promise.reject(this.abortHub.reason());
-    }
-    if (this.active < this.limit) {
-      this.active += 1;
-      return Promise.resolve();
-    }
-    return new Promise<void>((resolve, reject) => {
-      const waiter: SemaphoreWaiter = {
-        resolve,
-        reject,
-        unsubAbort: () => {},
-      };
-      waiter.unsubAbort = this.abortHub.onAbort((reason) => {
-        const idx = this.queue.indexOf(waiter);
-        if (idx !== -1) {
-          this.queue.splice(idx, 1);
-        }
-        reject(reason);
-      });
-      this.queue.push(waiter);
-    });
-  }
-
-  release(): void {
-    while (this.queue.length > 0) {
-      const next = this.queue.shift()!;
-      next.unsubAbort();
-      if (this.abortHub.aborted) {
-        next.reject(this.abortHub.reason());
-        continue;
-      }
-      // Transfer the slot directly to the next FIFO waiter so new arrivals cannot barge ahead.
-      next.resolve();
-      return;
-    }
-    this.active -= 1;
-  }
-}
-
-function isPlainObject(
-  value: unknown,
-  realmObjectProto: unknown,
-): value is Record<string, unknown> {
-  if (typeof value !== "object" || value === null) return false;
-  const proto: unknown = Object.getPrototypeOf(value);
-  return proto === null || proto === Object.prototype || proto === realmObjectProto;
+  return validateMetaObject(evaluated);
 }
 
 function strictJsonStringify(value: unknown, label: string): string {
@@ -679,537 +609,7 @@ function strictJsonStringify(value: unknown, label: string): string {
   }
 }
 
-function cloneJsonToHost(value: unknown, label: string): unknown {
-  return JSON.parse(strictJsonStringify(value, label));
-}
-
-function validateAgentOpts(rawOpts: unknown, realmObjectProto: unknown): WorkflowAgentOpts {
-  if (rawOpts === undefined) {
-    return {};
-  }
-  if (!isPlainObject(rawOpts, realmObjectProto)) {
-    throw new TypeError("agent() opts must be a plain object");
-  }
-
-  for (const key of Object.keys(rawOpts)) {
-    if (!ALLOWED_AGENT_OPT_KEYS.has(key)) {
-      throw new TypeError(`Unknown agent() option: "${key}"`);
-    }
-  }
-
-  const label = ownProperty(rawOpts, "label");
-  if (label !== undefined && typeof label !== "string") {
-    throw new TypeError("agent() opts.label must be a string");
-  }
-
-  const phase = ownProperty(rawOpts, "phase");
-  if (phase !== undefined && typeof phase !== "string") {
-    throw new TypeError("agent() opts.phase must be a string");
-  }
-
-  const model = ownProperty(rawOpts, "model");
-  if (model !== undefined && typeof model !== "string") {
-    throw new TypeError("agent() opts.model must be a string");
-  }
-
-  const effort = ownProperty(rawOpts, "effort");
-  if (effort !== undefined && typeof effort !== "string") {
-    throw new TypeError("agent() opts.effort must be a string");
-  }
-
-  const isolation = ownProperty(rawOpts, "isolation");
-  if (isolation !== undefined && isolation !== "worktree") {
-    throw new TypeError('agent() opts.isolation must be "worktree"');
-  }
-
-  const agentType = ownProperty(rawOpts, "agentType");
-  if (agentType !== undefined && typeof agentType !== "string") {
-    throw new TypeError("agent() opts.agentType must be a string");
-  }
-
-  let schema: Record<string, unknown> | undefined;
-  const rawSchema = ownProperty(rawOpts, "schema");
-  if (rawSchema !== undefined) {
-    if (
-      !isPlainObject(rawSchema, realmObjectProto) ||
-      ownProperty(rawSchema, "type") !== "object"
-    ) {
-      throw new TypeError('agent() opts.schema must be an object schema with type: "object"');
-    }
-    schema = cloneJsonToHost(rawSchema, "agent() opts.schema") as Record<string, unknown>;
-  }
-
-  let target: WorkflowAgentOpts["target"];
-  const rawTarget = ownProperty(rawOpts, "target");
-  if (rawTarget !== undefined) {
-    if (!isPlainObject(rawTarget, realmObjectProto)) {
-      throw new TypeError("agent() opts.target must be a plain object");
-    }
-    for (const key of Object.keys(rawTarget)) {
-      if (!ALLOWED_TARGET_KEYS.has(key)) {
-        throw new TypeError(`Unknown agent() opts.target key: "${key}"`);
-      }
-    }
-    const providerInstanceId = ownProperty(rawTarget, "providerInstanceId");
-    if (providerInstanceId !== undefined && typeof providerInstanceId !== "string") {
-      throw new TypeError("agent() opts.target.providerInstanceId must be a string");
-    }
-    const driverKind = ownProperty(rawTarget, "driverKind");
-    if (driverKind !== undefined && typeof driverKind !== "string") {
-      throw new TypeError("agent() opts.target.driverKind must be a string");
-    }
-    const targetModel = ownProperty(rawTarget, "model");
-    if (targetModel !== undefined && typeof targetModel !== "string") {
-      throw new TypeError("agent() opts.target.model must be a string");
-    }
-    const rawOptions = ownProperty(rawTarget, "options");
-    const clonedOptions =
-      rawOptions !== undefined
-        ? cloneJsonToHost(rawOptions, "agent() opts.target.options")
-        : undefined;
-
-    target = {
-      ...(providerInstanceId !== undefined ? { providerInstanceId } : {}),
-      ...(driverKind !== undefined ? { driverKind } : {}),
-      ...(targetModel !== undefined ? { model: targetModel } : {}),
-      ...(clonedOptions !== undefined ? { options: clonedOptions } : {}),
-    };
-  }
-
-  return {
-    ...(label !== undefined ? { label } : {}),
-    ...(phase !== undefined ? { phase } : {}),
-    ...(schema !== undefined ? { schema } : {}),
-    ...(model !== undefined ? { model } : {}),
-    ...(effort !== undefined ? { effort } : {}),
-    ...(isolation !== undefined ? { isolation } : {}),
-    ...(agentType !== undefined ? { agentType } : {}),
-    ...(target !== undefined ? { target } : {}),
-  };
-}
-
-interface SharedRunState {
-  readonly host: WorkflowHost;
-  readonly semaphore: FifoSemaphore;
-  readonly abortHub: AbortHub;
-  readonly syncTimeoutMs: number;
-  agentCount: number;
-}
-
-type RealmErrorKind = "Error" | "TypeError" | "WorkflowScriptError";
-
-interface RealmErrorSpec {
-  readonly kind: RealmErrorKind;
-  readonly message: string;
-}
-
-type BridgeSyncOutcome<T> =
-  | { readonly ok: true; readonly value: T }
-  | {
-      readonly ok: false;
-      readonly errorKind: RealmErrorKind;
-      readonly errorMessage: string;
-    };
-
-type SerializedReturnOutcome =
-  | { readonly ok: true; readonly json: string | undefined }
-  | { readonly ok: false; readonly errorMessage: string };
-
-interface ContextDeferred {
-  readonly rejectSpecSync: (kind: RealmErrorKind, message: string) => void;
-  readonly enqueueResolveJson: (json: string | undefined) => void;
-  readonly enqueueRejectSpec: (kind: RealmErrorKind, message: string) => void;
-}
-
-interface ContextHostBridge {
-  readonly startAgent: (prompt: unknown, rawOpts: unknown, deferred: ContextDeferred) => void;
-  readonly startWorkflow: (ref: unknown, rawArgs: unknown, deferred: ContextDeferred) => void;
-  readonly onPhase: (title: string) => BridgeSyncOutcome<void>;
-  readonly onLog: (message: string) => BridgeSyncOutcome<void>;
-  readonly budgetSpent: () => BridgeSyncOutcome<number>;
-  readonly budgetRemaining: () => BridgeSyncOutcome<number>;
-}
-
-interface ContextSetupConfig {
-  readonly argsJson: string | undefined;
-  readonly budgetTotal: number | null;
-  readonly maxItems: number;
-}
-
-interface ContextRuntime {
-  readonly objectPrototype: unknown;
-  readonly hasQueuedSteps: () => boolean;
-  readonly isContextTypeError: (err: unknown) => boolean;
-  readonly enqueueAbort: (message: string) => void;
-  readonly enqueueStartBody: (
-    bodyFn: unknown,
-    onResolve: (outcome: SerializedReturnOutcome) => void,
-    onReject: (err: unknown) => void,
-  ) => void;
-}
-
-const CONTEXT_SETUP_SOURCE = `
-const __t3StepQueue = [];
-const __t3ShiftStep = Array.prototype.shift.bind(__t3StepQueue);
-const __t3DrainSteps = () => {
-  while (__t3StepQueue.length > 0) {
-    __t3ShiftStep()();
-  }
-};
-(function(bridge, config) {
-  "use strict";
-  const ContextError = Error;
-  const ContextTypeError = TypeError;
-  const ContextPromise = Promise;
-  const ContextArray = Array;
-  const ContextObject = Object;
-  const ContextReflect = Reflect;
-  const ContextString = String;
-  const jsonParse = JSON.parse;
-  const jsonStringify = JSON.stringify;
-  const objectPrototype = ContextObject.prototype;
-  const isArray = ContextArray.isArray;
-  const promiseThen = ContextPromise.prototype.then;
-  const promiseCatch = ContextPromise.prototype.catch;
-  const promiseAll = ContextPromise.all.bind(ContextPromise);
-  const promiseRace = ContextPromise.race.bind(ContextPromise);
-  const promiseReject = ContextPromise.reject.bind(ContextPromise);
-  const defineProperty = ContextObject.defineProperty;
-  const freeze = ContextObject.freeze;
-  const pushStep = ContextArray.prototype.push.bind(__t3StepQueue);
-  const maxItems = config.maxItems;
-
-  const makeContextError = (kind, message) => {
-    if (kind === "TypeError") {
-      return new ContextTypeError(message);
-    }
-    const err = new ContextError(message);
-    if (kind === "WorkflowScriptError") {
-      err.name = "WorkflowScriptError";
-    }
-    return err;
-  };
-
-  const OriginalDate = globalThis.Date;
-  const GuardedDate = new Proxy(OriginalDate, {
-    apply() {
-      throw makeContextError(
-        "WorkflowScriptError",
-        "Date() is not available in workflow scripts: it would break resume.",
-      );
-    },
-    construct(target, args, newTarget) {
-      if (args.length === 0) {
-        throw makeContextError(
-          "WorkflowScriptError",
-          "new Date() is not available in workflow scripts: it would break resume.",
-        );
-      }
-      return ContextReflect.construct(target, args, newTarget === GuardedDate ? target : newTarget);
-    },
-  });
-  defineProperty(OriginalDate, "now", {
-    value: function now() {
-      throw makeContextError(
-        "WorkflowScriptError",
-        "Date.now() is not available in workflow scripts: it would break resume.",
-      );
-    },
-    configurable: false,
-    writable: false,
-  });
-  defineProperty(OriginalDate.prototype, "constructor", {
-    value: GuardedDate,
-    configurable: false,
-    writable: false,
-  });
-  defineProperty(globalThis, "Date", {
-    value: GuardedDate,
-    configurable: false,
-    writable: false,
-  });
-  defineProperty(Math, "random", {
-    value: function random() {
-      throw makeContextError(
-        "WorkflowScriptError",
-        "Math.random() is not available in workflow scripts: it would break resume.",
-      );
-    },
-    configurable: false,
-    writable: false,
-  });
-
-  let aborted = false;
-  let abortError = null;
-  let rejectAbort;
-  const abortPromise = new ContextPromise((_, rej) => {
-    rejectAbort = rej;
-  });
-  promiseCatch.call(abortPromise, () => {});
-
-  const makeDeferred = () => {
-    let resolve;
-    let reject;
-    const promise = new ContextPromise((res, rej) => {
-      resolve = res;
-      reject = rej;
-    });
-    return {
-      promise,
-      rejectSpecSync(kind, message) {
-        reject(makeContextError(kind, message));
-      },
-      enqueueResolveJson(json) {
-        pushStep(() => {
-          resolve(json === undefined ? undefined : jsonParse(json));
-        });
-      },
-      enqueueRejectSpec(kind, message) {
-        pushStep(() => {
-          reject(makeContextError(kind, message));
-        });
-      },
-    };
-  };
-
-  const callSync = (fn, arg) => {
-    const outcome = fn(arg);
-    if (outcome.ok) return outcome.value;
-    throw makeContextError(outcome.errorKind, outcome.errorMessage);
-  };
-
-  const raceAbort = (promise) => {
-    promiseCatch.call(promise, () => {});
-    if (aborted) {
-      return promiseReject(abortError);
-    }
-    return promiseRace([promise, abortPromise]);
-  };
-
-  const runParallel = async (thunks) => {
-    if (!isArray(thunks)) {
-      throw new ContextTypeError("parallel() requires an array of functions");
-    }
-    if (thunks.length > maxItems) {
-      throw makeContextError(
-        "WorkflowScriptError",
-        "parallel() accepts at most " + maxItems + " items",
-      );
-    }
-    const fns = new ContextArray(thunks.length);
-    for (let i = 0; i < thunks.length; i += 1) {
-      const thunk = thunks[i];
-      if (typeof thunk !== "function") {
-        throw new ContextTypeError("parallel() item at index " + i + " must be a function");
-      }
-      fns[i] = thunk;
-    }
-    if (aborted) {
-      throw abortError;
-    }
-
-    const promises = new ContextArray(fns.length);
-    for (let i = 0; i < fns.length; i += 1) {
-      const thunk = fns[i];
-      promises[i] = (async () => {
-        try {
-          return await thunk();
-        } catch {
-          if (aborted) {
-            throw abortError;
-          }
-          return null;
-        }
-      })();
-    }
-
-    return await raceAbort(promiseAll(promises));
-  };
-
-  const runPipeline = async (items, rawStages) => {
-    if (!isArray(items)) {
-      throw new ContextTypeError("pipeline() requires an array of items");
-    }
-    if (items.length > maxItems) {
-      throw makeContextError(
-        "WorkflowScriptError",
-        "pipeline() accepts at most " + maxItems + " items",
-      );
-    }
-    if (rawStages.length === 0) {
-      throw new ContextTypeError("pipeline() requires at least one stage function");
-    }
-    const stages = new ContextArray(rawStages.length);
-    for (let i = 0; i < rawStages.length; i += 1) {
-      const stage = rawStages[i];
-      if (typeof stage !== "function") {
-        throw new ContextTypeError("pipeline() stage at index " + i + " must be a function");
-      }
-      stages[i] = stage;
-    }
-    if (aborted) {
-      throw abortError;
-    }
-
-    const itemPromises = new ContextArray(items.length);
-    for (let i = 0; i < items.length; i += 1) {
-      const item = items[i];
-      itemPromises[i] = (async () => {
-        let current = item;
-        for (let s = 0; s < stages.length; s += 1) {
-          if (aborted) {
-            throw abortError;
-          }
-          try {
-            current = await stages[s](current, item, i);
-          } catch {
-            if (aborted) {
-              throw abortError;
-            }
-            return null;
-          }
-        }
-        return current;
-      })();
-    }
-
-    return await raceAbort(promiseAll(itemPromises));
-  };
-
-  // Regular functions (not async) so their constructor is the context's Function.
-  function agent(prompt, rawOpts) {
-    const deferred = makeDeferred();
-    bridge.startAgent(prompt, rawOpts, deferred);
-    return deferred.promise;
-  }
-
-  function parallel(thunks) {
-    return runParallel(thunks);
-  }
-
-  function pipeline(items, ...rawStages) {
-    return runPipeline(items, rawStages);
-  }
-
-  function phase(title) {
-    if (typeof title !== "string" || title.trim().length === 0) {
-      throw new ContextTypeError("phase() title must be a non-empty string");
-    }
-    callSync(bridge.onPhase, title);
-  }
-
-  function log(message) {
-    callSync(bridge.onLog, ContextString(message));
-  }
-
-  function workflow(ref, rawArgs) {
-    const deferred = makeDeferred();
-    bridge.startWorkflow(ref, rawArgs, deferred);
-    return deferred.promise;
-  }
-
-  globalThis.agent = agent;
-  globalThis.parallel = parallel;
-  globalThis.pipeline = pipeline;
-  globalThis.phase = phase;
-  globalThis.log = log;
-  globalThis.workflow = workflow;
-  globalThis.args = config.argsJson === undefined ? undefined : jsonParse(config.argsJson);
-  globalThis.budget = freeze({
-    total: config.budgetTotal,
-    spent: function spent() {
-      return callSync(bridge.budgetSpent);
-    },
-    remaining: function remaining() {
-      return callSync(bridge.budgetRemaining);
-    },
-  });
-
-  const stringifyReturnValue = (value) => {
-    if (value === undefined) {
-      return { ok: true, json: undefined };
-    }
-    try {
-      const serialized = jsonStringify(value, (_key, v) => {
-        if (typeof v === "function" || typeof v === "symbol" || typeof v === "bigint") {
-          throw makeContextError(
-            "WorkflowScriptError",
-            "Workflow return value is not JSON-serializable",
-          );
-        }
-        return v;
-      });
-      if (serialized === undefined) {
-        return { ok: false, errorMessage: "Workflow return value is not JSON-serializable" };
-      }
-      return { ok: true, json: serialized };
-    } catch (err) {
-      const msg =
-        typeof err === "object" && err !== null && typeof err.message === "string"
-          ? err.message
-          : ContextString(err);
-      return {
-        ok: false,
-        errorMessage:
-          msg === "Workflow return value is not JSON-serializable"
-            ? msg
-            : "Workflow return value is not JSON-serializable: " + msg,
-      };
-    }
-  };
-
-  return {
-    objectPrototype,
-    hasQueuedSteps: () => __t3StepQueue.length > 0,
-    isContextTypeError: (err) => err instanceof ContextTypeError,
-    enqueueAbort: (message) => {
-      pushStep(() => {
-        if (aborted) return;
-        aborted = true;
-        abortError = makeContextError("Error", message);
-        rejectAbort(abortError);
-      });
-    },
-    enqueueStartBody: (bodyFn, onResolve, onReject) => {
-      pushStep(() => {
-        try {
-          const runPromise = bodyFn();
-          // Context-realm reactions ensure completion runs inside the context's afterEvaluate drain.
-          promiseThen.call(
-            runPromise,
-            (value) => {
-              onResolve(stringifyReturnValue(value));
-            },
-            (err) => {
-              onReject(err);
-            },
-          );
-        } catch (err) {
-          onReject(err);
-        }
-      });
-    },
-  };
-})`;
-
-const CONTEXT_SETUP_SCRIPT = new NodeVM.Script(CONTEXT_SETUP_SOURCE);
-const DRAIN_STEPS_SCRIPT = new NodeVM.Script("__t3DrainSteps()");
-
-function toRealmErrorSpec(err: unknown, abortHub: AbortHub): RealmErrorSpec {
-  if (abortHub.aborted && err === abortHub.reason()) {
-    return { kind: "Error", message: extractErrorMessage(err) };
-  }
-  if (err instanceof WorkflowScriptError) {
-    return { kind: "WorkflowScriptError", message: err.message };
-  }
-  if (err instanceof TypeError) {
-    return { kind: "TypeError", message: err.message };
-  }
-  return { kind: "Error", message: extractErrorMessage(err) };
-}
-
-function serializeHostValue(value: unknown): string | undefined {
-  if (value === undefined) return undefined;
+function serializeHostValue(value: unknown): string {
   const serialized = JSON.stringify(value);
   if (serialized === undefined) {
     throw new WorkflowScriptError("Host return value is not JSON-serializable");
@@ -1217,381 +617,34 @@ function serializeHostValue(value: unknown): string | undefined {
   return serialized;
 }
 
-function normalizeScriptFailure(
-  err: unknown,
-  abortHub: AbortHub,
-  isContextTypeError: (value: unknown) => boolean,
-): unknown {
-  if (abortHub.aborted) {
-    return abortHub.reason();
-  }
-  if (err instanceof WorkflowScriptError) {
-    return err;
-  }
-  if (extractErrorCode(err) === "ERR_VM_DYNAMIC_IMPORT_CALLBACK_MISSING") {
-    return new WorkflowScriptError("import() is not available in workflow scripts.");
-  }
-  if (err instanceof TypeError || isContextTypeError(err)) {
-    return new TypeError(extractErrorMessage(err));
-  }
-  if (err instanceof Error) {
-    return err;
-  }
-  return new WorkflowScriptError(extractErrorMessage(err));
+function getAbortReason(signal: AbortSignal): unknown {
+  return signal.reason !== undefined ? signal.reason : new Error("Workflow aborted");
 }
 
-async function executeScriptInContext(
-  script: string,
-  args: unknown,
-  shared: SharedRunState,
-  depth: number,
-): Promise<unknown> {
-  if (shared.abortHub.aborted) {
-    throw shared.abortHub.reason();
+function toRealmErrorSpec(err: unknown): {
+  readonly kind: RealmErrorKind;
+  readonly message: string;
+} {
+  if (err instanceof WorkflowScriptError) {
+    return { kind: "WorkflowScriptError", message: truncateErrorMessage(err.message) };
   }
-
-  const parsed = parseMetaAndBody(script);
-  const argsJson = args === undefined ? undefined : strictJsonStringify(args, "Workflow args");
-
-  let compiled: NodeVM.Script;
-  try {
-    compiled = new NodeVM.Script(`(async () => { "use strict"; ${parsed.body}\n})`, {
-      filename: `${parsed.meta.name}.workflow.js`,
-      lineOffset: parsed.bodyStartLine,
-    });
-  } catch (err) {
-    const message = extractErrorMessage(err);
-    if (/Cannot use import statement/i.test(message)) {
-      throw new WorkflowScriptError("import statements are not available in workflow scripts.");
-    }
-    throw new WorkflowScriptError(`Syntax error in workflow script: ${message}`);
+  if (err instanceof TypeError) {
+    return { kind: "TypeError", message: truncateErrorMessage(err.message) };
   }
+  return { kind: "Error", message: truncateErrorMessage(extractErrorMessage(err)) };
+}
 
-  // vm is a determinism guard, not a security boundary; script authors already have shell access.
-  const context = NodeVM.createContext(Object.create(null), {
-    codeGeneration: { strings: false, wasm: false },
-    microtaskMode: "afterEvaluate",
-  });
-
-  let currentPhase: string | undefined;
-  let runtime!: ContextRuntime;
-  let contextClosed = false;
-  let inSlice = false;
-  let postSliceDrainScheduled = false;
-  const runDeferred = Promise.withResolvers<unknown>();
-
-  const finishWithValue = (value: unknown): void => {
-    if (contextClosed) return;
-    contextClosed = true;
-    runDeferred.resolve(value);
-  };
-
-  const finishWithError = (err: unknown): void => {
-    if (contextClosed) return;
-    contextClosed = true;
-    runDeferred.reject(err);
-  };
-
-  const schedulePostSliceDrain = (): void => {
-    if (contextClosed || postSliceDrainScheduled) return;
-    postSliceDrainScheduled = true;
-    // Dynamic import() rejects on Node's host microtask queue two hops after invocation.
-    queueMicrotask(() => {
-      queueMicrotask(() => {
-        postSliceDrainScheduled = false;
-        if (!contextClosed && !inSlice) {
-          drainContext(false);
-        }
-      });
-    });
-  };
-
-  const isClosed = (): boolean => contextClosed;
-
-  const drainContext = (scheduleFollowUp = true): void => {
-    if (contextClosed || inSlice) return;
-    inSlice = true;
-    try {
-      while (true) {
-        DRAIN_STEPS_SCRIPT.runInContext(context, { timeout: shared.syncTimeoutMs });
-        if (isClosed() || !runtime.hasQueuedSteps()) break;
-      }
-    } catch (err) {
-      if (extractErrorCode(err) === "ERR_SCRIPT_EXECUTION_TIMEOUT") {
-        finishWithError(
-          new WorkflowScriptError(
-            `The workflow script ran for more than ${shared.syncTimeoutMs} ms without waiting; it was stopped.`,
-          ),
-        );
-      } else {
-        finishWithError(normalizeScriptFailure(err, shared.abortHub, runtime.isContextTypeError));
-      }
-      return;
-    } finally {
-      inSlice = false;
-    }
-    if (!contextClosed && shared.abortHub.aborted) {
-      finishWithError(shared.abortHub.reason());
-      return;
-    }
-    if (scheduleFollowUp && !contextClosed) {
-      schedulePostSliceDrain();
-    }
-  };
-
-  const settleDeferredWithValue = (deferred: ContextDeferred, value: unknown): void => {
-    if (contextClosed) return;
-    try {
-      const json = serializeHostValue(value);
-      deferred.enqueueResolveJson(json);
-    } catch (err) {
-      const spec = toRealmErrorSpec(err, shared.abortHub);
-      deferred.enqueueRejectSpec(spec.kind, spec.message);
-    }
-    drainContext();
-  };
-
-  const settleDeferredWithError = (deferred: ContextDeferred, err: unknown): void => {
-    if (contextClosed) return;
-    const spec = toRealmErrorSpec(err, shared.abortHub);
-    deferred.enqueueRejectSpec(spec.kind, spec.message);
-    drainContext();
-  };
-
-  const runBridgeSync = <T>(fn: () => T): BridgeSyncOutcome<T> => {
-    try {
-      return { ok: true, value: fn() };
-    } catch (err) {
-      const spec = toRealmErrorSpec(err, shared.abortHub);
-      return { ok: false, errorKind: spec.kind, errorMessage: spec.message };
-    }
-  };
-
-  const checkBudget = (): void => {
-    const { total, spent } = shared.host.budget;
-    if (total !== null && spent() >= total) {
-      throw new Error("The workflow's token budget is spent.");
-    }
-  };
-
-  const startAgent = (prompt: unknown, rawOpts: unknown, deferred: ContextDeferred): void => {
-    try {
-      if (shared.abortHub.aborted) {
-        deferred.rejectSpecSync("Error", extractErrorMessage(shared.abortHub.reason()));
-        return;
-      }
-      if (typeof prompt !== "string" || prompt.trim().length === 0) {
-        deferred.rejectSpecSync("TypeError", "agent() prompt must be a non-empty string");
-        return;
-      }
-      const opts = validateAgentOpts(rawOpts, runtime.objectPrototype);
-      checkBudget();
-
-      if (shared.agentCount >= WORKFLOW_LIMITS.maxAgents) {
-        deferred.rejectSpecSync(
-          "WorkflowScriptError",
-          `A workflow runs at most ${WORKFLOW_LIMITS.maxAgents} agents`,
-        );
-        return;
-      }
-      const index = shared.agentCount;
-      shared.agentCount += 1;
-
-      const call: WorkflowAgentCall = {
-        index,
-        prompt,
-        opts,
-        phase: opts.phase ?? currentPhase,
-      };
-
-      const runWithSlot = (): void => {
-        if (contextClosed) {
-          shared.semaphore.release();
-          return;
-        }
-        let agentPromise: Promise<unknown>;
-        try {
-          if (shared.abortHub.aborted) {
-            throw shared.abortHub.reason();
-          }
-          checkBudget();
-          agentPromise = raceWithAbort(shared.host.runAgent(call), shared.abortHub);
-        } catch (err) {
-          shared.semaphore.release();
-          if (inSlice) {
-            const spec = toRealmErrorSpec(err, shared.abortHub);
-            deferred.rejectSpecSync(spec.kind, spec.message);
-          } else {
-            settleDeferredWithError(deferred, err);
-          }
-          return;
-        }
-
-        agentPromise.then(
-          (result) => {
-            shared.semaphore.release();
-            settleDeferredWithValue(deferred, result);
-          },
-          (err) => {
-            shared.semaphore.release();
-            settleDeferredWithError(deferred, err);
-          },
-        );
-      };
-
-      if (shared.semaphore.tryAcquire()) {
-        runWithSlot();
-        return;
-      }
-
-      shared.semaphore.acquire().then(
-        () => {
-          runWithSlot();
-        },
-        (err) => {
-          settleDeferredWithError(deferred, err);
-        },
-      );
-    } catch (err) {
-      const spec = toRealmErrorSpec(err, shared.abortHub);
-      deferred.rejectSpecSync(spec.kind, spec.message);
-    }
-  };
-
-  const startWorkflow = (ref: unknown, rawArgs: unknown, deferred: ContextDeferred): void => {
-    try {
-      if (shared.abortHub.aborted) {
-        deferred.rejectSpecSync("Error", extractErrorMessage(shared.abortHub.reason()));
-        return;
-      }
-      if (depth >= 1) {
-        deferred.rejectSpecSync(
-          "WorkflowScriptError",
-          "Nested workflow() calls are supported one level only.",
-        );
-        return;
-      }
-      if (typeof ref === "string") {
-        deferred.rejectSpecSync(
-          "WorkflowScriptError",
-          "Saved workflows are not supported; pass {scriptPath}.",
-        );
-        return;
-      }
-      if (!isPlainObject(ref, runtime.objectPrototype)) {
-        deferred.rejectSpecSync(
-          "WorkflowScriptError",
-          "workflow() requires { scriptPath: string }",
-        );
-        return;
-      }
-      const scriptPath = ownProperty(ref, "scriptPath");
-      if (typeof scriptPath !== "string" || scriptPath.trim().length === 0) {
-        deferred.rejectSpecSync(
-          "WorkflowScriptError",
-          "workflow() requires { scriptPath: string }",
-        );
-        return;
-      }
-      const childArgs =
-        rawArgs === undefined ? undefined : cloneJsonToHost(rawArgs, "workflow() args");
-
-      void (async () => {
-        try {
-          const childScript = await raceWithAbort(
-            shared.host.loadScript({ scriptPath }),
-            shared.abortHub,
-          );
-          const childResult = await executeScriptInContext(
-            childScript,
-            childArgs,
-            shared,
-            depth + 1,
-          );
-          settleDeferredWithValue(deferred, childResult);
-        } catch (err) {
-          settleDeferredWithError(deferred, err);
-        }
-      })();
-    } catch (err) {
-      const spec = toRealmErrorSpec(err, shared.abortHub);
-      deferred.rejectSpecSync(spec.kind, spec.message);
-    }
-  };
-
-  const budgetTotal = shared.host.budget.total;
-  const bridge: ContextHostBridge = {
-    startAgent,
-    startWorkflow,
-    onPhase: (title) =>
-      runBridgeSync(() => {
-        currentPhase = title;
-        shared.host.onPhase(title);
-      }),
-    onLog: (message) =>
-      runBridgeSync(() => {
-        shared.host.onLog(
-          message.length > MAX_LOG_CHARS ? message.slice(0, MAX_LOG_CHARS) : message,
-        );
-      }),
-    budgetSpent: () => runBridgeSync(() => shared.host.budget.spent()),
-    budgetRemaining: () =>
-      runBridgeSync(() =>
-        budgetTotal === null
-          ? Number.POSITIVE_INFINITY
-          : Math.max(0, budgetTotal - shared.host.budget.spent()),
-      ),
-  };
-
-  const setupContext = CONTEXT_SETUP_SCRIPT.runInContext(context, {
-    timeout: shared.syncTimeoutMs,
-  }) as (bridge: ContextHostBridge, config: ContextSetupConfig) => ContextRuntime;
-
-  runtime = setupContext(bridge, {
-    argsJson,
-    budgetTotal,
-    maxItems: WORKFLOW_LIMITS.maxItems,
-  });
-
-  const unsubAbort = shared.abortHub.onAbort((reason) => {
-    if (contextClosed) return;
-    runtime.enqueueAbort(extractErrorMessage(reason));
-    if (!inSlice) {
-      drainContext(false);
-      if (!contextClosed) {
-        finishWithError(reason);
-      }
-    }
-  });
-
-  try {
-    const bodyFn: unknown = compiled.runInContext(context, { timeout: shared.syncTimeoutMs });
-    runtime.enqueueStartBody(
-      bodyFn,
-      (outcome) => {
-        if (shared.abortHub.aborted) {
-          finishWithError(shared.abortHub.reason());
-          return;
-        }
-        if (!outcome.ok) {
-          finishWithError(new WorkflowScriptError(outcome.errorMessage));
-          return;
-        }
-        if (outcome.json === undefined) {
-          finishWithValue(null);
-          return;
-        }
-        finishWithValue(JSON.parse(outcome.json));
-      },
-      (err) => {
-        finishWithError(normalizeScriptFailure(err, shared.abortHub, runtime.isContextTypeError));
-      },
-    );
-    drainContext();
-    return await runDeferred.promise;
-  } finally {
-    unsubAbort();
+function fromRealmErrorSpec(kind: unknown, message: unknown): Error {
+  const text = typeof message === "string" ? message : String(message ?? "Workflow script failed");
+  if (kind === "TypeError") {
+    return new TypeError(text);
   }
+  return new WorkflowScriptError(text);
+}
+
+function readBudgetSpent(host: WorkflowHost): number {
+  const spent = host.budget.spent();
+  return Number.isFinite(spent) ? spent : 0;
 }
 
 export async function runWorkflowScript(input: {
@@ -1601,22 +654,462 @@ export async function runWorkflowScript(input: {
   readonly concurrency: number;
   readonly syncTimeoutMs?: number;
 }): Promise<unknown> {
+  if (input.host.signal.aborted) {
+    throw getAbortReason(input.host.signal);
+  }
+  if (typeof input.script !== "string") {
+    throw new WorkflowScriptError("Workflow script must be a string");
+  }
+  if (Buffer.byteLength(input.script, "utf8") > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
+    throw new WorkflowScriptError("Workflow script exceeds the 4 MiB limit.");
+  }
+  const argsJson =
+    input.args === undefined ? undefined : strictJsonStringify(input.args, "Workflow args");
+  if (
+    argsJson !== undefined &&
+    Buffer.byteLength(argsJson, "utf8") > WORKFLOW_MESSAGE_LIMITS.maxValueBytes
+  ) {
+    throw new WorkflowScriptError("Workflow args exceed the 4 MiB limit.");
+  }
+
   const limit = Number.isFinite(input.concurrency) ? Math.max(1, Math.trunc(input.concurrency)) : 1;
   const syncTimeoutMs =
     input.syncTimeoutMs !== undefined && Number.isFinite(input.syncTimeoutMs)
       ? Math.max(1, Math.trunc(input.syncTimeoutMs))
       : DEFAULT_SYNC_TIMEOUT_MS;
-  const abortHub = createAbortHub(input.host.signal);
+  const initialSpent = readBudgetSpent(input.host);
+
+  const worker = new NodeWorkerThreads.Worker(WORKFLOW_SANDBOX_WORKER_SOURCE, {
+    eval: true,
+    resourceLimits: { ...WORKFLOW_WORKER_RESOURCE_LIMITS },
+    env: {},
+    stdout: true,
+    stderr: true,
+    argv: [],
+    execArgv: [],
+  });
+  worker.stdout?.resume();
+  worker.stderr?.resume();
+
+  const runDeferred = Promise.withResolvers<unknown>();
+  let settled = false;
+  let started = false;
+  let lastSentSeq = 0;
+  let lastIdleSeq = 0;
+  let hostAgentCount = 0;
+  let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
+  let terminatePromise: Promise<number> | null = null;
+
+  const terminateWorker = (): Promise<number> => {
+    terminatePromise ??= worker.terminate().catch(() => 0);
+    return terminatePromise;
+  };
+
+  const clearDeadline = (): void => {
+    if (deadlineTimer !== null) {
+      clearTimeout(deadlineTimer);
+      deadlineTimer = null;
+    }
+  };
+
+  const failRun = (err: unknown): void => {
+    if (settled) return;
+    settled = true;
+    clearDeadline();
+    void terminateWorker();
+    runDeferred.reject(err);
+  };
+
+  const succeedRun = (value: unknown): void => {
+    if (settled) return;
+    settled = true;
+    clearDeadline();
+    runDeferred.resolve(value);
+  };
+
+  const onDeadlineExpired = (): void => {
+    deadlineTimer = null;
+    if (settled) return;
+    failRun(
+      new WorkflowScriptError(
+        `The workflow script ran for more than ${syncTimeoutMs} ms without waiting; it was stopped.`,
+      ),
+    );
+  };
+
+  const armDeadlineIfIdle = (): void => {
+    if (settled || deadlineTimer !== null) return;
+    deadlineTimer = setTimeout(onDeadlineExpired, syncTimeoutMs);
+  };
+
+  const resetDeadline = (): void => {
+    clearDeadline();
+    if (settled) return;
+    deadlineTimer = setTimeout(onDeadlineExpired, syncTimeoutMs);
+  };
+
+  const postToWorker = (message: string, maxBytes: number, capMessage: string): boolean => {
+    if (settled) return false;
+    if (Buffer.byteLength(message, "utf8") > maxBytes) {
+      failRun(new WorkflowScriptError(capMessage));
+      return false;
+    }
+    armDeadlineIfIdle();
+    // oxlint-disable-next-line unicorn/require-post-message-target-origin -- Node worker_threads Worker.postMessage has no targetOrigin argument.
+    worker.postMessage(message);
+    return true;
+  };
+
+  const onAbort = (): void => {
+    failRun(getAbortReason(input.host.signal));
+  };
+  input.host.signal.addEventListener("abort", onAbort, { once: true });
+
+  worker.on("error", (err: unknown) => {
+    if (settled) return;
+    const code = extractErrorCode(err);
+    const message = extractErrorMessage(err);
+    if (code === "ERR_WORKER_OUT_OF_MEMORY") {
+      failRun(
+        new WorkflowScriptError(`Workflow worker exceeded memory limit (${code}): ${message}`),
+      );
+      return;
+    }
+    failRun(
+      new WorkflowScriptError(
+        `Workflow worker crashed${code !== undefined ? ` (${code})` : ""}: ${message}`,
+      ),
+    );
+  });
+
+  worker.on("exit", (code: number) => {
+    if (settled) return;
+    failRun(new WorkflowScriptError(`Workflow worker exited unexpectedly (code ${code})`));
+  });
+
+  worker.on("message", (raw: unknown) => {
+    if (settled) return;
+    if (typeof raw !== "string") {
+      failRun(new WorkflowScriptError("Workflow worker sent a non-string message."));
+      return;
+    }
+    const bytes = Buffer.byteLength(raw, "utf8");
+    if (bytes > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
+      failRun(new WorkflowScriptError("Workflow message exceeded the 4 MiB limit."));
+      return;
+    }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      failRun(new WorkflowScriptError("Workflow worker sent invalid JSON."));
+      return;
+    }
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+      failRun(new WorkflowScriptError("Workflow worker sent a malformed message."));
+      return;
+    }
+    const msg = parsed as Record<string, unknown>;
+    const msgType = msg.type;
+
+    if (msgType === "ready") {
+      if (started) return;
+      started = true;
+      lastSentSeq += 1;
+      const base = JSON.stringify({
+        type: "start",
+        seq: lastSentSeq,
+        script: input.script,
+        hasArgs: argsJson !== undefined,
+        concurrency: limit,
+        syncTimeoutMs,
+        budgetTotal: input.host.budget.total,
+        budgetSpent: initialSpent,
+        maxAgents: WORKFLOW_LIMITS.maxAgents,
+        maxItems: WORKFLOW_LIMITS.maxItems,
+        maxPromptBytes: WORKFLOW_MESSAGE_LIMITS.maxPromptBytes,
+        maxValueBytes: WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+        maxLogChars: WORKFLOW_MESSAGE_LIMITS.maxLogChars,
+      });
+      const startMsg = argsJson === undefined ? base : `${base.slice(0, -1)},"args":${argsJson}}`;
+      postToWorker(startMsg, MAX_START_MESSAGE_BYTES, "Workflow start payload exceeds size limit.");
+      return;
+    }
+
+    if (msgType === "idle") {
+      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
+        failRun(new WorkflowScriptError("Workflow worker message exceeded the 1 MiB limit."));
+        return;
+      }
+      const seq = msg.seq;
+      if (typeof seq !== "number" || !Number.isInteger(seq) || seq < 0 || seq > lastSentSeq) {
+        failRun(new WorkflowScriptError("Workflow worker sent an invalid idle sequence."));
+        return;
+      }
+      if (seq > lastIdleSeq) {
+        lastIdleSeq = seq;
+        if (lastIdleSeq === lastSentSeq) {
+          clearDeadline();
+        } else {
+          resetDeadline();
+        }
+      }
+      return;
+    }
+
+    if (msgType === "phase") {
+      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
+        failRun(new WorkflowScriptError("Workflow phase() message exceeds the 1 MiB limit."));
+        return;
+      }
+      if (typeof msg.title !== "string" || msg.title.trim().length === 0) {
+        failRun(new WorkflowScriptError("Workflow worker sent an invalid phase title."));
+        return;
+      }
+      try {
+        input.host.onPhase(msg.title);
+      } catch (err) {
+        failRun(err);
+      }
+      return;
+    }
+
+    if (msgType === "log") {
+      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
+        failRun(new WorkflowScriptError("Workflow log() message exceeds the 1 MiB limit."));
+        return;
+      }
+      if (typeof msg.message !== "string") {
+        failRun(new WorkflowScriptError("Workflow worker sent an invalid log message."));
+        return;
+      }
+      const text =
+        msg.message.length > WORKFLOW_MESSAGE_LIMITS.maxLogChars
+          ? msg.message.slice(0, WORKFLOW_MESSAGE_LIMITS.maxLogChars)
+          : msg.message;
+      try {
+        input.host.onLog(text);
+      } catch (err) {
+        failRun(err);
+      }
+      return;
+    }
+
+    if (msgType === "agent") {
+      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
+        failRun(
+          new WorkflowScriptError("Workflow agent() prompt and options exceed the 1 MiB limit."),
+        );
+        return;
+      }
+      const id = msg.id;
+      const index = msg.index;
+      const prompt = msg.prompt;
+      const opts = msg.opts;
+      const phase = msg.phase;
+      if (
+        typeof id !== "number" ||
+        !Number.isInteger(id) ||
+        typeof index !== "number" ||
+        !Number.isInteger(index) ||
+        index < 0 ||
+        typeof prompt !== "string" ||
+        typeof opts !== "object" ||
+        opts === null ||
+        Array.isArray(opts) ||
+        (phase !== undefined && typeof phase !== "string")
+      ) {
+        failRun(new WorkflowScriptError("Workflow worker sent an invalid agent request."));
+        return;
+      }
+
+      hostAgentCount += 1;
+      if (hostAgentCount > WORKFLOW_LIMITS.maxAgents) {
+        failRun(
+          new WorkflowScriptError(`A workflow runs at most ${WORKFLOW_LIMITS.maxAgents} agents`),
+        );
+        return;
+      }
+
+      const call: WorkflowAgentCall = {
+        index,
+        prompt,
+        opts: opts as WorkflowAgentOpts,
+        phase,
+      };
+
+      void Promise.resolve()
+        .then(() => input.host.runAgent(call))
+        .then(
+          (value) => {
+            if (settled) return;
+            let spent: number;
+            try {
+              spent = readBudgetSpent(input.host);
+            } catch (err) {
+              failRun(err);
+              return;
+            }
+            const seq = (lastSentSeq += 1);
+            if (value === undefined) {
+              postToWorker(
+                JSON.stringify({ type: "agentResult", seq, id, ok: true, spent, hasValue: false }),
+                WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+                "Workflow agent() result exceeds the 4 MiB limit.",
+              );
+              return;
+            }
+            let valueJson: string;
+            try {
+              valueJson = serializeHostValue(value);
+            } catch (err) {
+              const spec = toRealmErrorSpec(err);
+              postToWorker(
+                JSON.stringify({
+                  type: "agentResult",
+                  seq,
+                  id,
+                  ok: false,
+                  spent,
+                  errorKind: spec.kind,
+                  errorMessage: spec.message,
+                }),
+                WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+                "Workflow agent() result exceeds the 4 MiB limit.",
+              );
+              return;
+            }
+            const resultMsg = `{"type":"agentResult","seq":${seq},"id":${id},"ok":true,"spent":${spent},"hasValue":true,"value":${valueJson}}`;
+            postToWorker(
+              resultMsg,
+              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+              "Workflow agent() result exceeds the 4 MiB limit.",
+            );
+          },
+          (err) => {
+            if (settled || input.host.signal.aborted) return;
+            let spent: number;
+            try {
+              spent = readBudgetSpent(input.host);
+            } catch (budgetErr) {
+              failRun(budgetErr);
+              return;
+            }
+            const seq = (lastSentSeq += 1);
+            const spec = toRealmErrorSpec(err);
+            postToWorker(
+              JSON.stringify({
+                type: "agentResult",
+                seq,
+                id,
+                ok: false,
+                spent,
+                errorKind: spec.kind,
+                errorMessage: spec.message,
+              }),
+              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+              "Workflow agent() result exceeds the 4 MiB limit.",
+            );
+          },
+        );
+      return;
+    }
+
+    if (msgType === "loadScript") {
+      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
+        failRun(new WorkflowScriptError("workflow() scriptPath exceeds the 1 MiB limit."));
+        return;
+      }
+      const id = msg.id;
+      const scriptPath = msg.scriptPath;
+      if (
+        typeof id !== "number" ||
+        !Number.isInteger(id) ||
+        typeof scriptPath !== "string" ||
+        scriptPath.trim().length === 0
+      ) {
+        failRun(new WorkflowScriptError("Workflow worker sent an invalid loadScript request."));
+        return;
+      }
+
+      void Promise.resolve()
+        .then(() => input.host.loadScript({ scriptPath }))
+        .then(
+          (childScript) => {
+            if (settled) return;
+            const seq = (lastSentSeq += 1);
+            if (typeof childScript !== "string") {
+              postToWorker(
+                JSON.stringify({
+                  type: "loadScriptResult",
+                  seq,
+                  id,
+                  ok: false,
+                  errorKind: "WorkflowScriptError",
+                  errorMessage: "Workflow script must be a string",
+                }),
+                WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+                "Nested workflow script exceeds the 4 MiB limit.",
+              );
+              return;
+            }
+            postToWorker(
+              JSON.stringify({
+                type: "loadScriptResult",
+                seq,
+                id,
+                ok: true,
+                script: childScript,
+              }),
+              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+              "Nested workflow script exceeds the 4 MiB limit.",
+            );
+          },
+          (err) => {
+            if (settled || input.host.signal.aborted) return;
+            const seq = (lastSentSeq += 1);
+            const spec = toRealmErrorSpec(err);
+            postToWorker(
+              JSON.stringify({
+                type: "loadScriptResult",
+                seq,
+                id,
+                ok: false,
+                errorKind: spec.kind,
+                errorMessage: spec.message,
+              }),
+              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+              "Nested workflow script exceeds the 4 MiB limit.",
+            );
+          },
+        );
+      return;
+    }
+
+    if (msgType === "done") {
+      succeedRun(msg.value);
+      return;
+    }
+
+    if (msgType === "error") {
+      if (bytes > WORKFLOW_MESSAGE_LIMITS.maxPromptBytes) {
+        failRun(new WorkflowScriptError("Workflow error message exceeds the 1 MiB limit."));
+        return;
+      }
+      failRun(fromRealmErrorSpec(msg.kind, msg.message));
+      return;
+    }
+
+    failRun(new WorkflowScriptError(`Unknown workflow worker message type: ${String(msgType)}`));
+  });
+
   try {
-    const shared: SharedRunState = {
-      host: input.host,
-      semaphore: new FifoSemaphore(limit, abortHub),
-      abortHub,
-      syncTimeoutMs,
-      agentCount: 0,
-    };
-    return await executeScriptInContext(input.script, input.args, shared, 0);
+    return await runDeferred.promise;
   } finally {
-    abortHub.dispose();
+    settled = true;
+    clearDeadline();
+    input.host.signal.removeEventListener("abort", onAbort);
+    await terminateWorker();
   }
 }
