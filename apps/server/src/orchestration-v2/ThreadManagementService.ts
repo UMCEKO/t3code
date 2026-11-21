@@ -132,6 +132,9 @@ function existingThreadIdsForCommand(
     case "delegated_task.wake-policy":
     case "delegated_task.completion-delivery.acknowledge":
     case "delegated_task.completion-delivery.dispose":
+    case "workflow.start":
+    case "workflow.progress":
+    case "workflow.complete":
     case "delegated_task.remote.request":
     case "delegated_task.remote.complete":
     case "delegated_task.remote.stop":
@@ -1601,89 +1604,112 @@ const make = Effect.gen(function* () {
 
   const stopWorkflow: ThreadManagementServiceShape["stopWorkflow"] = Effect.fn(
     "ThreadManagementService.stopWorkflow",
-  )(
-    function* (input) {
-      const records = yield* orchestrator
-        .getThreadRecords(input.threadId, ["subagents", "runs", "providerThreads"])
-        .pipe(
-          Effect.mapError(
-            (cause) =>
-              new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable", cause }),
-          ),
-        );
-      if (records.thread.deletedAt !== null) {
-        return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable" });
-      }
-      // Check mode limits under the lock so users cannot raise modes between validation and Stop.
-      const limit = yield* DispatchModeLimit;
-      const exceeded =
-        limit === undefined ? undefined : exceededDispatchModeLimit(limit, records.thread);
-      if (limit !== undefined && exceeded !== undefined) {
-        if (limit.refused !== undefined) {
-          yield* Ref.set(limit.refused, {
-            threadId: input.threadId,
-            runtimeMode: records.thread.runtimeMode,
-            interactionMode: records.thread.interactionMode,
-            mode: exceeded,
-          });
+  )(function* (input) {
+    // Dispatch takes the thread lock, so app-owned workflow stops release it first.
+    const appOwnedWorkflowId = yield* threadDispatch.withLock(
+      input.threadId,
+      Effect.gen(function* () {
+        const records = yield* orchestrator
+          .getThreadRecords(input.threadId, ["subagents", "runs", "providerThreads"])
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable", cause }),
+            ),
+          );
+        if (records.thread.deletedAt !== null) {
+          return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable" });
         }
-        return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable" });
-      }
-      const task = records.subagents.find((candidate) => candidate.id === input.subagentId);
-      if (
-        task === undefined ||
-        task.threadId !== input.threadId ||
-        task.workflow === undefined ||
-        task.status !== "running"
-      ) {
-        return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "not-running" });
-      }
-      if (task.origin !== "provider_native" || task.driver !== "claudeAgent") {
-        return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unsupported" });
-      }
-      const providerThreadId =
-        task.providerThreadId ??
-        records.runs.find((run) => run.id === task.runId)?.providerThreadId;
-      const providerThread = records.providerThreads.find(
-        (candidate) =>
-          candidate.id === providerThreadId &&
-          candidate.appThreadId === input.threadId &&
-          candidate.providerInstanceId === task.providerInstanceId &&
-          candidate.driver === task.driver,
-      );
-      const taskId = task.nativeTaskRef?.nativeId;
-      if (providerThread?.providerSessionId == null || taskId == null || taskId.length === 0) {
-        return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable" });
-      }
-      const runtime = yield* sessions
-        .get(providerThread.providerSessionId)
-        .pipe(
+        // Check mode limits under the lock so users cannot raise modes between validation and Stop.
+        const limit = yield* DispatchModeLimit;
+        const exceeded =
+          limit === undefined ? undefined : exceededDispatchModeLimit(limit, records.thread);
+        if (limit !== undefined && exceeded !== undefined) {
+          if (limit.refused !== undefined) {
+            yield* Ref.set(limit.refused, {
+              threadId: input.threadId,
+              runtimeMode: records.thread.runtimeMode,
+              interactionMode: records.thread.interactionMode,
+              mode: exceeded,
+            });
+          }
+          return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable" });
+        }
+        const task = records.subagents.find((candidate) => candidate.id === input.subagentId);
+        if (
+          task === undefined ||
+          task.threadId !== input.threadId ||
+          task.workflow === undefined ||
+          task.status !== "running"
+        ) {
+          return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "not-running" });
+        }
+        if (task.origin === "app_owned" && task.childThreadId === null) {
+          return task.id;
+        }
+        if (task.origin !== "provider_native" || task.driver !== "claudeAgent") {
+          return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unsupported" });
+        }
+        const providerThreadId =
+          task.providerThreadId ??
+          records.runs.find((run) => run.id === task.runId)?.providerThreadId;
+        const providerThread = records.providerThreads.find(
+          (candidate) =>
+            candidate.id === providerThreadId &&
+            candidate.appThreadId === input.threadId &&
+            candidate.providerInstanceId === task.providerInstanceId &&
+            candidate.driver === task.driver,
+        );
+        const taskId = task.nativeTaskRef?.nativeId;
+        if (providerThread?.providerSessionId == null || taskId == null || taskId.length === 0) {
+          return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable" });
+        }
+        const runtime = yield* sessions
+          .get(providerThread.providerSessionId)
+          .pipe(
+            Effect.mapError(
+              (cause) =>
+                new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable", cause }),
+            ),
+          );
+        if (Option.isNone(runtime)) {
+          return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable" });
+        }
+        if (runtime.value.stopTask === undefined) {
+          return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unsupported" });
+        }
+        // Bounded so a provider that never answers cannot hold the thread lock.
+        yield* runtime.value.stopTask({ providerThread, taskId }).pipe(
+          Effect.timeout("15 seconds"),
           Effect.mapError(
             (cause) =>
-              new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable", cause }),
+              new OrchestrationV2StopWorkflowError({
+                ...input,
+                reason: "stop-failed",
+                cause,
+              }),
           ),
         );
-      if (Option.isNone(runtime)) {
-        return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable" });
-      }
-      if (runtime.value.stopTask === undefined) {
-        return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "unsupported" });
-      }
-      // Bounded so a provider that never answers cannot hold the thread lock.
-      yield* runtime.value.stopTask({ providerThread, taskId }).pipe(
-        Effect.timeout("15 seconds"),
-        Effect.mapError(
-          (cause) =>
-            new OrchestrationV2StopWorkflowError({
-              ...input,
-              reason: "stop-failed",
-              cause,
-            }),
+        return undefined;
+      }),
+    );
+    if (appOwnedWorkflowId !== undefined) {
+      yield* dispatch({
+        type: "workflow.complete",
+        commandId: CommandId.make(`server:stop-workflow:${appOwnedWorkflowId}`),
+        parentThreadId: input.threadId,
+        taskId: appOwnedWorkflowId,
+        status: "cancelled",
+        result: "Stopped.",
+      }).pipe(
+        Effect.mapError((cause) =>
+          cause._tag === "OrchestratorThreadAboveModeLimitError"
+            ? new OrchestrationV2StopWorkflowError({ ...input, reason: "unavailable", cause })
+            : new OrchestrationV2StopWorkflowError({ ...input, reason: "stop-failed", cause }),
         ),
       );
-    },
-    (effect, input) => effect.pipe((effect) => threadDispatch.withLock(input.threadId, effect)),
-  );
+    }
+  });
 
   const awaitBackgroundTasks: ThreadManagementServiceShape["awaitBackgroundTasks"] = Effect.fn(
     "ThreadManagementService.awaitBackgroundTasks",
@@ -1751,6 +1777,27 @@ const make = Effect.gen(function* () {
     for (const task of subagents) {
       if (task.origin !== "app_owned") continue;
       if (task.childThreadId === null) {
+        if (task.workflow !== undefined) {
+          if (task.status !== "running") continue;
+          const commandId = CommandId.make(`${input.commandId}:stop:${task.id}`);
+          yield* (input.remoteDispatch ?? dispatch)({
+            type: "workflow.complete",
+            commandId,
+            parentThreadId: input.threadId,
+            taskId: task.id,
+            status: "cancelled",
+            result: "Stopped.",
+          }).pipe(
+            Effect.catch((error) =>
+              Effect.logWarning("Unable to stop a delegated task", {
+                parentThreadId: input.threadId,
+                taskId: task.id,
+                error,
+              }).pipe(Effect.andThen(Effect.sync(() => failures.push(error)))),
+            ),
+          );
+          continue;
+        }
         // A task in a linked environment ends here; its follower then stops it there.
         // One with its result keeps it, but its thread there may run follow-up work.
         if (task.remoteChild === undefined) continue;
