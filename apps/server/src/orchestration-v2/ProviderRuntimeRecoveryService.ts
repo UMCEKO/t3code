@@ -445,7 +445,9 @@ export const make = Effect.gen(function* () {
       for (const run of unattendedRuns) {
         if (
           restartContinuationBlocked(projection, run, now, false) ||
-          (yield* restartStopRequested(projections.getThreadRecords, projection.thread, run).pipe(
+          (yield* restartStopRequested(projections.getThreadRecords, projection.thread, run, {
+            serverRestart: true,
+          }).pipe(
             Effect.mapError(
               (cause) =>
                 new ProviderRuntimeRecoveryError({

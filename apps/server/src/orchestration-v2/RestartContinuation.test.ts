@@ -1505,7 +1505,10 @@ it.effect("treats a stopping or ended server workflow as a stop for its agents' 
       result: null,
       status: "running",
     };
-    const check = (owner: ReturnType<typeof workflowTask>) =>
+    const check = (
+      owner: ReturnType<typeof workflowTask>,
+      options?: { readonly serverRestart?: boolean },
+    ) =>
       restartStopRequested<never>(
         ((
           threadId: string,
@@ -1528,8 +1531,10 @@ it.effect("treats a stopping or ended server workflow as a stop for its agents' 
           forkedFrom: null,
         } as never,
         { id: "run:agent", delegatedTaskId: "node:agent" } as never,
+        options,
       );
     assert.isFalse(yield* check(workflowTask("running")));
+    assert.isTrue(yield* check(workflowTask("running"), { serverRestart: true }));
     assert.isTrue(yield* check(workflowTask("running", 1)));
     assert.isTrue(yield* check(workflowTask("failed")));
   }),

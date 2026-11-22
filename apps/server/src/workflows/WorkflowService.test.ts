@@ -4,6 +4,7 @@ import { describe, expect, it } from "@effect/vitest";
 import {
   CommandId,
   EnvironmentId,
+  EventId,
   MessageId,
   NodeId,
   ORCHESTRATOR_MCP_RUNNING_TASK_NEXT,
@@ -14,6 +15,7 @@ import {
   ProviderInstanceId,
   ProviderThreadId,
   ProviderTurnId,
+  RunId,
   ThreadId,
   TurnItemId,
   type ModelSelection,
@@ -49,6 +51,7 @@ import * as McpInvocationContext from "../mcp/McpInvocationContext.ts";
 import * as OrchestratorMcpService from "../mcp/OrchestratorMcpService.ts";
 import { ClaudeProviderCapabilitiesV2 } from "../orchestration-v2/Adapters/ClaudeAdapterV2.ts";
 import * as CommandReceiptStore from "../orchestration-v2/CommandReceiptStore.ts";
+import * as EventSink from "../orchestration-v2/EventSink.ts";
 import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import * as ProviderAdapterRegistry from "../orchestration-v2/ProviderAdapterRegistry.ts";
 import * as ProviderContinuationRequests from "@t3tools/provider-core/server/ProviderContinuationRequests";
@@ -3976,5 +3979,279 @@ return { out };`,
           expect(oversizedReadCalls).toBe(0);
         }).pipe(Effect.provide(harness.layerToolkit));
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect.each([
+    "list-shells",
+    "coordinator-records-missing-meta",
+    "workflows-dir-read",
+    "meta-task-records",
+  ] as const)("startup sweep fails closed when %s discovery fails", (scenario) =>
+    Effect.gen(function* () {
+      const fs = yield* FileSystem.FileSystem;
+      const path = yield* Path.Path;
+      const sharedBaseDir = yield* fs.realPath(
+        yield* fs.makeTempDirectoryScoped({ prefix: `t3-workflow-discovery-fail-${scenario}-` }),
+      );
+      const sharedDbContext = yield* Layer.build(SqlitePersistence.layerMemory);
+      const databaseLayer = Layer.succeedContext(sharedDbContext);
+
+      const harness1 = yield* makeWorkflowHarness({
+        name: `discovery-fail-seed-${scenario}`,
+        databaseLayer,
+        baseDir: sharedBaseDir,
+      });
+
+      const seeded = yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        const mcpService = yield* OrchestratorMcpService.OrchestratorMcpService;
+        const config = yield* ServerConfig.ServerConfig;
+        const parentTurn = yield* startParentThreadAndRun(
+          harness1.turnQueue,
+          harness1.cwd,
+          `discovery-fail-${scenario}`,
+        );
+        const parentRun = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
+          (r) => r.id === parentTurn.turn.runId,
+        )!;
+        const runId = `wf_disc_${scenario.replaceAll("-", "_")}`;
+        const dir = path.join(config.workflowsDir, runId);
+        yield* fs.makeDirectory(dir, { recursive: true });
+        const scriptPath = path.join(dir, "script.js");
+        const journalPath = path.join(dir, "journal.jsonl");
+        yield* fs.writeFileString(
+          scriptPath,
+          `export const meta = { name: "DiscoveryFail", description: "Fails discovery." }; return 1;`,
+        );
+        yield* fs.writeFileString(journalPath, "");
+        const started = yield* orchestrator.dispatch({
+          type: "workflow.start",
+          commandId: CommandId.make(`seed-discovery-start:${runId}`),
+          parentThreadId,
+          parentRunId: parentRun.id,
+          parentNodeId: parentRun.rootNodeId!,
+          title: "DiscoveryFail",
+          description: "Fails discovery.",
+          modelSelection,
+          workflow: {
+            name: "DiscoveryFail",
+            runHandles: { runId, scriptPath, transcriptDir: dir },
+            phases: [],
+            agents: [],
+          },
+        });
+        const taskEvent = started.storedEvents.find(
+          (s) => s.event.type === "subagent.updated" && s.event.payload.origin === "app_owned",
+        );
+        if (taskEvent?.event.type !== "subagent.updated") {
+          throw new Error("missing workflow task");
+        }
+        const taskId = taskEvent.event.payload.id;
+        yield* mcpService.delegateWorkflowAgent(parentScope, {
+          parentRunId: parentRun.id,
+          workflowNodeId: taskId,
+          requestKey: `${runId}:0`,
+          task: { task: "Unaccepted child", title: "Worker" },
+        });
+        yield* Queue.take(harness1.turnQueue);
+
+        if (scenario !== "coordinator-records-missing-meta") {
+          yield* fs.writeFileString(
+            path.join(dir, "run.json"),
+            JSON.stringify({
+              runId,
+              threadId: parentThreadId,
+              taskId,
+              name: "DiscoveryFail",
+              scriptPath,
+              journalPath,
+              startedAt: 0,
+              status: "running",
+              usage: {
+                agents: 1,
+                done: 0,
+                errors: 0,
+                empty: 0,
+                cached: 0,
+                tokens: 0,
+                durationMs: 0,
+              },
+            }),
+          );
+        }
+        return { runId, taskId, workflowsDir: config.workflowsDir };
+      }).pipe(Effect.provide(harness1.layerToolkit));
+
+      let coordinatorRecordReads = 0;
+      const harness2 = yield* makeWorkflowHarness({
+        name: `discovery-fail-recover-${scenario}`,
+        databaseLayer,
+        baseDir: sharedBaseDir,
+        wrapFileSystem: (fsService) => ({
+          ...fsService,
+          readDirectory: (dirPath, opts) =>
+            scenario === "workflows-dir-read" && dirPath === seeded.workflowsDir
+              ? Effect.fail(
+                  PlatformError.systemError({
+                    _tag: "PermissionDenied",
+                    module: "FileSystem",
+                    method: "readDirectory",
+                    description: "workflows dir unreadable",
+                    pathOrDescriptor: dirPath,
+                  }),
+                )
+              : fsService.readDirectory(dirPath, opts),
+        }),
+        wrapThreadManagement: (tm) => ({
+          ...tm,
+          listActiveShellIndex: () =>
+            scenario === "list-shells"
+              ? Effect.fail(
+                  new Orchestrator.OrchestratorProjectionError({
+                    threadId: parentThreadId,
+                    cause: "transient shell index read failure",
+                  }),
+                )
+              : scenario === "meta-task-records"
+                ? Effect.succeed([])
+                : tm.listActiveShellIndex(),
+          getThreadRecords: ((threadId, fields, filter) => {
+            if (
+              threadId === parentThreadId &&
+              (scenario === "coordinator-records-missing-meta" ||
+                scenario === "meta-task-records") &&
+              coordinatorRecordReads === 0
+            ) {
+              coordinatorRecordReads += 1;
+              return Effect.fail(
+                new Orchestrator.OrchestratorProjectionError({
+                  threadId,
+                  cause: "transient projection read failure",
+                }),
+              );
+            }
+            return tm.getThreadRecords(threadId, fields, filter);
+          }) as typeof tm.getThreadRecords,
+        }),
+      });
+
+      const exit = yield* WorkflowService.recoverInterruptedWorkflows.pipe(
+        Effect.exit,
+        Effect.provide(harness2.layerToolkit),
+      );
+      expect(Exit.isFailure(exit)).toBe(true);
+    }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "stops pending background work on an older inactive provider thread before completing the workflow",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWorkflowHarness({ name: "inactive-provider-roster-bg-work" });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const sink = yield* EventSink.EventSinkV2;
+          yield* startParentThreadAndRun(
+            harness.turnQueue,
+            harness.cwd,
+            "inactive-provider-roster-bg-work",
+          );
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          const script = `
+            export const meta = {
+              name: "InactiveRoster",
+              description: "Stops background work left on an older inactive provider thread.",
+            };
+            const first = await agent("Start background work on old provider thread");
+            const second = await agent("Gate completion");
+            return { first, second };
+          `;
+          const runCall = yield* callTool("t3_workflow_run", { script });
+          expect(runCall.isError).not.toBe(true);
+          const started = yield* decodeRunResult(runCall.structuredContent);
+
+          const childTurn = yield* Queue.take(harness.turnQueue);
+          const childThreadId = childTurn.turn.threadId;
+          yield* childTurn.setPendingBackgroundTasks([
+            { taskId: "bg-old-roster", kind: "command", description: "stale watcher" },
+          ]);
+          yield* childTurn.complete("child-done");
+
+          // Wait for the second agent so the child's first turn is settled before switching its active provider thread.
+          const gateTurn = yield* Queue.take(harness.turnQueue);
+          const childBeforeSwitch = yield* orchestrator.getThreadProjection(childThreadId);
+          const oldProviderThread = childBeforeSwitch.providerThreads[0]!;
+          const oldRun = childBeforeSwitch.runs[0]!;
+          expect(oldProviderThread.pendingBackgroundTasks?.length ?? 0).toBe(1);
+
+          const now = yield* DateTime.now;
+          const newerProviderThreadId = ProviderThreadId.make(
+            `provider-thread:${childThreadId}:newer`,
+          );
+          const newerRunId = RunId.make(`run:${childThreadId}:newer`);
+          yield* sink.write({
+            events: [
+              {
+                id: EventId.make(`event:newer-pt:${childThreadId}`),
+                type: "provider-thread.updated",
+                threadId: childThreadId,
+                occurredAt: now,
+                payload: {
+                  ...oldProviderThread,
+                  id: newerProviderThreadId,
+                  status: "idle",
+                  firstRunOrdinal: oldRun.ordinal + 1,
+                  lastRunOrdinal: oldRun.ordinal + 1,
+                  pendingBackgroundTasks: [],
+                  updatedAt: now,
+                },
+              },
+              {
+                id: EventId.make(`event:newer-run:${childThreadId}`),
+                type: "run.created",
+                threadId: childThreadId,
+                runId: newerRunId,
+                providerInstanceId: instanceId,
+                occurredAt: now,
+                payload: {
+                  ...oldRun,
+                  id: newerRunId,
+                  ordinal: oldRun.ordinal + 1,
+                  providerThreadId: newerProviderThreadId,
+                  status: "completed",
+                  startedAt: now,
+                  completedAt: now,
+                },
+              },
+              {
+                id: EventId.make(`event:switch-active-pt:${childThreadId}`),
+                type: "thread.provider-switched",
+                threadId: childThreadId,
+                occurredAt: now,
+                payload: {
+                  ...childBeforeSwitch.thread,
+                  activeProviderThreadId: newerProviderThreadId,
+                  updatedAt: now,
+                },
+              },
+            ],
+          });
+
+          // Release the gate agent so the workflow completes and must stop the older inactive provider roster.
+          yield* gateTurn.complete("gate-done");
+
+          const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
+          expect(terminal.status).toBe("completed");
+          expect(yield* Deferred.isDone(childTurn.interrupted)).toBe(true);
+
+          const childAfter = yield* orchestrator.getThreadProjection(childThreadId);
+          expect(
+            childAfter.providerThreads.every(
+              (pt) => (pt.pendingBackgroundTasks?.length ?? 0) === 0,
+            ),
+          ).toBe(true);
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }),
   );
 });

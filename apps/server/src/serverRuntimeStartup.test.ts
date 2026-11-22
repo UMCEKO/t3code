@@ -502,3 +502,133 @@ it.effect("recovers interrupted workflows before provider recovery and effect wo
     ]);
   }),
 );
+
+it.effect("blocks provider recovery and fails startup closed when workflow discovery fails", () =>
+  Effect.gen(function* () {
+    let providerRecoveryRan = false;
+    const aborted = yield* Deferred.make<void>();
+    const recovery = {
+      terminalizedRuns: 0,
+      stoppedSessions: 0,
+      closedRequests: 0,
+      retiredEffects: 0,
+      requeuedEffects: 0,
+    };
+    const imports = { importedThreadCount: 0, importedMessageCount: 0 };
+    const dependencies = Layer.mergeAll(
+      NodeCrypto.layer,
+      Path.layer,
+      Layer.mock(ServerConfig.ServerConfig)({
+        ...(yield* ServerConfig.deriveServerPaths("/workflow-discovery-fail", undefined).pipe(
+          Effect.provide(Path.layer),
+        )),
+        baseDir: "/workflow-discovery-fail",
+        logLevel: "Error",
+        traceMinLevel: "Info",
+        traceTimingEnabled: false,
+        traceBatchWindowMs: 200,
+        traceMaxBytes: 1024,
+        traceMaxFiles: 1,
+        otlpTracesUrl: undefined,
+        otlpMetricsUrl: undefined,
+        otlpLogsUrl: undefined,
+        otlpTracesExport: DEFAULT_SIGNAL_EXPORT,
+        otlpMetricsExport: DEFAULT_SIGNAL_EXPORT,
+        otlpLogsExport: DEFAULT_SIGNAL_EXPORT,
+        otelEnvironment: OtelEnvironment.none,
+        staticDir: undefined,
+        devAllowedOrigins: [],
+        desktopBootstrapToken: undefined,
+        logWebSocketEvents: false,
+        tailscaleServeEnabled: false,
+        tailscaleServePort: 443,
+        mode: "web",
+        cwd: "/workflow-discovery-fail",
+        host: "localhost",
+        port: 3773,
+        devUrl: undefined,
+        noBrowser: true,
+        startupPresentation: "browser",
+        autoBootstrapProjectFromCwd: false,
+      }),
+      Layer.mock(Keybindings.Keybindings)({ start: Effect.void }),
+      Layer.mock(LegacyV1ThreadImporter.LegacyV1ThreadImporter)({
+        pendingThreadCount: Effect.succeed(0),
+        reconcileShells: Effect.succeed(imports),
+        importPendingTranscripts: Effect.succeed(imports),
+      }),
+      Layer.mock(ProviderRuntimeRecovery.ProviderRuntimeRecoveryService)({
+        recover: Effect.sync(() => {
+          providerRecoveryRan = true;
+          return recovery;
+        }),
+        prepareForShutdown: Effect.void,
+        reconcile: () => Effect.succeed(recovery),
+      }),
+      Layer.mock(Orchestrator.OrchestratorV2)({ recoverDelegatedTasks: Effect.void }),
+      Layer.mock(ProviderSessionManager.ProviderSessionManagerV2)({ shutdown: Effect.void }),
+      Layer.mock(AgentAwarenessRelay.AgentAwarenessRelay)({ start: () => Effect.void }),
+      Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({ runOnce: () => Effect.never }),
+      Layer.mock(ServerLifecycleEvents.ServerLifecycleEvents)({
+        publish: (event) => Effect.succeed({ ...event, sequence: 1 }),
+      }),
+      Layer.mock(ServerSettings.ServerSettingsService)({
+        start: Effect.void,
+        getSettings: Effect.succeed(DEFAULT_SERVER_SETTINGS),
+      }),
+      Layer.mock(ServerEnvironment.ServerEnvironment)({
+        getDescriptor: Effect.succeed({
+          environmentId: EnvironmentId.make("fail-closed-environment"),
+          label: "Test environment",
+          platform: { os: "linux", arch: "x64" },
+          serverVersion: "0.0.0-test",
+          capabilities: { repositoryIdentity: true },
+        }),
+      }),
+      Layer.mock(ProjectStore.ProjectStoreV2)({}),
+      Layer.mock(ProjectService.ProjectService)({}),
+      Layer.mock(ThreadManagement.ThreadManagementService)({
+        countThreads: () => Effect.succeed(0),
+        listActiveShellIndex: () =>
+          Effect.fail(
+            new Orchestrator.OrchestratorProjectionError({
+              threadId: "thread:discovery-fail" as never,
+              cause: "transient sqlite busy",
+            }),
+          ),
+      }),
+      Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
+      Layer.mock(ServiceLauncherClient.ServiceLauncherClient)({
+        managed: false,
+        protocol: undefined,
+        prepareTrial: () => Effect.undefined,
+      }),
+      Layer.mock(GitVcsDriver.GitVcsDriver)({}),
+      Layer.mock(AnalyticsService.AnalyticsService)({}),
+      FileSystem.layerNoop({}),
+      Layer.mock(ServerSecretStore.ServerSecretStore)({ get: () => Effect.succeedNone }),
+      Layer.mock(EnvironmentAuth.EnvironmentAuth)({}),
+      Layer.mock(ExternalLauncher.ExternalLauncher)({}),
+      Layer.mock(HttpServer.HttpServer)({
+        address: NetAddress.inetAddressFromIpStringUnsafe("127.0.0.1", 3773),
+      }),
+    );
+    const exit = yield* Effect.gen(function* () {
+      const startup = yield* ServerRuntimeStartup.ServerRuntimeStartup;
+      yield* startup.markHttpListening;
+      const readyExit = yield* Effect.exit(startup.awaitCommandReady);
+      yield* Deferred.await(aborted);
+      return readyExit;
+    }).pipe(
+      Effect.provide(
+        ServerRuntimeStartup.layerWithOptions({
+          abort: () => Deferred.succeed(aborted, undefined).pipe(Effect.asVoid),
+        }).pipe(Layer.provide(dependencies)),
+      ),
+      Effect.provideService(ServerActivation, Effect.never),
+    );
+    assert.isTrue(Exit.isFailure(exit));
+    assert.isFalse(providerRecoveryRan);
+    assert.isTrue(yield* Deferred.isDone(aborted));
+  }),
+);

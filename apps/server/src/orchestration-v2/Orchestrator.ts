@@ -15157,6 +15157,103 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
     },
   );
 
+  const stopPendingProviderThreadRosters = Effect.fn(
+    "Orchestrator.stopPendingProviderThreadRosters",
+  )(function* (input: {
+    readonly command: Extract<OrchestrationV2ServerCommand, { readonly type: "thread.stop" }>;
+    readonly projection: Pick<OrchestrationV2ThreadProjection, "providerThreads">;
+    readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
+    readonly effects: Ref.Ref<Array<PendingOrchestrationEffectV2>>;
+  }) {
+    const { command, projection, events, effects } = input;
+    const pendingProviders = projection.providerThreads.filter(
+      (candidate) => (candidate.pendingBackgroundTasks?.length ?? 0) > 0,
+    );
+    if (pendingProviders.length === 0) return;
+
+    const existingEvents = yield* Ref.get(events);
+    const existingEffects = yield* Ref.get(effects);
+    const targetedProviderThreads = new Set<OrchestrationV2ProviderThread["id"]>();
+    for (const effect of existingEffects) {
+      if (effect.request.type === "provider-turn.interrupt") {
+        targetedProviderThreads.add(effect.request.providerThreadId);
+      }
+    }
+    const clearedProviderThreads = new Set<OrchestrationV2ProviderThread["id"]>();
+    for (const event of existingEvents) {
+      if (
+        event.type === "provider-thread.updated" &&
+        (event.payload.pendingBackgroundTasks?.length ?? 0) === 0
+      ) {
+        clearedProviderThreads.add(event.payload.id);
+      }
+    }
+    const remaining = pendingProviders.filter(
+      (candidate) =>
+        !targetedProviderThreads.has(candidate.id) && !clearedProviderThreads.has(candidate.id),
+    );
+    if (remaining.length === 0) return;
+
+    const { providerTurns } = yield* projectionStore
+      .getThreadRecords(command.threadId, ["providerTurns"])
+      .pipe(mapDispatchError(command));
+    const emitEvent = emit(events, command);
+    const now = yield* DateTime.now;
+    const extraInterrupts: Array<PendingOrchestrationEffectV2> = [];
+
+    for (const providerThread of remaining) {
+      const sessionOption =
+        providerThread.providerSessionId === null
+          ? Option.none()
+          : yield* providerSessions
+              .get(providerThread.providerSessionId)
+              .pipe(Effect.orElseSucceed(() => Option.none()));
+      if (Option.isSome(sessionOption) && providerThread.providerSessionId !== null) {
+        const latestTurn = providerTurns.findLast(
+          (candidate) => candidate.providerThreadId === providerThread.id,
+        );
+        if (latestTurn !== undefined) {
+          extraInterrupts.push({
+            id: `effect:${command.commandId}:provider-turn.interrupt:${latestTurn.id}`,
+            commandId: command.commandId,
+            threadId: command.threadId,
+            request: {
+              type: "provider-turn.interrupt",
+              providerSessionId: providerThread.providerSessionId,
+              providerThreadId: providerThread.id,
+              providerTurnId: latestTurn.id,
+            },
+          });
+          continue;
+        }
+        const stillPending =
+          sessionOption.value.hasPendingBackgroundWorkForThread === undefined
+            ? false
+            : yield* sessionOption.value
+                .hasPendingBackgroundWorkForThread(providerThread)
+                .pipe(Effect.catchCause(() => Effect.succeed(true)));
+        if (stillPending) continue;
+      }
+      yield* emitEvent({
+        type: "provider-thread.updated",
+        threadId: command.threadId,
+        driver: providerThread.driver,
+        providerInstanceId: providerThread.providerInstanceId,
+        occurredAt: now,
+        payload: {
+          ...providerThread,
+          status: providerThread.status === "active" ? "idle" : providerThread.status,
+          pendingBackgroundTasks: [],
+          updatedAt: now,
+        },
+      });
+    }
+
+    if (extraInterrupts.length > 0) {
+      yield* Ref.update(effects, (existing) => [...existing, ...extraInterrupts]);
+    }
+  });
+
   const dispatchThreadStop = Effect.fn("Orchestrator.dispatchThreadStop")(function* (
     command: Extract<OrchestrationV2ServerCommand, { readonly type: "thread.stop" }>,
     events: Ref.Ref<Array<OrchestrationV2DomainEvent>>,
@@ -15219,6 +15316,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         const enqueued = yield* Ref.get(interruptEffects);
         yield* Ref.update(events, (existing) => [...existing, ...written]);
         yield* Ref.update(effects, (existing) => [...existing, ...enqueued]);
+        yield* stopPendingProviderThreadRosters({ command, projection, events, effects });
         yield* cancelIdleOrphans({ command, events, projection });
         yield* stopDelegatedTasks;
         return interrupted.value;
@@ -15269,6 +15367,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
         now,
       });
     }
+    yield* stopPendingProviderThreadRosters({ command, projection, events, effects });
     yield* holdStoppedThread({ command, events, projection, cohortRunIds: [], now });
     yield* cancelIdleOrphans({ command, events, projection });
     yield* stopDelegatedTasks;

@@ -100,6 +100,7 @@ export const restartStopRequested = Effect.fn("RestartContinuation.restartStopRe
     ) => Effect.Effect<ProjectionRecords<K>, E>,
     thread: Pick<ProjectionRuntimeRecoveryState["thread"], "id" | "lineage" | "forkedFrom">,
     source: Pick<OrchestrationV2Run, "id" | "delegatedTaskId">,
+    options?: { readonly serverRestart?: boolean },
   ) {
     const { turnItems } = yield* getThreadRecords(thread.id, ["turnItems"], {
       turnItemRunIds: [source.id],
@@ -123,12 +124,14 @@ export const restartStopRequested = Effect.fn("RestartContinuation.restartStopRe
       const owner = (yield* getThreadRecords(lineage.parentThreadId, ["subagents"], {
         subagentIds: [task.parentNodeId],
       })).subagents.find((candidate) => candidate.id === task.parentNodeId);
-      // A server workflow that is stopping or ended owns its agents' threads: nothing resumes there.
+      // Server workflows never survive a server restart; fail closed even if cleanup has not marked them yet.
       if (
         owner?.origin === "app_owned" &&
         owner.childThreadId === null &&
         owner.workflow !== undefined &&
-        (owner.workflow.stopRequestedAt !== undefined || !isOrchestrationV2WorkActive(owner.status))
+        (options?.serverRestart === true ||
+          owner.workflow.stopRequestedAt !== undefined ||
+          !isOrchestrationV2WorkActive(owner.status))
       )
         return true;
     }
@@ -320,7 +323,12 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
       });
       return;
     }
-    if (yield* restartStopRequested(threads.getThreadRecords, projection.thread, source)) return;
+    if (
+      yield* restartStopRequested(threads.getThreadRecords, projection.thread, source, {
+        serverRestart: input.cause === "server_restart",
+      })
+    )
+      return;
     const sourceMessage = (yield* threads.getThreadRecords(input.threadId, ["messages"], {
       messageIds: [source.userMessageId],
     })).messages.find((message) => message.id === source.userMessageId);

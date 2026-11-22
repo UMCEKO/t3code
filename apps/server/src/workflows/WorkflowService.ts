@@ -53,6 +53,7 @@ import * as FileSystem from "effect/FileSystem";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as Path from "effect/Path";
+import * as PlatformError from "effect/PlatformError";
 import * as Queue from "effect/Queue";
 import * as Random from "effect/Random";
 import * as Result from "effect/Result";
@@ -70,8 +71,9 @@ import {
   type Caller,
 } from "../mcp/threadAccess.ts";
 import { DispatchModeLimit } from "../orchestration-v2/DispatchModeLimit.ts";
+import * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
+import * as ProjectionStore from "../orchestration-v2/ProjectionStore.ts";
 import * as ThreadManagementService from "../orchestration-v2/ThreadManagementService.ts";
-import type * as Orchestrator from "../orchestration-v2/Orchestrator.ts";
 import { checkOutput, type OutputRejection } from "../orchestration-v2/runOutput.ts";
 import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
 import {
@@ -721,6 +723,18 @@ const runMetaPathIn = (path: Path.Path, workflowsDir: string, runId: string): st
 const journalPathIn = (path: Path.Path, workflowsDir: string, runId: string): string =>
   path.join(runDirIn(path, workflowsDir, runId), "journal.jsonl");
 
+const isPlatformNotFound = (cause: unknown): boolean =>
+  PlatformError.isPlatformError(cause) && cause.reason._tag === "NotFound";
+
+const isOrchestratorProjectionError = Schema.is(Orchestrator.OrchestratorProjectionError);
+const isProjectionStoreThreadNotFoundError = Schema.is(
+  ProjectionStore.ProjectionStoreThreadNotFoundError,
+);
+
+const isThreadNotFound = (cause: unknown): boolean =>
+  isProjectionStoreThreadNotFoundError(cause) ||
+  (isOrchestratorProjectionError(cause) && isProjectionStoreThreadNotFoundError(cause.cause));
+
 const readPersistedRunWith = Effect.fn("WorkflowService.readPersistedRun")(function* (
   deps: {
     readonly fileSystem: FileSystem.FileSystem;
@@ -731,12 +745,13 @@ const readPersistedRunWith = Effect.fn("WorkflowService.readPersistedRun")(funct
 ) {
   if (!isSafeRunId(runId)) return Option.none<PersistedWorkflowRun>();
   const metaPath = runMetaPathIn(deps.path, deps.workflowsDir, runId);
-  const exists = yield* deps.fileSystem.exists(metaPath).pipe(Effect.orElseSucceed(() => false));
-  if (!exists) return Option.none<PersistedWorkflowRun>();
-  const content = yield* deps.fileSystem
-    .readFileString(metaPath)
-    .pipe(Effect.mapError(() => failure("orchestration_error", `Unable to read ${metaPath}.`)));
-  return yield* decodePersistedWorkflowRun(content).pipe(Effect.option);
+  const contentOption = yield* deps.fileSystem.readFileString(metaPath).pipe(
+    Effect.asSome,
+    Effect.catchIf(isPlatformNotFound, () => Effect.succeed(Option.none<string>())),
+    Effect.mapError(() => failure("orchestration_error", `Unable to read ${metaPath}.`)),
+  );
+  if (Option.isNone(contentOption)) return Option.none<PersistedWorkflowRun>();
+  return yield* decodePersistedWorkflowRun(contentOption.value).pipe(Effect.option);
 });
 
 const writePersistedRunStrictWith = Effect.fn("WorkflowService.writePersistedRunStrict")(function* (
@@ -780,10 +795,16 @@ const readWorkflowTaskStrict = Effect.fn("WorkflowService.readWorkflowTaskStrict
 ) {
   const shell = yield* threadManagement.getThreadShell(threadId);
   if (shell === null || shell.deletedAt !== null) return undefined;
-  const { subagents } = yield* threadManagement.getThreadRecords(threadId, ["subagents"], {
-    subagentIds: [taskId],
-  });
-  return subagents.find((candidate) => candidate.id === taskId);
+  const records = yield* threadManagement
+    .getThreadRecords(threadId, ["subagents"], {
+      subagentIds: [taskId],
+    })
+    .pipe(
+      Effect.asSome,
+      Effect.catchIf(isThreadNotFound, () => Effect.succeedNone),
+    );
+  if (Option.isNone(records)) return undefined;
+  return records.value.subagents.find((candidate) => candidate.id === taskId);
 });
 
 function buildStoppedSnapshotFromSql(
@@ -1328,21 +1349,26 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
   const keyFor = (parentThreadId: ThreadId, taskId: NodeId | null, runId: string | undefined) =>
     taskId !== null ? `task:${parentThreadId}:${taskId}` : `run:${runId ?? ""}`;
 
-  // 1. Discover every SQL-running workflow so terminal or missing run.json rows are reconciled too.
+  // 1. Discover every SQL-running workflow; discovery failures must fail startup closed before provider recovery.
   const activeShells = yield* threadManagement
     .listActiveShellIndex()
     .pipe(
-      Effect.catch((error) =>
-        Effect.logWarning("workflow.startup-sweep.list-shells-failed", { error }).pipe(
-          Effect.as([] as const),
-        ),
+      Effect.tapError((error) =>
+        Effect.logError("workflow.startup-sweep.list-shells-failed", { error }),
       ),
     );
   for (const shell of activeShells) {
     if (!shell.mayBeLive) continue;
-    const records = yield* threadManagement
-      .getThreadRecords(shell.id, ["subagents"])
-      .pipe(Effect.option);
+    const records = yield* threadManagement.getThreadRecords(shell.id, ["subagents"]).pipe(
+      Effect.asSome,
+      Effect.catchIf(isThreadNotFound, () => Effect.succeedNone),
+      Effect.tapError((error) =>
+        Effect.logError("workflow.startup-sweep.read-subagents-failed", {
+          threadId: shell.id,
+          error,
+        }),
+      ),
+    );
     if (Option.isNone(records)) continue;
     for (const subagent of records.value.subagents) {
       if (!isAppOwnedWorkflowTask(subagent) || isTerminalSubagentStatus(subagent.status)) continue;
@@ -1350,11 +1376,7 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
       const persisted =
         runId === undefined
           ? undefined
-          : Option.getOrUndefined(
-              yield* readPersistedRunWith(storeDeps, runId).pipe(
-                Effect.orElseSucceed(() => Option.none<PersistedWorkflowRun>()),
-              ),
-            );
+          : Option.getOrUndefined(yield* readPersistedRunWith(storeDeps, runId));
       candidatesByKey.set(keyFor(shell.id, subagent.id, runId), {
         runId,
         parentThreadId: shell.id,
@@ -1368,16 +1390,21 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
   // 2. Discover running run.json entries (covers SQL-terminal and crashed-before-start runs).
   const dirExists = yield* fileSystem
     .exists(serverConfig.workflowsDir)
-    .pipe(Effect.orElseSucceed(() => false));
+    .pipe(
+      Effect.tapError((error) =>
+        Effect.logError("workflow.startup-sweep.workflows-dir-exists-failed", { error }),
+      ),
+    );
   if (dirExists) {
-    const entries = yield* fileSystem
-      .readDirectory(serverConfig.workflowsDir)
-      .pipe(Effect.orElseSucceed(() => [] as ReadonlyArray<string>));
+    const entries = yield* fileSystem.readDirectory(serverConfig.workflowsDir).pipe(
+      Effect.catchIf(isPlatformNotFound, () => Effect.succeed([] as ReadonlyArray<string>)),
+      Effect.tapError((error) =>
+        Effect.logError("workflow.startup-sweep.workflows-dir-read-failed", { error }),
+      ),
+    );
     for (const entry of entries) {
       if (!isSafeRunId(entry)) continue;
-      const persisted = yield* readPersistedRunWith(storeDeps, entry).pipe(
-        Effect.orElseSucceed(() => Option.none<PersistedWorkflowRun>()),
-      );
+      const persisted = yield* readPersistedRunWith(storeDeps, entry);
       if (Option.isNone(persisted)) continue;
       const record = persisted.value;
       const candidateKey = keyFor(record.threadId, record.taskId, record.runId);
@@ -1387,7 +1414,14 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
         record.taskId === null
           ? undefined
           : yield* readWorkflowTaskStrict(threadManagement, record.threadId, record.taskId).pipe(
-              Effect.orElseSucceed(() => undefined),
+              Effect.tapError((error) =>
+                Effect.logError("workflow.startup-sweep.read-task-failed", {
+                  runId: record.runId,
+                  threadId: record.threadId,
+                  taskId: record.taskId,
+                  error,
+                }),
+              ),
             );
       candidatesByKey.set(candidateKey, {
         runId: record.runId,
@@ -1676,8 +1710,8 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
       }
       yield* reconcilePersistedAfterCleanup(sqlTask, shouldConfirmChildren);
     }).pipe(
-      Effect.catchDefect((cause) =>
-        Effect.logWarning("workflow.startup-sweep.entry-defect", {
+      Effect.tapDefect((cause) =>
+        Effect.logError("workflow.startup-sweep.entry-defect", {
           runId: candidate.runId,
           taskId: candidate.taskId,
           cause,
