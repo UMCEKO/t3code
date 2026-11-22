@@ -23,6 +23,7 @@ export const readContainedWorkflowFile = Effect.fn("orchestration.readContainedW
     readonly byteCap: number;
     readonly tail?: boolean;
     readonly configDir?: string;
+    readonly extraRoots?: ReadonlyArray<string>;
     /** Reads complete lines from a byte offset; resets to zero after shrinkage or inode changes. */
     readonly fromOffset?: {
       readonly offset: number;
@@ -37,15 +38,30 @@ export const readContainedWorkflowFile = Effect.fn("orchestration.readContainedW
     }
 
     const home = yield* HostProcess.HomeDirectory;
-    const root = yield* Effect.tryPromise({
-      try: () => NodeFSP.realpath(workflowFilesRoot(home, input.configDir)),
-      catch: (cause) =>
-        new OrchestrationWorkflowFileError({
-          reason: "root-unavailable",
-          path: input.path,
-          cause,
-        }),
-    });
+    const candidateRoots = [
+      workflowFilesRoot(home, input.configDir),
+      ...(input.extraRoots ?? []).map((root) => root.trim()).filter((root) => root.length > 0),
+    ];
+    const resolvedRoots: Array<string> = [];
+    let lastRootCause: unknown;
+    for (const candidate of candidateRoots) {
+      const resolvedRoot = yield* Effect.tryPromise({
+        try: () => NodeFSP.realpath(candidate),
+        catch: (cause) => cause,
+      }).pipe(Effect.result);
+      if (resolvedRoot._tag === "Success") {
+        resolvedRoots.push(resolvedRoot.success);
+      } else {
+        lastRootCause = resolvedRoot.failure;
+      }
+    }
+    if (resolvedRoots.length === 0) {
+      return yield* new OrchestrationWorkflowFileError({
+        reason: "root-unavailable",
+        path: input.path,
+        cause: lastRootCause,
+      });
+    }
 
     // Resolve the file itself; contained directories can still hold escaping symlinks.
     const resolved = yield* Effect.tryPromise({
@@ -54,7 +70,11 @@ export const readContainedWorkflowFile = Effect.fn("orchestration.readContainedW
         new OrchestrationWorkflowFileError({ reason: "not-found", path: input.path, cause }),
     });
 
-    if (resolved !== root && !resolved.startsWith(`${root}${NodePath.sep}`)) {
+    if (
+      !resolvedRoots.some(
+        (root) => resolved === root || resolved.startsWith(`${root}${NodePath.sep}`),
+      )
+    ) {
       return yield* new OrchestrationWorkflowFileError({ reason: "outside-root", path: resolved });
     }
     if (NodePath.extname(resolved) !== input.extension) {
