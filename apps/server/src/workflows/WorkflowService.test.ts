@@ -74,7 +74,14 @@ import * as ScheduledTaskService from "../scheduledTasks/ScheduledTaskService.ts
 import * as SecretRequests from "../secrets/SecretRequests.ts";
 import * as ServerSettings from "../serverSettings.ts";
 import * as GitVcsDriver from "../vcs/GitVcsDriver.ts";
-import { agentCallKey, decodeJournal } from "./journal.ts";
+import {
+  JournalRecordTooLargeError,
+  MAX_JOURNAL_LINE_BYTES,
+  agentCallKey,
+  decodeJournal,
+  makeJournalWriter,
+  type JournalEntry,
+} from "./journal.ts";
 import { getUnconfirmedSandboxChildPids, reapUnconfirmedSandboxChildren } from "./sandbox.ts";
 import * as WorkflowService from "./WorkflowService.ts";
 
@@ -4988,10 +4995,15 @@ return { out };`,
                   const parsed = JSON.parse(raw) as {
                     readonly status?: string;
                     readonly cleanupPending?: boolean;
+                    readonly sandboxCleanupPending?: { readonly pid?: number };
                   };
-                  if (parsed.status === "running" && parsed.cleanupPending === true) {
+                  if (parsed.status === "running" && parsed.sandboxCleanupPending !== undefined) {
                     yield* Deferred.succeed(cleanupPendingMetaWritten, undefined);
-                  } else if (parsed.status === "cancelled" && parsed.cleanupPending === undefined) {
+                  } else if (
+                    parsed.status === "cancelled" &&
+                    parsed.cleanupPending === undefined &&
+                    parsed.sandboxCleanupPending === undefined
+                  ) {
                     yield* Deferred.succeed(cancelledMetaWritten, undefined);
                   }
                 }
@@ -5110,9 +5122,12 @@ return { out };`,
           const midMeta = JSON.parse(yield* fs.readFileString(metaPath)) as {
             readonly status: string;
             readonly cleanupPending?: boolean;
+            readonly sandboxCleanupPending?: { readonly pid?: number; readonly startTime?: string };
           };
           expect(midMeta.status).toBe("running");
-          expect(midMeta.cleanupPending).toBe(true);
+          expect(midMeta.cleanupPending).toBeUndefined();
+          expect(midMeta.sandboxCleanupPending?.pid).toBe(childPid);
+          expect(midMeta.sandboxCleanupPending?.startTime).toBeDefined();
 
           const refusedResume = yield* callTool("t3_workflow_run", {
             scriptPath: started.scriptPath,
@@ -5144,9 +5159,11 @@ return { out };`,
           const finalMeta = JSON.parse(yield* fs.readFileString(metaPath)) as {
             readonly status: string;
             readonly cleanupPending?: boolean;
+            readonly sandboxCleanupPending?: { readonly pid?: number };
           };
           expect(finalMeta.status).toBe("cancelled");
           expect(finalMeta.cleanupPending).toBeUndefined();
+          expect(finalMeta.sandboxCleanupPending).toBeUndefined();
           expect(getUnconfirmedSandboxChildPids()).not.toContain(childPid);
         }).pipe(
           Effect.provide(stopHarness.layerToolkit),
@@ -5271,6 +5288,7 @@ return { out };`,
         let dualRealKill: NodeChildProcess.ChildProcessWithoutNullStreams["kill"] | undefined;
         const dualFirstKillFailed = yield* Deferred.make<void>();
         const dualCleanupPendingWritten = yield* Deferred.make<void>();
+        const dualChildOnlyPendingWritten = yield* Deferred.make<void>();
         const dualChildConfirmStarted = yield* Deferred.make<void>();
         const dualSandboxExited = yield* Deferred.make<void>();
         const dualCancelledWritten = yield* Deferred.make<void>();
@@ -5331,10 +5349,21 @@ return { out };`,
                   const parsed = JSON.parse(raw) as {
                     readonly status?: string;
                     readonly cleanupPending?: boolean;
+                    readonly sandboxCleanupPending?: { readonly pid?: number };
                   };
-                  if (parsed.status === "running" && parsed.cleanupPending === true) {
+                  if (parsed.status === "running" && parsed.sandboxCleanupPending !== undefined) {
                     yield* Deferred.succeed(dualCleanupPendingWritten, undefined);
-                  } else if (parsed.status === "cancelled" && parsed.cleanupPending === undefined) {
+                  } else if (
+                    parsed.status === "running" &&
+                    parsed.cleanupPending === true &&
+                    parsed.sandboxCleanupPending === undefined
+                  ) {
+                    yield* Deferred.succeed(dualChildOnlyPendingWritten, undefined);
+                  } else if (
+                    parsed.status === "cancelled" &&
+                    parsed.cleanupPending === undefined &&
+                    parsed.sandboxCleanupPending === undefined
+                  ) {
                     yield* Deferred.succeed(dualCancelledWritten, undefined);
                   }
                 }
@@ -5410,6 +5439,7 @@ return { out };`,
           dualAllowSandboxKill = true;
           yield* TestClock.adjust("50 millis");
           yield* Deferred.await(dualSandboxExited);
+          yield* Deferred.await(dualChildOnlyPendingWritten);
           expect(dualKillAttempts).toBeGreaterThanOrEqual(3);
           expect(getUnconfirmedSandboxChildPids()).not.toContain(dualPid);
 
@@ -5421,9 +5451,11 @@ return { out };`,
           const midMeta = JSON.parse(yield* fs.readFileString(metaPath)) as {
             readonly status: string;
             readonly cleanupPending?: boolean;
+            readonly sandboxCleanupPending?: { readonly pid?: number; readonly startTime?: string };
           };
           expect(midMeta.status).toBe("running");
           expect(midMeta.cleanupPending).toBe(true);
+          expect(midMeta.sandboxCleanupPending).toBeUndefined();
 
           // Once the child also confirms stopped, terminal settlement completes.
           dualHoldChildUnconfirmed = false;
@@ -6055,7 +6087,8 @@ return { out };`,
             scriptPath,
             `export const meta = { name: "LargeValidJournal", description: "Valid journal exceeding 64 MiB." };
             const first = await agent("First cached step");
-            return { first };`,
+            const second = await agent("Second large cached step");
+            return { first, secondLength: second.length, secondHead: second.slice(0, 8) };`,
           );
 
           const started = yield* orchestrator.dispatch({
@@ -6095,6 +6128,9 @@ return { out };`,
           const firstKey = agentCallKey("First cached step", {
             modelSelection: { instanceId, model },
           });
+          const secondKey = agentCallKey("Second large cached step", {
+            modelSelection: { instanceId, model },
+          });
           const largePayload = "a".repeat(3_500_000);
           yield* fs.writeFileString(
             journalPath,
@@ -6115,7 +6151,8 @@ return { out };`,
             })}\n`,
           );
           for (let i = 1; i <= 20; i += 1) {
-            const key = `k_${i}`;
+            const key = i === 1 ? secondKey : `k_${i}`;
+            const value = i === 1 ? `bulk-01-${"a".repeat(3_500_000 - 8)}` : largePayload;
             yield* fs.writeFileString(
               journalPath,
               `${JSON.stringify({
@@ -6131,7 +6168,7 @@ return { out };`,
                 index: i,
                 key,
                 outcome: "ok",
-                value: largePayload,
+                value,
               })}\n`,
               { flag: "a" },
             );
@@ -6183,12 +6220,32 @@ return { out };`,
           };
         }).pipe(Effect.provide(harness1.layerToolkit));
 
+        const resumeReads: Array<{ readonly offset: number; readonly length: number }> = [];
+        let resumeJournalPath = "";
         const harness2 = yield* makeWorkflowHarness({
           name: "large-valid-journal-recover",
           databaseLayer,
           baseDir: sharedBaseDir,
+          wrapScriptFileOpener: (openFile) => (filePath) =>
+            openFile(filePath).pipe(
+              Effect.map((handle) => ({
+                ...handle,
+                ...(handle.readAt === undefined
+                  ? {}
+                  : {
+                      readAt: (offset: number, length: number) => {
+                        if (filePath === resumeJournalPath) {
+                          resumeReads.push({ offset, length });
+                        }
+                        return handle.readAt!(offset, length);
+                      },
+                    }),
+              })),
+            ),
         });
         yield* Effect.gen(function* () {
+          const config = yield* ServerConfig.ServerConfig;
+          resumeJournalPath = path.join(config.workflowRunsDir, seeded.runId, "journal.jsonl");
           const orchestrator = yield* Orchestrator.OrchestratorV2;
           const recoverExit = yield* WorkflowService.recoverInterruptedWorkflows.pipe(Effect.exit);
           expect(Exit.isSuccess(recoverExit)).toBe(true);
@@ -6212,7 +6269,7 @@ return { out };`,
           expect(statusRes.agents.completed).toBe(21);
           expect(statusRes.agents.failed).toBe(1);
 
-          // Resume from the >64 MiB journal replays index 0 without starting a new child turn.
+          // Resume from the >64 MiB journal replays index 0 on demand without retaining the 20 x 3.5 MiB bodies.
           const beforeResumeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
           const resumeCall = yield* callTool("t3_workflow_run", {
             scriptPath: seeded.scriptPath,
@@ -6223,6 +6280,659 @@ return { out };`,
           const resumeTerminal = yield* awaitWorkflowTerminal(resumed.taskId, beforeResumeSeq);
           expect(resumeTerminal.status).toBe("completed");
           expect(resumeTerminal.result).toContain("cached-from-large-journal");
+          expect(resumeTerminal.result).toContain("3500000");
+          expect(resumeTerminal.result).toContain("bulk-01-");
+          expect(resumeReads).toHaveLength(2);
+          expect(resumeReads[0]!.length).toBeLessThan(1_024);
+          expect(resumeReads[1]!.length).toBeGreaterThan(3_500_000);
+        }).pipe(Effect.provide(harness2.layerToolkit));
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "startup sweep does not stall when a child's first confirmation read hangs right after stop dispatch",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedBaseDir = yield* fs.realPath(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-stalled-first-confirm-" }),
+        );
+        const sharedDbContext = yield* Layer.build(SqlitePersistence.layerMemory);
+        const databaseLayer = Layer.succeedContext(sharedDbContext);
+
+        const harness1 = yield* makeWorkflowHarness({
+          name: "stalled-first-confirm-seed",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+        });
+
+        const seeded = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcpService = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const config = yield* ServerConfig.ServerConfig;
+          const parentTurn = yield* startParentThreadAndRun(
+            harness1.turnQueue,
+            harness1.cwd,
+            "stalled-first-confirm",
+          );
+          const parentRun = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
+            (r) => r.id === parentTurn.turn.runId,
+          )!;
+
+          const runId = "wf_stallfirst01";
+          const dir = path.join(config.workflowRunsDir, runId);
+          const scriptPath = path.join(dir, "script.js");
+          const journalPath = path.join(dir, "journal.jsonl");
+          const metaPath = path.join(dir, "run.json");
+          yield* fs.makeDirectory(dir, { recursive: true });
+          yield* fs.writeFileString(
+            scriptPath,
+            `export const meta = { name: "StallFirstConfirm", description: "Stalled first confirmation read." }; return 1;`,
+          );
+          yield* fs.writeFileString(journalPath, "");
+
+          const started = yield* orchestrator.dispatch({
+            type: "workflow.start",
+            commandId: CommandId.make("command:stalled-first-confirm:workflow-start"),
+            parentThreadId,
+            parentRunId: parentRun.id,
+            parentNodeId: parentRun.rootNodeId!,
+            title: "StallFirstConfirm",
+            description: "Stalled first confirmation read.",
+            modelSelection,
+            workflow: {
+              name: "StallFirstConfirm",
+              runHandles: { runId, scriptPath, transcriptDir: dir },
+              phases: [],
+              agents: [],
+            },
+          });
+          const taskEvent = started.storedEvents.find(
+            (s) => s.event.type === "subagent.updated" && s.event.payload.origin === "app_owned",
+          );
+          if (taskEvent?.event.type !== "subagent.updated") {
+            throw new Error("missing workflow task");
+          }
+          const taskId = taskEvent.event.payload.id;
+
+          const child = yield* mcpService.delegateWorkflowAgent(parentScope, {
+            parentRunId: parentRun.id,
+            workflowNodeId: taskId,
+            requestKey: `${runId}:0`,
+            task: { task: "Stalling child", title: "Stalling child" },
+          });
+          yield* Queue.take(harness1.turnQueue);
+
+          yield* fs.writeFileString(
+            metaPath,
+            JSON.stringify({
+              runId,
+              threadId: parentThreadId,
+              taskId,
+              name: "StallFirstConfirm",
+              scriptPath,
+              journalPath,
+              startedAt: 0,
+              status: "running",
+              usage: {
+                agents: 1,
+                done: 0,
+                errors: 0,
+                empty: 0,
+                cached: 0,
+                tokens: 0,
+                durationMs: 0,
+              },
+            }),
+          );
+          return { runId, taskId, metaPath, childThreadId: child.childThreadId };
+        }).pipe(Effect.provide(harness1.layerToolkit));
+
+        let stopDispatched = false;
+        let stallFirstRead = true;
+        const firstReadStalled = yield* Deferred.make<void>();
+        const finalMetaWritten = yield* Deferred.make<void>();
+
+        const harness2 = yield* makeWorkflowHarness({
+          name: "stalled-first-confirm-recover",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+          wrapFileSystem: (fsService) => ({
+            ...fsService,
+            rename: (oldPath, newPath) =>
+              fsService
+                .rename(oldPath, newPath)
+                .pipe(
+                  Effect.tap(() =>
+                    !stallFirstRead && newPath === seeded.metaPath
+                      ? Deferred.succeed(finalMetaWritten, undefined)
+                      : Effect.void,
+                  ),
+                ),
+          }),
+          wrapThreadManagement: (tm) => ({
+            ...tm,
+            cancelDelegatedTask: (input) =>
+              tm.cancelDelegatedTask(input).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    if (input.command.threadId === seeded.childThreadId) {
+                      stopDispatched = true;
+                    }
+                  }),
+                ),
+              ),
+            getThreadRecords: ((threadId, fields, filter) =>
+              Effect.gen(function* () {
+                if (threadId === seeded.childThreadId && stopDispatched && stallFirstRead) {
+                  yield* Deferred.succeed(firstReadStalled, undefined);
+                  return yield* Effect.never;
+                }
+                return yield* tm.getThreadRecords(threadId, fields, filter);
+              })) as typeof tm.getThreadRecords,
+          }),
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const beforeRecoverSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          const sweepFiber = yield* WorkflowService.recoverInterruptedWorkflows.pipe(
+            Effect.forkScoped,
+          );
+          yield* Deferred.await(firstReadStalled);
+          yield* TestClock.adjust("2 seconds");
+          yield* Fiber.join(sweepFiber);
+
+          const midTask = (yield* orchestrator.getThreadProjection(parentThreadId)).subagents.find(
+            (s) => s.id === seeded.taskId,
+          );
+          expect(midTask?.status).toBe("running");
+          expect(midTask?.workflow?.stopRequestedAt).toBeDefined();
+          const midMeta = JSON.parse(yield* fs.readFileString(seeded.metaPath)) as {
+            readonly status: string;
+            readonly cleanupPending?: boolean;
+          };
+          expect(midMeta.status).toBe("running");
+          expect(midMeta.cleanupPending).toBe(true);
+
+          // Once the stalled read clears, background cleanup finishes recovery.
+          stallFirstRead = false;
+          yield* TestClock.adjust("50 millis");
+          const terminal = yield* awaitWorkflowTerminal(seeded.taskId, beforeRecoverSeq);
+          expect(terminal.status).toBe("failed");
+          yield* Deferred.await(finalMetaWritten);
+          const finalMeta = JSON.parse(yield* fs.readFileString(seeded.metaPath)) as {
+            readonly status: string;
+            readonly cleanupPending?: boolean;
+          };
+          expect(finalMeta.status).toBe("failed");
+          expect(finalMeta.cleanupPending).toBeUndefined();
+        }).pipe(Effect.provide(harness2.layerToolkit));
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "restart preserves sandbox cleanup gate after unconfirmed shutdown termination until verified process exit",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedBaseDir = yield* fs.realPath(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-sandbox-restart-gate-" }),
+        );
+        const sharedDbContext = yield* Layer.build(SqlitePersistence.layerMemory);
+        const databaseLayer = Layer.succeedContext(sharedDbContext);
+
+        const workerModuleUrl = new URL("./sandboxWorker.ts", import.meta.url).href;
+        const pinnedWorkerCommand = {
+          command: process.execPath,
+          args: [
+            "-e",
+            `setInterval(() => {}, 60_000); import(${JSON.stringify(workerModuleUrl)}).then((m) => m.runWorkflowSandboxWorker());`,
+          ],
+          env: { ELECTRON_RUN_AS_NODE: "1" },
+        };
+
+        let shutdownChild: NodeChildProcess.ChildProcessWithoutNullStreams | undefined;
+        let shutdownRealKill: NodeChildProcess.ChildProcessWithoutNullStreams["kill"] | undefined;
+        const harness1 = yield* makeWorkflowHarness({
+          name: "sandbox-restart-gate-1",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+          wrapSandboxRunner: (runner) => (input) =>
+            runner({
+              ...input,
+              maxKillAttempts: 2,
+              killRetryDelayMs: 0,
+              spawnCommand: pinnedWorkerCommand,
+              spawnChild: (command, args, opts) => {
+                const child = NodeChildProcess.spawn(command, args, opts);
+                shutdownChild = child;
+                shutdownRealKill = child.kill.bind(child);
+                child.kill = (() => {
+                  const err = new Error("Operation not permitted") as Error & { code: string };
+                  err.code = "EPERM";
+                  throw err;
+                }) as typeof child.kill;
+                return child;
+              },
+            }),
+        });
+
+        const serviceScope = yield* Scope.make();
+        const serviceContext = yield* Layer.buildWithScope(harness1.layerToolkit, serviceScope);
+        yield* Effect.gen(function* () {
+          const started = yield* Effect.gen(function* () {
+            const config = yield* ServerConfig.ServerConfig;
+            yield* startParentThreadAndRun(
+              harness1.turnQueue,
+              harness1.cwd,
+              "sandbox-restart-gate",
+            );
+            const runCall = yield* callTool("t3_workflow_run", {
+              script: `
+                export const meta = { name: "SandboxRestartGate", description: "Survives shutdown kill." };
+                await agent("Child stopped on restart");
+                return "unreachable";
+              `,
+            });
+            expect(runCall.isError).not.toBe(true);
+            const result = yield* decodeRunResult(runCall.structuredContent);
+            yield* Queue.take(harness1.turnQueue);
+            return {
+              ...result,
+              metaPath: path.join(config.workflowRunsDir, result.runId, "run.json"),
+            };
+          }).pipe(Effect.provide(serviceContext));
+
+          const workerPid = shutdownChild?.pid;
+          expect(workerPid).toBeDefined();
+
+          // Shut down server #1 while sandbox kill fails with EPERM.
+          yield* Scope.close(serviceScope, Exit.void);
+          expect(getUnconfirmedSandboxChildPids()).toContain(workerPid);
+
+          const metaAfterShutdown = JSON.parse(yield* fs.readFileString(started.metaPath)) as {
+            readonly status: string;
+            readonly cleanupPending?: boolean;
+            readonly sandboxCleanupPending?: {
+              readonly pid?: number;
+              readonly startTime?: string;
+            };
+          };
+          expect(metaAfterShutdown.status).toBe("running");
+          expect(metaAfterShutdown.cleanupPending).toBeUndefined();
+          expect(metaAfterShutdown.sandboxCleanupPending?.pid).toBe(workerPid);
+          expect(metaAfterShutdown.sandboxCleanupPending?.startTime).toBeDefined();
+
+          // Server #2 restarts while the old sandbox worker is still alive.
+          const finalMetaWritten = yield* Deferred.make<void>();
+          let sandboxKilled = false;
+          const harness2 = yield* makeWorkflowHarness({
+            name: "sandbox-restart-gate-2",
+            databaseLayer,
+            baseDir: sharedBaseDir,
+            wrapFileSystem: (fsService) => ({
+              ...fsService,
+              rename: (oldPath, newPath) =>
+                fsService
+                  .rename(oldPath, newPath)
+                  .pipe(
+                    Effect.tap(() =>
+                      sandboxKilled && newPath === started.metaPath
+                        ? Deferred.succeed(finalMetaWritten, undefined)
+                        : Effect.void,
+                    ),
+                  ),
+            }),
+          });
+
+          yield* Effect.gen(function* () {
+            const orchestrator = yield* Orchestrator.OrchestratorV2;
+            const config = yield* ServerConfig.ServerConfig;
+            const beforeRecoverSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+            // Seed two extra terminal runs: one with unverifiable sandbox identity (missing startTime)
+            // and one whose recorded PID matches this live process with a stale startTime (PID reuse).
+            const unverifiableRunId = "wf_unverifiable01";
+            const unverifiableDir = path.join(config.workflowRunsDir, unverifiableRunId);
+            const unverifiableScript = path.join(unverifiableDir, "script.js");
+            const unverifiableJournal = path.join(unverifiableDir, "journal.jsonl");
+            const unverifiableMetaPath = path.join(unverifiableDir, "run.json");
+            yield* fs.makeDirectory(unverifiableDir, { recursive: true });
+            yield* fs.writeFileString(
+              unverifiableScript,
+              `export const meta = { name: "Unverifiable", description: "Missing startTime." }; return 1;`,
+            );
+            yield* fs.writeFileString(unverifiableJournal, "");
+            yield* fs.writeFileString(
+              unverifiableMetaPath,
+              JSON.stringify({
+                runId: unverifiableRunId,
+                threadId: parentThreadId,
+                taskId: null,
+                name: "Unverifiable",
+                scriptPath: unverifiableScript,
+                journalPath: unverifiableJournal,
+                startedAt: 0,
+                status: "failed",
+                sandboxCleanupPending: { pid: process.pid },
+                usage: {
+                  agents: 0,
+                  done: 0,
+                  errors: 0,
+                  empty: 0,
+                  cached: 0,
+                  tokens: 0,
+                  durationMs: 0,
+                },
+              }),
+            );
+
+            const recycledRunId = "wf_pidreused01";
+            const recycledDir = path.join(config.workflowRunsDir, recycledRunId);
+            const recycledScript = path.join(recycledDir, "script.js");
+            const recycledJournal = path.join(recycledDir, "journal.jsonl");
+            const recycledMetaPath = path.join(recycledDir, "run.json");
+            yield* fs.makeDirectory(recycledDir, { recursive: true });
+            yield* fs.writeFileString(
+              recycledScript,
+              `export const meta = { name: "RecycledPid", description: "Stale startTime on live PID." }; return 2;`,
+            );
+            yield* fs.writeFileString(recycledJournal, "");
+            yield* fs.writeFileString(
+              recycledMetaPath,
+              JSON.stringify({
+                runId: recycledRunId,
+                threadId: parentThreadId,
+                taskId: null,
+                name: "RecycledPid",
+                scriptPath: recycledScript,
+                journalPath: recycledJournal,
+                startedAt: 0,
+                status: "failed",
+                sandboxCleanupPending: { pid: process.pid, startTime: "stale-boot:0" },
+                usage: {
+                  agents: 0,
+                  done: 0,
+                  errors: 0,
+                  empty: 0,
+                  cached: 0,
+                  tokens: 0,
+                  durationMs: 0,
+                },
+              }),
+            );
+
+            yield* WorkflowService.recoverInterruptedWorkflows;
+
+            // Provider child stopped cleanly, but sandbox exit is still unconfirmed: run MUST stay gated.
+            const midTask = (yield* orchestrator.getThreadProjection(
+              parentThreadId,
+            )).subagents.find((s) => s.id === started.taskId);
+            expect(midTask?.status).toBe("running");
+            expect(midTask?.workflow?.stopRequestedAt).toBeDefined();
+
+            const midMeta = JSON.parse(yield* fs.readFileString(started.metaPath)) as {
+              readonly status: string;
+              readonly cleanupPending?: boolean;
+              readonly sandboxCleanupPending?: {
+                readonly pid?: number;
+                readonly startTime?: string;
+              };
+            };
+            expect(midMeta.cleanupPending).toBeUndefined();
+            expect(midMeta.sandboxCleanupPending?.pid).toBe(workerPid);
+
+            const refusedResume = yield* callTool("t3_workflow_run", {
+              scriptPath: started.scriptPath,
+              resumeFromRunId: started.runId,
+            });
+            expect(declaredFailure(refusedResume).code).toBe("invalid_request");
+
+            const refusedStop = yield* callTool("t3_workflow_stop", { runId: started.runId });
+            expect(declaredFailure(refusedStop).code).toBe("orchestration_error");
+
+            // Unverifiable sandbox identity stays fail-closed across recovery and refuses resume.
+            const unverifiableAfter = JSON.parse(
+              yield* fs.readFileString(unverifiableMetaPath),
+            ) as {
+              readonly sandboxCleanupPending?: { readonly pid?: number };
+            };
+            expect(unverifiableAfter.sandboxCleanupPending?.pid).toBe(process.pid);
+            const refusedUnverifiable = yield* callTool("t3_workflow_run", {
+              scriptPath: unverifiableScript,
+              resumeFromRunId: unverifiableRunId,
+            });
+            expect(declaredFailure(refusedUnverifiable).code).toBe("invalid_request");
+
+            // Stale startTime on a live PID proves the old worker exited (PID reuse) and clears the gate.
+            const recycledAfter = JSON.parse(yield* fs.readFileString(recycledMetaPath)) as {
+              readonly sandboxCleanupPending?: unknown;
+            };
+            expect(recycledAfter.sandboxCleanupPending).toBeUndefined();
+
+            // An inspector that reports unverifiable (e.g. unreadable /proc) also stays fail-closed.
+            const inspectorUnverifiableExit =
+              yield* WorkflowService.recoverInterruptedWorkflows.pipe(
+                Effect.provideService(WorkflowService.WorkflowSandboxProcessInspector, {
+                  captureIdentity: () => Effect.succeed({ ok: false, reason: "unavailable" }),
+                  checkExited: () =>
+                    Effect.succeed({ status: "unverifiable", reason: "/proc unreadable" }),
+                }),
+                Effect.exit,
+              );
+            expect(Exit.isSuccess(inspectorUnverifiableExit)).toBe(true);
+            const stillGatedMeta = JSON.parse(yield* fs.readFileString(started.metaPath)) as {
+              readonly sandboxCleanupPending?: { readonly pid?: number };
+            };
+            expect(stillGatedMeta.sandboxCleanupPending?.pid).toBe(workerPid);
+
+            // Terminate the real sandbox worker so verified identity confirms exit.
+            sandboxKilled = true;
+            shutdownChild!.kill = shutdownRealKill!;
+            yield* Effect.promise(() => reapUnconfirmedSandboxChildren());
+            expect(getUnconfirmedSandboxChildPids()).not.toContain(workerPid);
+
+            yield* TestClock.adjust("50 millis");
+            const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeRecoverSeq);
+            expect(terminal.status).toBe("failed");
+            yield* Deferred.await(finalMetaWritten);
+            const clearedMeta = JSON.parse(yield* fs.readFileString(started.metaPath)) as {
+              readonly status: string;
+              readonly sandboxCleanupPending?: unknown;
+            };
+            expect(clearedMeta.status).toBe("failed");
+            expect(clearedMeta.sandboxCleanupPending).toBeUndefined();
+
+            // Resume now succeeds once sandbox exit is verified.
+            const resumeCall = yield* callTool("t3_workflow_run", {
+              scriptPath: started.scriptPath,
+              resumeFromRunId: started.runId,
+            });
+            expect(resumeCall.isError).not.toBe(true);
+          }).pipe(Effect.provide(harness2.layerToolkit));
+        }).pipe(
+          Effect.ensuring(
+            Effect.sync(() => {
+              if (
+                shutdownChild !== undefined &&
+                shutdownRealKill !== undefined &&
+                shutdownChild.exitCode === null &&
+                shutdownChild.signalCode === null
+              ) {
+                shutdownChild.kill = shutdownRealKill;
+                shutdownRealKill("SIGKILL");
+              }
+            }),
+          ),
+        );
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "recovers a journal containing records at the exact 8 MiB shared limit and refuses oversized writes",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedBaseDir = yield* fs.realPath(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-at-limit-journal-" }),
+        );
+        const sharedDbContext = yield* Layer.build(SqlitePersistence.layerMemory);
+        const databaseLayer = Layer.succeedContext(sharedDbContext);
+
+        const harness1 = yield* makeWorkflowHarness({
+          name: "at-limit-journal-seed",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+        });
+
+        const seeded = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcpService = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const config = yield* ServerConfig.ServerConfig;
+          const parentTurn = yield* startParentThreadAndRun(
+            harness1.turnQueue,
+            harness1.cwd,
+            "at-limit-journal",
+          );
+          const parentRun = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
+            (r) => r.id === parentTurn.turn.runId,
+          )!;
+
+          const runId = "wf_atlimit0001";
+          const dir = path.join(config.workflowRunsDir, runId);
+          const scriptPath = path.join(dir, "script.js");
+          const journalPath = path.join(dir, "journal.jsonl");
+          const metaPath = path.join(dir, "run.json");
+          yield* fs.makeDirectory(dir, { recursive: true });
+          yield* fs.writeFileString(
+            scriptPath,
+            `export const meta = { name: "AtLimitJournal", description: "Records at exact 8 MiB limit." }; return 1;`,
+          );
+          yield* fs.writeFileString(journalPath, "");
+
+          const started = yield* orchestrator.dispatch({
+            type: "workflow.start",
+            commandId: CommandId.make("command:at-limit-journal:workflow-start"),
+            parentThreadId,
+            parentRunId: parentRun.id,
+            parentNodeId: parentRun.rootNodeId!,
+            title: "AtLimitJournal",
+            description: "Records at exact 8 MiB limit.",
+            modelSelection,
+            workflow: {
+              name: "AtLimitJournal",
+              runHandles: { runId, scriptPath, transcriptDir: dir },
+              phases: [],
+              agents: [],
+            },
+          });
+          const taskEvent = started.storedEvents.find(
+            (s) => s.event.type === "subagent.updated" && s.event.payload.origin === "app_owned",
+          );
+          if (taskEvent?.event.type !== "subagent.updated") {
+            throw new Error("missing at-limit workflow task");
+          }
+          const taskId = taskEvent.event.payload.id;
+
+          const tailChild = yield* mcpService.delegateWorkflowAgent(parentScope, {
+            parentRunId: parentRun.id,
+            workflowNodeId: taskId,
+            requestKey: `${runId}:1`,
+            task: { task: "Unfinished tail child", title: "Tail child" },
+          });
+          yield* Queue.take(harness1.turnQueue);
+
+          const buildResult = (filler: string): JournalEntry => ({
+            type: "result",
+            index: 0,
+            key: "k_at_limit",
+            outcome: "ok",
+            value: filler,
+          });
+          const overhead = Buffer.byteLength(JSON.stringify(buildResult("")), "utf8");
+          const exactLimitEntry = buildResult("a".repeat(MAX_JOURNAL_LINE_BYTES - overhead));
+          const oversizedEntry = buildResult("b".repeat(MAX_JOURNAL_LINE_BYTES - overhead + 1));
+          expect(Buffer.byteLength(JSON.stringify(exactLimitEntry), "utf8")).toBe(
+            MAX_JOURNAL_LINE_BYTES,
+          );
+
+          const writer = yield* makeJournalWriter({
+            writeLine: (line) => fs.writeFileString(journalPath, line, { flag: "a" }),
+          });
+          const oversizedExit = yield* writer.append(oversizedEntry).pipe(Effect.exit);
+          expect(Exit.isFailure(oversizedExit)).toBe(true);
+          if (Exit.isFailure(oversizedExit)) {
+            expect(oversizedExit.cause).toBeDefined();
+            const failed = yield* writer.append(oversizedEntry).pipe(Effect.flip);
+            expect(failed).toBeInstanceOf(JournalRecordTooLargeError);
+          }
+
+          expect(yield* writer.append(exactLimitEntry)).toBe(true);
+          expect(
+            yield* writer.append({
+              type: "started",
+              index: 1,
+              key: "k_tail",
+              label: "Tail child",
+              phase: null,
+              agentId: tailChild.taskId,
+              childThreadId: tailChild.childThreadId,
+            }),
+          ).toBe(true);
+          yield* writer.flush;
+          yield* writer.close;
+
+          yield* fs.writeFileString(
+            metaPath,
+            JSON.stringify({
+              runId,
+              threadId: parentThreadId,
+              taskId,
+              name: "AtLimitJournal",
+              scriptPath,
+              journalPath,
+              startedAt: 0,
+              status: "running",
+              usage: {
+                agents: 2,
+                done: 1,
+                errors: 0,
+                empty: 0,
+                cached: 0,
+                tokens: 0,
+                durationMs: 0,
+              },
+            }),
+          );
+          return { runId, taskId, tailChildThreadId: tailChild.childThreadId };
+        }).pipe(Effect.provide(harness1.layerToolkit));
+
+        const harness2 = yield* makeWorkflowHarness({
+          name: "at-limit-journal-recover",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+        });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const recoverExit = yield* WorkflowService.recoverInterruptedWorkflows.pipe(Effect.exit);
+          expect(Exit.isSuccess(recoverExit)).toBe(true);
+
+          const recoveredTask = (yield* orchestrator.getThreadProjection(
+            parentThreadId,
+          )).subagents.find((s) => s.id === seeded.taskId);
+          expect(recoveredTask?.status).toBe("failed");
+
+          const tailChildProj = yield* orchestrator.getThreadProjection(seeded.tailChildThreadId);
+          expect(
+            tailChildProj.runs.every(
+              (run) => run.status === "cancelled" || run.status === "interrupted",
+            ),
+          ).toBe(true);
         }).pipe(Effect.provide(harness2.layerToolkit));
       }).pipe(Effect.provide(NodeServices.layer)),
   );

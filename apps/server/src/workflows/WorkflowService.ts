@@ -1,7 +1,9 @@
-// @effect-diagnostics nodeBuiltinImport:off -- Workflow script reads use O_NONBLOCK + fstat to reject special files without blocking.
+// @effect-diagnostics nodeBuiltinImport:off -- Workflow script reads use O_NONBLOCK + fstat and sandbox exit verification uses /proc and OS process queries.
+import * as NodeChildProcess from "node:child_process";
 import * as NodeFS from "node:fs";
 import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import {
   CommandId,
   MessageId,
@@ -82,14 +84,22 @@ import * as ThreadManagementService from "../orchestration-v2/ThreadManagementSe
 import { checkOutput, type OutputRejection } from "../orchestration-v2/runOutput.ts";
 import { userFacingDispatchErrorMessage } from "../orchestration-v2/UserFacingErrors.ts";
 import {
+  DEFAULT_REPLAY_CACHE_MAX_BYTES,
+  DEFAULT_REPLAY_CACHE_MAX_ENTRIES,
+  MAX_JOURNAL_LINE_BYTES,
   MAX_PENDING_JOURNAL_BYTES,
   MAX_PENDING_JOURNAL_ENTRIES,
   agentCallKey,
-  createReplayCursorAccumulator,
+  createIndexedReplayCursor,
+  createReplayIndexAccumulator,
+  isJournalRecordTooLargeError,
   makeJournalWriter,
   parseJournalLine,
+  type IndexedReplayCursor,
   type JournalEntry,
-  type ReplayCursor,
+  type JournalLineSpan,
+  type ReplayIndex,
+  type ReplayIndexEntry,
 } from "./journal.ts";
 import {
   WORKFLOW_MESSAGE_LIMITS,
@@ -122,7 +132,6 @@ const STARTUP_STOP_CONFIRM_BUDGET_MS = 2_000;
 const STOP_CONFIRM_WAIT_MS = 2_000;
 const STOP_WAIT_BOUND_MS = 30_000;
 const MAX_PERSISTED_RUN_META_BYTES = 8 * 1024 * 1024;
-const MAX_JOURNAL_LINE_BYTES = 8 * 1024 * 1024;
 
 const TASK_ROLE_LITERALS: ReadonlySet<string> = new Set<OrchestratorMcpTaskRole>([
   "implementation",
@@ -132,6 +141,15 @@ const TASK_ROLE_LITERALS: ReadonlySet<string> = new Set<OrchestratorMcpTaskRole>
   "test",
   "general",
 ]);
+
+const PersistedSandboxCleanupPending = Schema.Struct({
+  pid: Schema.optional(
+    Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
+  ),
+  startTime: Schema.optional(TrimmedNonEmptyString),
+  reason: Schema.optional(Schema.String),
+});
+type PersistedSandboxCleanupPending = typeof PersistedSandboxCleanupPending.Type;
 
 const PersistedWorkflowRun = Schema.Struct({
   runId: TrimmedNonEmptyString,
@@ -143,6 +161,7 @@ const PersistedWorkflowRun = Schema.Struct({
   startedAt: NonNegativeInt,
   status: OrchestratorMcpWorkflowRunStatus,
   cleanupPending: Schema.optional(Schema.Boolean),
+  sandboxCleanupPending: Schema.optional(PersistedSandboxCleanupPending),
   phases: Schema.optional(Schema.Array(OrchestrationV2WorkflowPhase)),
   currentPhase: Schema.optional(TrimmedNonEmptyString),
   result: Schema.optional(Schema.Json),
@@ -214,7 +233,20 @@ class WorkflowJournalLineTooLargeError extends Schema.TaggedError<WorkflowJourna
   },
 ) {
   override get message(): string {
-    return `Workflow journal entry at ${this.journalPath} exceeds the 8 MiB limit.`;
+    return `Workflow journal entry at ${this.journalPath} exceeds the ${MAX_JOURNAL_LINE_BYTES / (1024 * 1024)} MiB limit.`;
+  }
+}
+
+class WorkflowReplayLoadError extends Schema.TaggedError<WorkflowReplayLoadError>()(
+  "WorkflowReplayLoadError",
+  {
+    journalPath: Schema.String,
+    index: Schema.Number,
+    reason: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Unable to load cached workflow result #${this.index} from ${this.journalPath}: ${this.reason}`;
   }
 }
 
@@ -262,6 +294,10 @@ export interface OpenWorkflowScriptFile {
   readonly readChunk: (
     maxBytes: number,
   ) => Effect.Effect<Option.Option<Uint8Array>, WorkflowScriptFileError>;
+  readonly readAt?: (
+    offset: number,
+    length: number,
+  ) => Effect.Effect<Uint8Array, WorkflowScriptFileError>;
 }
 
 export type WorkflowScriptFileOpener = (
@@ -309,6 +345,27 @@ const defaultOpenWorkflowScriptFile: WorkflowScriptFileOpener = (scriptPath) =>
           catch: (cause): WorkflowScriptFileError =>
             new WorkflowScriptReadError({ scriptPath, cause }),
         }),
+      readAt: (position, length) =>
+        Effect.tryPromise({
+          try: async () => {
+            if (length <= 0) return new Uint8Array(0);
+            const buffer = Buffer.allocUnsafe(length);
+            let totalRead = 0;
+            while (totalRead < length) {
+              const { bytesRead } = await handle.read(
+                buffer,
+                totalRead,
+                length - totalRead,
+                position + totalRead,
+              );
+              if (bytesRead === 0) break;
+              totalRead += bytesRead;
+            }
+            return buffer.subarray(0, totalRead);
+          },
+          catch: (cause): WorkflowScriptFileError =>
+            new WorkflowScriptReadError({ scriptPath, cause }),
+        }),
     })),
   );
 
@@ -322,6 +379,319 @@ export type WorkflowSandboxRunner = typeof runWorkflowScript;
 export const WorkflowSandboxRunner = Context.Reference<WorkflowSandboxRunner>(
   "t3/workflows/WorkflowSandboxRunner",
   { defaultValue: () => runWorkflowScript },
+);
+
+export interface SandboxProcessIdentity {
+  readonly pid: number;
+  readonly startTime: string;
+}
+
+export type SandboxProcessExitCheck =
+  | { readonly status: "exited" }
+  | { readonly status: "alive" }
+  | { readonly status: "unverifiable"; readonly reason: string };
+
+export interface WorkflowSandboxProcessInspector {
+  readonly captureIdentity: (
+    pid: number,
+  ) => Effect.Effect<
+    | { readonly ok: true; readonly identity: SandboxProcessIdentity }
+    | { readonly ok: false; readonly reason: string }
+  >;
+  readonly checkExited: (
+    identity: SandboxProcessIdentity,
+  ) => Effect.Effect<SandboxProcessExitCheck>;
+}
+
+const DARWIN_PS_LINE = /^\s*(\d+)\s+(\S+)\s+(\w{3} \w{3} +\d{1,2} \d{2}:\d{2}:\d{2} \d{4})\s*$/;
+const PROCESS_INSPECT_TIMEOUT_MS = 5_000;
+
+function osProcessExists(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (cause) {
+    return errorCodeOf(cause) !== "ESRCH";
+  }
+}
+
+function parseLinuxProcStat(
+  stat: string,
+): { readonly state: string; readonly startTime: string } | undefined {
+  const commandEnd = stat.lastIndexOf(")");
+  if (commandEnd < 0) return undefined;
+  const fields = stat
+    .slice(commandEnd + 2)
+    .trim()
+    .split(/\s+/u);
+  const state = fields[0];
+  const startTime = fields[19];
+  if (state === undefined || startTime === undefined || !/^\d+$/u.test(startTime)) {
+    return undefined;
+  }
+  return { state, startTime };
+}
+
+function readLinuxBootId(): string | undefined {
+  try {
+    const bootId = NodeFS.readFileSync("/proc/sys/kernel/random/boot_id", "utf8").trim();
+    return bootId.length > 0 ? bootId : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function readProcStatSync(
+  procPath: string,
+):
+  | { readonly ok: true; readonly content: string }
+  | { readonly ok: false; readonly cause: unknown } {
+  try {
+    return { ok: true, content: NodeFS.readFileSync(procPath, "utf8") };
+  } catch (cause) {
+    return { ok: false, cause };
+  }
+}
+
+function decodeUtf8Strict(
+  bytes: Uint8Array,
+): { readonly ok: true; readonly text: string } | { readonly ok: false; readonly cause: unknown } {
+  try {
+    return { ok: true, text: new TextDecoder("utf-8", { fatal: true }).decode(bytes) };
+  } catch (cause) {
+    return { ok: false, cause };
+  }
+}
+
+function execProcessQuery(
+  command: string,
+  args: ReadonlyArray<string>,
+  env?: NodeJS.ProcessEnv,
+): Effect.Effect<
+  { readonly ok: true; readonly stdout: string } | { readonly ok: false; readonly reason: string }
+> {
+  return Effect.callback((resume) => {
+    const child = NodeChildProcess.execFile(
+      command,
+      args,
+      {
+        ...(env === undefined ? {} : { env }),
+        timeout: PROCESS_INSPECT_TIMEOUT_MS,
+        killSignal: "SIGKILL",
+        maxBuffer: 64 * 1024,
+        windowsHide: true,
+      },
+      (err, stdout) => {
+        if (err !== null) {
+          resume(Effect.succeed({ ok: false, reason: errorMessage(err) }));
+          return;
+        }
+        resume(Effect.succeed({ ok: true, stdout: String(stdout) }));
+      },
+    );
+    return Effect.sync(() => {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    });
+  });
+}
+
+const defaultWorkflowSandboxProcessInspector: WorkflowSandboxProcessInspector = {
+  captureIdentity: Effect.fn("WorkflowSandboxProcessInspector.captureIdentity")(function* (
+    pid: number,
+  ) {
+    if (!Number.isInteger(pid) || pid < 1) {
+      return { ok: false, reason: `Invalid sandbox worker pid (${String(pid)}).` } as const;
+    }
+    const platform = yield* HostProcess.Platform;
+    if (platform === "linux") {
+      const statResult = readProcStatSync(`/proc/${pid}/stat`);
+      if (!statResult.ok) {
+        return {
+          ok: false,
+          reason: `Unable to read /proc/${pid}/stat: ${errorMessage(statResult.cause)}`,
+        } as const;
+      }
+      const parsed = parseLinuxProcStat(statResult.content);
+      if (parsed === undefined) {
+        return { ok: false, reason: `Unable to parse /proc/${pid}/stat.` } as const;
+      }
+      if (parsed.state === "Z" || parsed.state === "X" || parsed.state === "x") {
+        return {
+          ok: false,
+          reason: `Process ${pid} already exited (state ${parsed.state}).`,
+        } as const;
+      }
+      const bootId = readLinuxBootId();
+      const startTime = bootId !== undefined ? `${bootId}:${parsed.startTime}` : parsed.startTime;
+      return { ok: true, identity: { pid, startTime } } as const;
+    }
+    if (platform === "darwin") {
+      const queried = yield* execProcessQuery(
+        "/bin/ps",
+        ["-ww", "-o", "pid=,stat=,lstart=", "-p", String(pid)],
+        { ...process.env, LC_ALL: "C", TZ: "UTC" },
+      );
+      if (!queried.ok) {
+        return {
+          ok: false,
+          reason: `Unable to inspect macOS process ${pid}: ${queried.reason}`,
+        } as const;
+      }
+      for (const line of queried.stdout.split("\n")) {
+        const match = DARWIN_PS_LINE.exec(line);
+        if (match === null || Number(match[1]) !== pid) continue;
+        if (match[2]!.startsWith("Z")) {
+          return { ok: false, reason: `Process ${pid} is already a zombie.` } as const;
+        }
+        return { ok: true, identity: { pid, startTime: match[3]! } } as const;
+      }
+      return { ok: false, reason: `Process ${pid} was not returned by /bin/ps.` } as const;
+    }
+    if (platform === "win32") {
+      const queried = yield* execProcessQuery("powershell.exe", [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `(Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')`,
+      ]);
+      if (!queried.ok) {
+        return {
+          ok: false,
+          reason: `Unable to inspect Windows process ${pid}: ${queried.reason}`,
+        } as const;
+      }
+      const startTime = queried.stdout.trim();
+      if (startTime.length === 0 || !Number.isFinite(Date.parse(startTime))) {
+        return {
+          ok: false,
+          reason: `Unable to parse Windows start time for process ${pid}.`,
+        } as const;
+      }
+      return { ok: true, identity: { pid, startTime } } as const;
+    }
+    return {
+      ok: false,
+      reason: `Sandbox process identity capture is unsupported on platform "${platform}".`,
+    } as const;
+  }),
+  checkExited: Effect.fn("WorkflowSandboxProcessInspector.checkExited")(function* (
+    identity: SandboxProcessIdentity,
+  ) {
+    const platform = yield* HostProcess.Platform;
+    if (platform === "linux") {
+      const statResult = readProcStatSync(`/proc/${identity.pid}/stat`);
+      if (!statResult.ok) {
+        const code = errorCodeOf(statResult.cause);
+        if (code === "ENOENT" || code === "ESRCH") {
+          return readProcStatSync("/proc/self/stat").ok
+            ? ({ status: "exited" } as const)
+            : ({
+                status: "unverifiable",
+                reason: "/proc is unavailable to verify sandbox worker exit.",
+              } as const);
+        }
+        return {
+          status: "unverifiable",
+          reason: `Unable to read /proc/${identity.pid}/stat: ${errorMessage(statResult.cause)}`,
+        } as const;
+      }
+      const parsed = parseLinuxProcStat(statResult.content);
+      if (parsed === undefined) {
+        return {
+          status: "unverifiable",
+          reason: `Unable to parse /proc/${identity.pid}/stat.`,
+        } as const;
+      }
+      if (parsed.state === "Z" || parsed.state === "X" || parsed.state === "x") {
+        return { status: "exited" } as const;
+      }
+      if (identity.startTime.includes(":")) {
+        const bootId = readLinuxBootId();
+        if (bootId === undefined) {
+          return {
+            status: "unverifiable",
+            reason: "Unable to read /proc/sys/kernel/random/boot_id to verify sandbox identity.",
+          } as const;
+        }
+        return `${bootId}:${parsed.startTime}` === identity.startTime
+          ? ({ status: "alive" } as const)
+          : ({ status: "exited" } as const);
+      }
+      return parsed.startTime === identity.startTime
+        ? ({ status: "alive" } as const)
+        : ({ status: "exited" } as const);
+    }
+    if (platform === "darwin") {
+      if (!osProcessExists(identity.pid)) {
+        return { status: "exited" } as const;
+      }
+      const queried = yield* execProcessQuery(
+        "/bin/ps",
+        ["-ww", "-o", "pid=,stat=,lstart=", "-p", String(identity.pid)],
+        { ...process.env, LC_ALL: "C", TZ: "UTC" },
+      );
+      if (queried.ok) {
+        for (const line of queried.stdout.split("\n")) {
+          const match = DARWIN_PS_LINE.exec(line);
+          if (match === null || Number(match[1]) !== identity.pid) continue;
+          if (match[2]!.startsWith("Z")) {
+            return { status: "exited" } as const;
+          }
+          return match[3] === identity.startTime
+            ? ({ status: "alive" } as const)
+            : ({ status: "exited" } as const);
+        }
+      }
+      if (!osProcessExists(identity.pid)) {
+        return { status: "exited" } as const;
+      }
+      return {
+        status: "unverifiable",
+        reason: queried.ok
+          ? `Process ${identity.pid} exists but /bin/ps returned no start time.`
+          : `Unable to inspect macOS process ${identity.pid}: ${queried.reason}`,
+      } as const;
+    }
+    if (platform === "win32") {
+      if (!osProcessExists(identity.pid)) {
+        return { status: "exited" } as const;
+      }
+      const queried = yield* execProcessQuery("powershell.exe", [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `(Get-Process -Id ${identity.pid} -ErrorAction Stop).StartTime.ToUniversalTime().ToString('o')`,
+      ]);
+      if (queried.ok) {
+        const observed = queried.stdout.trim();
+        if (observed.length > 0 && Number.isFinite(Date.parse(observed))) {
+          return observed === identity.startTime
+            ? ({ status: "alive" } as const)
+            : ({ status: "exited" } as const);
+        }
+      }
+      if (!osProcessExists(identity.pid)) {
+        return { status: "exited" } as const;
+      }
+      return {
+        status: "unverifiable",
+        reason: queried.ok
+          ? `Unable to parse Windows start time for process ${identity.pid}.`
+          : `Unable to inspect Windows process ${identity.pid}: ${queried.reason}`,
+      } as const;
+    }
+    return {
+      status: "unverifiable",
+      reason: `Sandbox process exit verification is unsupported on platform "${platform}".`,
+    } as const;
+  }),
+};
+
+export const WorkflowSandboxProcessInspector = Context.Reference<WorkflowSandboxProcessInspector>(
+  "t3/workflows/WorkflowSandboxProcessInspector",
+  { defaultValue: () => defaultWorkflowSandboxProcessInspector },
 );
 
 function createHostAbortController(): AbortController {
@@ -550,8 +920,13 @@ function hasPendingBackgroundWork(state: {
   );
 }
 
-function withoutCleanupPending(record: PersistedWorkflowRun): PersistedWorkflowRun {
+function withoutChildCleanupPending(record: PersistedWorkflowRun): PersistedWorkflowRun {
   const { cleanupPending: _cleanupPending, ...rest } = record;
+  return rest;
+}
+
+function withoutSandboxCleanupPending(record: PersistedWorkflowRun): PersistedWorkflowRun {
+  const { sandboxCleanupPending: _sandboxCleanupPending, ...rest } = record;
   return rest;
 }
 
@@ -1060,7 +1435,7 @@ interface OwnedChildTarget {
 
 const foldBoundedJournalFile = Effect.fn("WorkflowService.foldBoundedJournalFile")(function* (
   journalPath: string,
-  onEntry: (entry: JournalEntry) => void,
+  onEntry: (entry: JournalEntry, span: JournalLineSpan) => void,
 ): Effect.fn.Return<
   boolean,
   | WorkflowScriptNotRegularFileError
@@ -1091,8 +1466,13 @@ const foldBoundedJournalFile = Effect.fn("WorkflowService.foldBoundedJournalFile
       let pendingInvalidLine: number | undefined;
       let lineChunks: Array<Uint8Array> = [];
       let lineBytes = 0;
+      let fileOffset = 0;
+      let lineStartOffset = 0;
 
-      const processLine = (line: string): Effect.Effect<void, WorkflowJournalCorruptError> => {
+      const processLine = (
+        line: string,
+        span: JournalLineSpan,
+      ): Effect.Effect<void, WorkflowJournalCorruptError> => {
         const trimmed = line.trim();
         if (trimmed.length === 0) return Effect.void;
         lineNumber += 1;
@@ -1107,7 +1487,7 @@ const foldBoundedJournalFile = Effect.fn("WorkflowService.foldBoundedJournalFile
           pendingInvalidLine = lineNumber;
           return Effect.void;
         }
-        onEntry(entry);
+        onEntry(entry, span);
         return Effect.void;
       };
 
@@ -1136,6 +1516,9 @@ const foldBoundedJournalFile = Effect.fn("WorkflowService.foldBoundedJournalFile
         const buf = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
         let offset = 0;
         while (offset < buf.length) {
+          if (lineBytes === 0) {
+            lineStartOffset = fileOffset + offset;
+          }
           const nl = buf.indexOf(0x0a, offset);
           if (nl === -1) {
             const remaining = buf.length - offset;
@@ -1151,19 +1534,58 @@ const foldBoundedJournalFile = Effect.fn("WorkflowService.foldBoundedJournalFile
             return yield* new WorkflowJournalLineTooLargeError({ journalPath });
           }
           const fullLine = concatLine(buf.subarray(offset, nl));
+          const span: JournalLineSpan = {
+            offset: lineStartOffset,
+            length: fullLine.byteLength,
+          };
           lineChunks = [];
           lineBytes = 0;
           offset = nl + 1;
-          yield* processLine(decoder.decode(fullLine));
+          yield* processLine(decoder.decode(fullLine), span);
         }
+        fileOffset += buf.length;
       }
 
       if (lineBytes > 0) {
-        yield* processLine(decoder.decode(concatLine()));
+        const fullLine = concatLine();
+        yield* processLine(decoder.decode(fullLine), {
+          offset: lineStartOffset,
+          length: fullLine.byteLength,
+        });
       }
       return true;
     }),
   );
+});
+
+const readJournalBytesAtSpan = Effect.fn("WorkflowService.readJournalBytesAtSpan")(function* (
+  file: OpenWorkflowScriptFile,
+  journalPath: string,
+  span: JournalLineSpan,
+): Effect.fn.Return<Uint8Array, WorkflowScriptFileError | WorkflowJournalLineTooLargeError> {
+  if (span.length > MAX_JOURNAL_LINE_BYTES) {
+    return yield* new WorkflowJournalLineTooLargeError({ journalPath });
+  }
+  if (file.readAt !== undefined) {
+    return yield* file.readAt(span.offset, span.length);
+  }
+  let skipped = 0;
+  while (skipped < span.offset) {
+    const chunk = yield* file.readChunk(Math.min(span.offset - skipped, READ_SCRIPT_CHUNK_BYTES));
+    if (Option.isNone(chunk) || chunk.value.byteLength === 0) {
+      return new Uint8Array(0);
+    }
+    skipped += chunk.value.byteLength;
+  }
+  const out = new Uint8Array(span.length);
+  let read = 0;
+  while (read < span.length) {
+    const chunk = yield* file.readChunk(Math.min(span.length - read, READ_SCRIPT_CHUNK_BYTES));
+    if (Option.isNone(chunk) || chunk.value.byteLength === 0) break;
+    out.set(chunk.value, read);
+    read += chunk.value.byteLength;
+  }
+  return out.subarray(0, read);
 });
 
 interface JournalRecoveryScan {
@@ -1228,11 +1650,11 @@ const reconstructFromJournalFile = Effect.fn("WorkflowService.reconstructFromJou
   },
 );
 
-const readReplayCursorFromJournal = Effect.fn("WorkflowService.readReplayCursorFromJournal")(
+const readReplayIndexFromJournal = Effect.fn("WorkflowService.readReplayIndexFromJournal")(
   function* (canonicalJournalPath: string) {
-    const accumulator = createReplayCursorAccumulator();
+    const accumulator = createReplayIndexAccumulator();
     const exists = yield* foldBoundedJournalFile(canonicalJournalPath, accumulator.push);
-    return { exists, cursor: accumulator.build() } as const;
+    return { exists, index: accumulator.build() } as const;
   },
 );
 
@@ -1313,6 +1735,23 @@ const isChildConfirmedStopped = (state: {
   state.thread.deletedAt !== null ||
   (!state.runs.some(isLiveChildRun) && !hasPendingBackgroundWork(state));
 
+interface ChildConfirmTarget {
+  readonly beforeStopSeq: number;
+  readonly runId: string;
+  readonly attempt: number;
+}
+
+function recordUnconfirmedChild(
+  unconfirmed: Map<ThreadId, ChildConfirmTarget>,
+  childThreadId: ThreadId,
+  target: ChildConfirmTarget,
+): void {
+  const existing = unconfirmed.get(childThreadId);
+  if (existing === undefined || target.beforeStopSeq < existing.beforeStopSeq) {
+    unconfirmed.set(childThreadId, target);
+  }
+}
+
 const dispatchStopForChildTree = Effect.fn("WorkflowService.dispatchStopForChildTree")(
   function* (input: {
     readonly threadManagement: ThreadManagementService.ThreadManagementService["Service"];
@@ -1323,7 +1762,7 @@ const dispatchStopForChildTree = Effect.fn("WorkflowService.dispatchStopForChild
     readonly reason: string;
     readonly attempt: number;
     readonly visited: Set<ThreadId>;
-    readonly unconfirmed: Map<ThreadId, number>;
+    readonly unconfirmed: Map<ThreadId, ChildConfirmTarget>;
     readonly semaphore: Semaphore.Semaphore;
   }): Effect.fn.Return<ChildStopDispatchError | undefined> {
     const {
@@ -1404,29 +1843,13 @@ const dispatchStopForChildTree = Effect.fn("WorkflowService.dispatchStopForChild
             });
           }
 
-          const afterStop = yield* readChildStopState(threadManagement, childThreadId);
-          if (afterStop === undefined) return undefined;
-
-          for (const childRun of afterStop.runs) {
-            if (childRun.status !== "queued") continue;
-            yield* threadManagement.dispatch({
-              type: "queued-run.cancel",
-              commandId: CommandId.make(
-                `server:workflow-stop-child-queued-post:${runId}:${childThreadId}:${childRun.id}:a${attempt}`,
-              ),
-              threadId: childThreadId,
-              runId: childRun.id,
-            });
-          }
-
-          const latest = yield* readChildStopState(threadManagement, childThreadId);
-          if (latest !== undefined && !isChildConfirmedStopped(latest)) {
-            const existingSeq = unconfirmed.get(childThreadId);
-            if (existingSeq === undefined || beforeStopSeq < existingSeq) {
-              unconfirmed.set(childThreadId, beforeStopSeq);
-            }
-          }
-          return afterStop.subagents;
+          // Defer all post-stop projection reads to the budgeted confirmation phase.
+          recordUnconfirmedChild(unconfirmed, childThreadId, {
+            beforeStopSeq,
+            runId,
+            attempt,
+          });
+          return initial.subagents;
         }),
       )
       .pipe(Effect.result);
@@ -1479,16 +1902,34 @@ const waitForSingleChildConfirmedStopped = Effect.fn(
 )(function* (
   threadManagement: ThreadManagementService.ThreadManagementService["Service"],
   childThreadId: ThreadId,
-  beforeStopSeq: number,
+  target: ChildConfirmTarget,
 ) {
-  const initial = yield* readChildStopState(threadManagement, childThreadId);
-  if (initial === undefined || isChildConfirmedStopped(initial)) {
+  let latest = yield* readChildStopState(threadManagement, childThreadId);
+  if (latest === undefined) return true;
+
+  const postQueuedRuns = latest.runs.filter((childRun) => childRun.status === "queued");
+  if (postQueuedRuns.length > 0) {
+    for (const childRun of postQueuedRuns) {
+      yield* threadManagement.dispatch({
+        type: "queued-run.cancel",
+        commandId: CommandId.make(
+          `server:workflow-stop-child-queued-post:${target.runId}:${childThreadId}:${childRun.id}:a${target.attempt}`,
+        ),
+        threadId: childThreadId,
+        runId: childRun.id,
+      });
+    }
+    latest = yield* readChildStopState(threadManagement, childThreadId);
+    if (latest === undefined) return true;
+  }
+
+  if (isChildConfirmedStopped(latest)) {
     return true;
   }
   const matched = yield* threadManagement
     .streamStoredEventsFrom({
       threadId: childThreadId,
-      afterSequence: beforeStopSeq,
+      afterSequence: target.beforeStopSeq,
     })
     .pipe(
       Stream.filter(
@@ -1508,8 +1949,8 @@ const waitForSingleChildConfirmedStopped = Effect.fn(
           return Effect.succeed("unresponsive" as const);
         }
         return readChildStopState(threadManagement, childThreadId).pipe(
-          Effect.map((latest) =>
-            latest === undefined || isChildConfirmedStopped(latest)
+          Effect.map((current) =>
+            current === undefined || isChildConfirmedStopped(current)
               ? ("settled" as const)
               : ("pending" as const),
           ),
@@ -1527,7 +1968,7 @@ const waitForSingleChildConfirmedStopped = Effect.fn(
 
 const confirmBatchWithBudget = Effect.fn("WorkflowService.confirmBatchWithBudget")(function* (
   threadManagement: ThreadManagementService.ThreadManagementService["Service"],
-  targets: ReadonlyMap<ThreadId, number>,
+  targets: ReadonlyMap<ThreadId, ChildConfirmTarget>,
   budgetMs: number,
   concurrency: number,
 ) {
@@ -1537,8 +1978,8 @@ const confirmBatchWithBudget = Effect.fn("WorkflowService.confirmBatchWithBudget
   const entries = [...targets.entries()];
   const waitAll = Effect.forEach(
     entries,
-    ([childThreadId, beforeStopSeq]) =>
-      waitForSingleChildConfirmedStopped(threadManagement, childThreadId, beforeStopSeq).pipe(
+    ([childThreadId, target]) =>
+      waitForSingleChildConfirmedStopped(threadManagement, childThreadId, target).pipe(
         Effect.tap((confirmed) =>
           Effect.sync(() => {
             if (confirmed) {
@@ -1567,7 +2008,7 @@ const stopOwnedChildThread = Effect.fn("WorkflowService.stopOwnedChildThread")(f
   return yield* withBoundedRetry(
     (attempt) =>
       Effect.gen(function* () {
-        const unconfirmed = new Map<ThreadId, number>();
+        const unconfirmed = new Map<ThreadId, ChildConfirmTarget>();
         const semaphore = yield* Semaphore.make(STARTUP_STOP_CONCURRENCY);
         const dispatchError = yield* dispatchStopForChildTree({
           threadManagement: input.threadManagement,
@@ -1635,7 +2076,7 @@ const stopAllWorkflowChildren = Effect.fn("WorkflowService.stopAllWorkflowChildr
             input.workflowTaskId,
             input.extraChildren,
           );
-          const unconfirmed = new Map<ThreadId, number>();
+          const unconfirmed = new Map<ThreadId, ChildConfirmTarget>();
           const visited = new Set<ThreadId>();
           const semaphore = yield* Semaphore.make(STARTUP_STOP_CONCURRENCY);
           let firstError: ChildStopDispatchError | undefined;
@@ -1757,12 +2198,19 @@ const reconcilePersistedFromSql = Effect.fn("WorkflowService.reconcilePersistedF
   finalTask: OrchestrationV2Subagent | undefined,
   endEntry: Extract<JournalEntry, { readonly type: "end" }> | undefined,
   restartMessage: string,
-  options: { readonly clearCleanupPending: boolean },
+  options: {
+    readonly clearCleanupPending: boolean;
+    readonly clearSandboxCleanupPending: boolean;
+  },
 ) {
   const { error: _previousError, ...withoutError } = record;
-  const baseRecord = options.clearCleanupPending
-    ? withoutCleanupPending(withoutError)
-    : withoutError;
+  let baseRecord: PersistedWorkflowRun = withoutError;
+  if (options.clearCleanupPending) {
+    baseRecord = withoutChildCleanupPending(baseRecord);
+  }
+  if (options.clearSandboxCleanupPending) {
+    baseRecord = withoutSandboxCleanupPending(baseRecord);
+  }
   if (finalTask !== undefined && isTerminalSubagentStatus(finalTask.status)) {
     const finalStatus = subagentStatusToWorkflowStatus(finalTask.status);
     if (finalStatus === "completed") {
@@ -1802,6 +2250,64 @@ const reconcilePersistedFromSql = Effect.fn("WorkflowService.reconcilePersistedF
   });
 });
 
+type SandboxExitVerification =
+  | { readonly confirmedExited: true }
+  | {
+      readonly confirmedExited: false;
+      readonly state: "alive" | "unverifiable";
+      readonly reason: string;
+    };
+
+const verifySandboxCleanupPending = Effect.fn("WorkflowService.verifySandboxCleanupPending")(
+  function* (
+    inspector: WorkflowSandboxProcessInspector,
+    runId: string,
+    taskId: NodeId | null,
+    pending: PersistedSandboxCleanupPending | undefined,
+  ): Effect.fn.Return<SandboxExitVerification> {
+    if (pending === undefined) {
+      return { confirmedExited: true };
+    }
+    if (pending.pid === undefined || pending.startTime === undefined) {
+      const reason =
+        pending.reason ??
+        "Sandbox worker process identity (pid and start time) was not recorded; cannot verify exit.";
+      yield* Effect.logWarning("workflow.sandbox.exit-unverifiable", {
+        runId,
+        taskId,
+        pid: pending.pid,
+        reason,
+      });
+      return { confirmedExited: false, state: "unverifiable", reason };
+    }
+    const check = yield* inspector.checkExited({
+      pid: pending.pid,
+      startTime: pending.startTime,
+    });
+    if (check.status === "exited") {
+      return { confirmedExited: true };
+    }
+    if (check.status === "alive") {
+      const reason = `Sandbox worker process (pid ${pending.pid}) is still running.`;
+      yield* Effect.logWarning("workflow.sandbox.still-alive-on-recovery", {
+        runId,
+        taskId,
+        pid: pending.pid,
+        startTime: pending.startTime,
+      });
+      return { confirmedExited: false, state: "alive", reason };
+    }
+    yield* Effect.logWarning("workflow.sandbox.exit-unverifiable", {
+      runId,
+      taskId,
+      pid: pending.pid,
+      startTime: pending.startTime,
+      reason: check.reason,
+    });
+    return { confirmedExited: false, state: "unverifiable", reason: check.reason };
+  },
+);
+
 interface RecoveryCandidate {
   readonly runId: string | undefined;
   readonly parentThreadId: ThreadId;
@@ -1818,7 +2324,7 @@ interface PreparedRecoveryCandidate {
   readonly shouldConfirmChildren: boolean;
   readonly journalChildren: ReadonlyArray<OwnedChildTarget>;
   readonly lastEndEntry: Extract<JournalEntry, { readonly type: "end" }> | undefined;
-  readonly unconfirmed: Map<ThreadId, number>;
+  readonly unconfirmed: Map<ThreadId, ChildConfirmTarget>;
   dispatchError: ChildStopDispatchError | undefined;
 }
 
@@ -1828,6 +2334,7 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
+  const processInspector = yield* WorkflowSandboxProcessInspector;
   const storeDeps = { fileSystem, path, workflowsDir: serverConfig.workflowRunsDir };
 
   const candidatesByKey = new Map<string, RecoveryCandidate>();
@@ -1917,7 +2424,13 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
       const record = persisted.value;
       const candidateKey = keyFor(record.threadId, record.taskId, record.runId);
       if (candidatesByKey.has(candidateKey)) continue;
-      if (record.status !== "running" && record.cleanupPending !== true) continue;
+      if (
+        record.status !== "running" &&
+        record.cleanupPending !== true &&
+        record.sandboxCleanupPending === undefined
+      ) {
+        continue;
+      }
       const sqlTask =
         record.taskId === null
           ? undefined
@@ -2008,14 +2521,14 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
       shouldConfirmChildren,
       journalChildren,
       lastEndEntry,
-      unconfirmed: new Map<ThreadId, number>(),
+      unconfirmed: new Map<ThreadId, ChildConfirmTarget>(),
       dispatchError: undefined,
     });
   }
 
   // 4. One bounded-concurrency stop pass across all candidates needing child stops.
   const stopSemaphore = yield* Semaphore.make(STARTUP_STOP_CONCURRENCY);
-  const allUnconfirmed = new Map<ThreadId, number>();
+  const allUnconfirmed = new Map<ThreadId, ChildConfirmTarget>();
   yield* Effect.forEach(
     prepared.filter((item) => item.shouldConfirmChildren),
     (item) =>
@@ -2056,11 +2569,8 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
             ),
           { concurrency: STARTUP_STOP_CONCURRENCY, discard: true },
         );
-        for (const [childThreadId, seq] of item.unconfirmed) {
-          const existing = allUnconfirmed.get(childThreadId);
-          if (existing === undefined || seq < existing) {
-            allUnconfirmed.set(childThreadId, seq);
-          }
+        for (const [childThreadId, target] of item.unconfirmed) {
+          recordUnconfirmedChild(allUnconfirmed, childThreadId, target);
         }
       }).pipe(Effect.provideService(DispatchModeLimit, undefined)),
     { concurrency: STARTUP_STOP_CONCURRENCY, discard: true },
@@ -2081,26 +2591,42 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
       const { runId, restartMessage, journalChildren, lastEndEntry } = item;
       const wasAlreadyStopRequested = sqlTask?.workflow?.stopRequestedAt !== undefined;
 
-      const reconcilePersistedAfterCleanup = (
+      const reconcilePersistedAfterCleanup = Effect.fn(
+        "WorkflowService.reconcilePersistedAfterCleanup",
+      )(function* (
         finalTask: OrchestrationV2Subagent | undefined,
         childrenStoppedConfirmed: boolean,
-      ) => {
-        if (persisted === undefined) return Effect.void;
+        sandboxExitedConfirmed: boolean,
+      ) {
+        if (persisted === undefined) return;
         if (persisted.status === "running") {
-          return reconcilePersistedFromSql(
+          yield* reconcilePersistedFromSql(
             storeDeps,
             persisted,
             finalTask,
             lastEndEntry,
             restartMessage,
-            { clearCleanupPending: childrenStoppedConfirmed },
+            {
+              clearCleanupPending: childrenStoppedConfirmed,
+              clearSandboxCleanupPending: sandboxExitedConfirmed,
+            },
           );
+          return;
         }
-        if (persisted.cleanupPending === true && childrenStoppedConfirmed) {
-          return writePersistedRunWith(storeDeps, withoutCleanupPending(persisted));
+        let updated: PersistedWorkflowRun = persisted;
+        let changed = false;
+        if (updated.cleanupPending === true && childrenStoppedConfirmed) {
+          updated = withoutChildCleanupPending(updated);
+          changed = true;
         }
-        return Effect.void;
-      };
+        if (updated.sandboxCleanupPending !== undefined && sandboxExitedConfirmed) {
+          updated = withoutSandboxCleanupPending(updated);
+          changed = true;
+        }
+        if (changed) {
+          yield* writePersistedRunWith(storeDeps, updated);
+        }
+      });
 
       const completeRecoveredWorkflow = Effect.fn("WorkflowService.completeRecoveredWorkflow")(
         function* (targetTask: OrchestrationV2Subagent, maxAttempts: number, attemptOffset = 0) {
@@ -2159,19 +2685,40 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
       );
 
       const deferCleanupInBackground = Effect.fn("WorkflowService.deferCleanupInBackground")(
-        function* (
-          targetTaskId: NodeId | null,
-          needsWorkflowCompletion: boolean,
-          initialError: unknown,
-        ) {
+        function* (input: {
+          readonly targetTaskId: NodeId | null;
+          readonly needsWorkflowCompletion: boolean;
+          readonly childCleanupPending: boolean;
+          readonly sandboxVerification: SandboxExitVerification;
+          readonly initialError: unknown;
+        }) {
+          const { targetTaskId, needsWorkflowCompletion } = input;
+          let childrenDone = !input.childCleanupPending;
+          let sandboxDone = input.sandboxVerification.confirmedExited;
+          let sandboxRetriable =
+            !input.sandboxVerification.confirmedExited &&
+            input.sandboxVerification.state === "alive";
+          const persistedSandboxGate = persisted?.sandboxCleanupPending;
+
           yield* Effect.logWarning("workflow.startup-sweep.cleanup-deferred", {
             runId,
             taskId: targetTaskId,
-            error: initialError,
+            childCleanupPending: !childrenDone,
+            sandboxCleanupPending: !sandboxDone,
+            error: input.initialError,
           });
-          // Persist the cleanup gate before touching SQL so a failed write fails startup closed.
+          // Persist the cleanup gates before touching SQL so a failed write fails startup closed.
           if (persisted !== undefined) {
-            yield* writePersistedRunStrictWith(storeDeps, { ...persisted, cleanupPending: true });
+            let gatedRecord: PersistedWorkflowRun = persisted;
+            if (!childrenDone) {
+              gatedRecord = { ...gatedRecord, cleanupPending: true };
+            } else if (gatedRecord.cleanupPending === true) {
+              gatedRecord = withoutChildCleanupPending(gatedRecord);
+            }
+            if (sandboxDone && gatedRecord.sandboxCleanupPending !== undefined) {
+              gatedRecord = withoutSandboxCleanupPending(gatedRecord);
+            }
+            yield* writePersistedRunStrictWith(storeDeps, gatedRecord);
           }
           if (needsWorkflowCompletion && targetTaskId !== null) {
             // Close admission and queued promotion in SQL before provider recovery runs.
@@ -2206,6 +2753,11 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
                 }),
               ),
             );
+          }
+
+          // When only an unverifiable sandbox identity remains, stay fail-closed without spinning.
+          if (childrenDone && !sandboxRetriable && !sandboxDone) {
+            return;
           }
 
           yield* Effect.gen(function* () {
@@ -2246,24 +2798,55 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
                 }
               }
               const bgAttemptOffset = 1 + attempt;
-              const stopOutcome = yield* stopAllWorkflowChildren({
-                threadManagement,
-                parentThreadId,
-                workflowTaskId: targetTaskId,
-                runId,
-                reason: "Server restarted while parent workflow was running.",
-                extraChildren: journalChildren,
-                maxAttempts: 1,
-                attemptOffset: bgAttemptOffset,
-              }).pipe(Effect.result);
-              if (Result.isFailure(stopOutcome)) {
-                yield* Effect.logWarning("workflow.startup-sweep.background-cleanup.retrying", {
+              if (!childrenDone) {
+                const stopOutcome = yield* stopAllWorkflowChildren({
+                  threadManagement,
+                  parentThreadId,
+                  workflowTaskId: targetTaskId,
                   runId,
-                  taskId: targetTaskId,
-                  attempt: attempt + 1,
-                  error: stopOutcome.failure,
-                });
-                continue;
+                  reason: "Server restarted while parent workflow was running.",
+                  extraChildren: journalChildren,
+                  maxAttempts: 1,
+                  attemptOffset: bgAttemptOffset,
+                }).pipe(Effect.result);
+                if (Result.isFailure(stopOutcome)) {
+                  yield* Effect.logWarning("workflow.startup-sweep.background-cleanup.retrying", {
+                    runId,
+                    taskId: targetTaskId,
+                    attempt: attempt + 1,
+                    error: stopOutcome.failure,
+                  });
+                  continue;
+                }
+                childrenDone = true;
+              }
+              if (!sandboxDone) {
+                if (!sandboxRetriable) {
+                  if (persisted !== undefined && persisted.cleanupPending === true) {
+                    yield* writePersistedRunWith(storeDeps, withoutChildCleanupPending(persisted));
+                  }
+                  return;
+                }
+                const nextSandboxCheck = yield* verifySandboxCleanupPending(
+                  processInspector,
+                  runId,
+                  targetTaskId,
+                  persistedSandboxGate,
+                );
+                if (!nextSandboxCheck.confirmedExited) {
+                  if (nextSandboxCheck.state === "unverifiable") {
+                    sandboxRetriable = false;
+                    if (persisted !== undefined && persisted.cleanupPending === true) {
+                      yield* writePersistedRunWith(
+                        storeDeps,
+                        withoutChildCleanupPending(persisted),
+                      );
+                    }
+                    return;
+                  }
+                  continue;
+                }
+                sandboxDone = true;
               }
               if (currentTask !== undefined && !isTerminalSubagentStatus(currentTask.status)) {
                 const completeOutcome = yield* completeRecoveredWorkflow(
@@ -2280,10 +2863,10 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
                   });
                   continue;
                 }
-                yield* reconcilePersistedAfterCleanup(completeOutcome.success, true);
+                yield* reconcilePersistedAfterCleanup(completeOutcome.success, true, true);
                 return;
               }
-              yield* reconcilePersistedAfterCleanup(currentTask, true);
+              yield* reconcilePersistedAfterCleanup(currentTask, true, true);
               return;
             }
           }).pipe(
@@ -2303,17 +2886,31 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
         stillUnconfirmed.has(childThreadId),
       ).length;
       const childrenConfirmed = item.dispatchError === undefined && candidateUnconfirmedCount === 0;
+      const sandboxVerification = yield* verifySandboxCleanupPending(
+        processInspector,
+        runId,
+        taskId,
+        persisted?.sandboxCleanupPending,
+      );
 
       if (item.isSqlActive && sqlTask !== undefined && taskId !== null) {
-        if (!childrenConfirmed) {
-          yield* deferCleanupInBackground(
-            taskId,
-            true,
-            item.dispatchError ??
-              new WorkflowStopNotConfirmedError({
-                messageText: `${candidateUnconfirmedCount} workflow child thread(s) did not confirm stopped during startup.`,
-              }),
-          );
+        if (!childrenConfirmed || !sandboxVerification.confirmedExited) {
+          yield* deferCleanupInBackground({
+            targetTaskId: taskId,
+            needsWorkflowCompletion: true,
+            childCleanupPending: !childrenConfirmed,
+            sandboxVerification,
+            initialError: !childrenConfirmed
+              ? (item.dispatchError ??
+                new WorkflowStopNotConfirmedError({
+                  messageText: `${candidateUnconfirmedCount} workflow child thread(s) did not confirm stopped during startup.`,
+                }))
+              : new WorkflowStopNotConfirmedError({
+                  messageText: !sandboxVerification.confirmedExited
+                    ? sandboxVerification.reason
+                    : "Cleanup pending.",
+                }),
+          });
           return;
         }
         const completed = yield* completeRecoveredWorkflow(
@@ -2321,25 +2918,40 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
           STARTUP_RECOVERY_MAX_ATTEMPTS,
         ).pipe(Effect.result);
         if (Result.isFailure(completed)) {
-          yield* deferCleanupInBackground(taskId, true, completed.failure);
+          yield* deferCleanupInBackground({
+            targetTaskId: taskId,
+            needsWorkflowCompletion: true,
+            childCleanupPending: false,
+            sandboxVerification,
+            initialError: completed.failure,
+          });
           return;
         }
-        yield* reconcilePersistedAfterCleanup(completed.success, true);
+        yield* reconcilePersistedAfterCleanup(completed.success, true, true);
         return;
       }
 
-      if (item.shouldConfirmChildren && !childrenConfirmed) {
-        yield* deferCleanupInBackground(
-          taskId,
-          false,
-          item.dispatchError ??
-            new WorkflowStopNotConfirmedError({
-              messageText: `${candidateUnconfirmedCount} workflow child thread(s) did not confirm stopped during startup.`,
-            }),
-        );
+      const childCleanupPending = item.shouldConfirmChildren && !childrenConfirmed;
+      if (childCleanupPending || !sandboxVerification.confirmedExited) {
+        yield* deferCleanupInBackground({
+          targetTaskId: taskId,
+          needsWorkflowCompletion: false,
+          childCleanupPending,
+          sandboxVerification,
+          initialError: childCleanupPending
+            ? (item.dispatchError ??
+              new WorkflowStopNotConfirmedError({
+                messageText: `${candidateUnconfirmedCount} workflow child thread(s) did not confirm stopped during startup.`,
+              }))
+            : new WorkflowStopNotConfirmedError({
+                messageText: !sandboxVerification.confirmedExited
+                  ? sandboxVerification.reason
+                  : "Cleanup pending.",
+              }),
+        });
         return;
       }
-      yield* reconcilePersistedAfterCleanup(sqlTask, item.shouldConfirmChildren);
+      yield* reconcilePersistedAfterCleanup(sqlTask, item.shouldConfirmChildren, true);
     }).pipe(
       Effect.tapDefect((cause) =>
         Effect.logError("workflow.startup-sweep.entry-defect", {
@@ -2359,12 +2971,14 @@ const make = Effect.gen(function* () {
   const path = yield* Path.Path;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
   const orchestratorMcp = yield* OrchestratorMcpService.OrchestratorMcpService;
+  const processInspector = yield* WorkflowSandboxProcessInspector;
   const storeDeps = { fileSystem, path, workflowsDir: serverConfig.workflowRunsDir };
 
   interface TrackedSandboxWorker {
     readonly runId: string;
     readonly taskId: NodeId;
     readonly worker: WorkflowSandboxWorker;
+    readonly getSandboxCleanupPending: () => Effect.Effect<PersistedSandboxCleanupPending>;
   }
   const trackedWorkers = new Map<string, TrackedSandboxWorker>();
 
@@ -2385,6 +2999,15 @@ const make = Effect.gen(function* () {
               if (trackedWorkers.get(entry.runId) === entry) {
                 trackedWorkers.delete(entry.runId);
               }
+              const existing = yield* readPersistedRunWith(storeDeps, entry.runId).pipe(
+                Effect.orElseSucceed(() => Option.none<PersistedWorkflowRun>()),
+              );
+              if (Option.isSome(existing) && existing.value.sandboxCleanupPending !== undefined) {
+                yield* writePersistedRunWith(
+                  storeDeps,
+                  withoutSandboxCleanupPending(existing.value),
+                );
+              }
               return;
             }
             yield* Effect.logError("workflow.sandbox.shutdown-cleanup-failed", {
@@ -2394,6 +3017,16 @@ const make = Effect.gen(function* () {
               attempts: outcome.attempts,
               cause: outcome.cause,
             });
+            const sandboxCleanupPending = yield* entry.getSandboxCleanupPending();
+            const existing = yield* readPersistedRunWith(storeDeps, entry.runId).pipe(
+              Effect.orElseSucceed(() => Option.none<PersistedWorkflowRun>()),
+            );
+            if (Option.isSome(existing)) {
+              yield* writePersistedRunWith(storeDeps, {
+                ...existing.value,
+                sandboxCleanupPending,
+              });
+            }
           }).pipe(Effect.ignore),
         { concurrency: "unbounded", discard: true },
       );
@@ -2448,7 +3081,9 @@ const make = Effect.gen(function* () {
     readonly args: unknown;
     readonly runTarget: OrchestratorMcpTarget | undefined;
     readonly tokenBudget: number | undefined;
-    readonly cursor: ReplayCursor | undefined;
+    readonly replaySource:
+      | { readonly journalPath: string; readonly index: ReplayIndex }
+      | undefined;
     readonly done: Deferred.Deferred<void>;
     readonly onRegisterLive: (live: LiveWorkflowRun) => void;
   }) {
@@ -2468,13 +3103,14 @@ const make = Effect.gen(function* () {
       args,
       runTarget,
       tokenBudget,
-      cursor,
+      replaySource,
       done,
     } = params;
 
     const abortController = createHostAbortController();
     const agentsAbortDeferred = yield* Deferred.make<void>();
     const progressSignal = yield* Queue.dropping<void>(1);
+    const openFile = yield* WorkflowScriptFileOpener;
     const runtimeContext = yield* Effect.context<never>();
     const runPromise = Effect.runPromiseWith(runtimeContext);
 
@@ -2493,12 +3129,118 @@ const make = Effect.gen(function* () {
         const awaitScriptReadsClosed = Effect.promise(() => startClosingScriptReads());
         yield* Effect.addFinalizer(() => awaitScriptReadsClosed);
 
+        let replayFileScope: Scope.Closeable | undefined;
+        let replayFile: OpenWorkflowScriptFile | undefined;
+        let replayFileClosing: Promise<void> | undefined;
+        const closeReplayFileScope = (): Promise<void> => {
+          if (replayFileClosing !== undefined) return replayFileClosing;
+          const scopeToClose = replayFileScope;
+          replayFileScope = undefined;
+          replayFile = undefined;
+          if (scopeToClose === undefined) return Promise.resolve();
+          replayFileClosing = runPromise(Scope.close(scopeToClose, Exit.void).pipe(Effect.ignore));
+          return replayFileClosing;
+        };
+
+        const loadReplayValue = (
+          sourceJournalPath: string,
+        ): ((
+          entry: ReplayIndexEntry,
+          expectedIndex: number,
+        ) => Effect.Effect<unknown, WorkflowReplayLoadError>) =>
+          Effect.fn("WorkflowService.loadReplayValue")(function* (
+            entry: ReplayIndexEntry,
+            expectedIndex: number,
+          ) {
+            const toLoadError = (reason: string) =>
+              new WorkflowReplayLoadError({
+                journalPath: sourceJournalPath,
+                index: expectedIndex,
+                reason,
+              });
+            const bytes = yield* Effect.gen(function* () {
+              if (replayFile !== undefined) {
+                return yield* readJournalBytesAtSpan(replayFile, sourceJournalPath, {
+                  offset: entry.offset,
+                  length: entry.length,
+                });
+              }
+              const candidateScope = yield* Scope.make();
+              const opened = yield* openFile(sourceJournalPath).pipe(
+                Scope.provide(candidateScope),
+                Effect.tapError(() => Scope.close(candidateScope, Exit.void).pipe(Effect.ignore)),
+              );
+              const info = yield* opened.stat.pipe(
+                Effect.tapError(() => Scope.close(candidateScope, Exit.void).pipe(Effect.ignore)),
+              );
+              if (!info.isRegularFile) {
+                yield* Scope.close(candidateScope, Exit.void).pipe(Effect.ignore);
+                return yield* new WorkflowScriptNotRegularFileError({
+                  scriptPath: sourceJournalPath,
+                });
+              }
+              if (opened.readAt !== undefined) {
+                replayFileScope = candidateScope;
+                replayFile = opened;
+                return yield* readJournalBytesAtSpan(opened, sourceJournalPath, {
+                  offset: entry.offset,
+                  length: entry.length,
+                });
+              }
+              return yield* readJournalBytesAtSpan(opened, sourceJournalPath, {
+                offset: entry.offset,
+                length: entry.length,
+              }).pipe(Effect.ensuring(Scope.close(candidateScope, Exit.void).pipe(Effect.ignore)));
+            }).pipe(Effect.mapError((error) => toLoadError(errorMessage(error))));
+
+            if (bytes.byteLength !== entry.length) {
+              return yield* toLoadError(
+                `Expected ${entry.length} bytes at offset ${entry.offset}, got ${bytes.byteLength}.`,
+              );
+            }
+            const decoded = decodeUtf8Strict(bytes);
+            if (!decoded.ok) {
+              return yield* toLoadError(`Invalid UTF-8 (${errorMessage(decoded.cause)}).`);
+            }
+            const parsed = parseJournalLine(decoded.text.trim());
+            if (
+              parsed === undefined ||
+              parsed.type !== "result" ||
+              parsed.index !== expectedIndex ||
+              parsed.key !== entry.key ||
+              parsed.outcome !== "ok"
+            ) {
+              return yield* toLoadError("Journal entry changed or no longer matches replay index.");
+            }
+            return parsed.value;
+          });
+
+        const cursor: IndexedReplayCursor<WorkflowReplayLoadError> | undefined =
+          replaySource === undefined
+            ? undefined
+            : createIndexedReplayCursor({
+                index: replaySource.index,
+                loadValue: loadReplayValue(replaySource.journalPath),
+                maxCacheEntries: DEFAULT_REPLAY_CACHE_MAX_ENTRIES,
+                maxCacheBytes: DEFAULT_REPLAY_CACHE_MAX_BYTES,
+                onBreak: () => {
+                  void closeReplayFileScope();
+                },
+              });
+
+        yield* Effect.addFinalizer(() =>
+          Effect.promise(() => closeReplayFileScope()).pipe(
+            Effect.andThen(Effect.sync(() => cursor?.clear())),
+          ),
+        );
+
         const journalWriter = yield* makeJournalWriter({
           writeLine: (line) => fileSystem.writeFileString(journalPath, line, { flag: "a" }),
           onWriteError: (error) =>
             Effect.logWarning("workflow.journal.append-failed", { runId, error }),
           maxPending: MAX_PENDING_JOURNAL_ENTRIES,
           maxPendingBytes: MAX_PENDING_JOURNAL_BYTES,
+          maxRecordBytes: MAX_JOURNAL_LINE_BYTES,
         });
 
         interface TrackedRepromptRun {
@@ -2596,7 +3338,19 @@ const make = Effect.gen(function* () {
         };
 
         const appendJournal = (entry: JournalEntry): Effect.Effect<void> =>
-          journalWriter.append(entry).pipe(Effect.asVoid);
+          journalWriter.append(entry).pipe(
+            Effect.catchTags({
+              JournalRecordTooLargeError: (error) =>
+                Effect.logWarning("workflow.journal.record-too-large", {
+                  runId,
+                  entryType: error.entryType,
+                  bytes: error.bytes,
+                  maxBytes: error.maxBytes,
+                  error,
+                }),
+            }),
+            Effect.asVoid,
+          );
 
         const pushLogInMemory = (message: string): void => {
           logs.push(message);
@@ -3017,21 +3771,16 @@ const make = Effect.gen(function* () {
             liveRecord.key = key;
 
             yield* Effect.promise(() => prevReplayGate);
-            let replayed:
-              | { readonly cached: true; readonly value: unknown }
-              | { readonly cached: false };
-            try {
-              if (stopRequested || abortController.signal.aborted) {
-                replayed = { cached: false };
-              } else {
-                replayed =
-                  cursor === undefined
-                    ? ({ cached: false } as const)
-                    : cursor.take(call.index, key);
+            const replayedOutcome = yield* Effect.gen(function* () {
+              if (stopRequested || abortController.signal.aborted || cursor === undefined) {
+                return { cached: false } as const;
               }
-            } finally {
-              releaseGateOnce();
+              return yield* cursor.take(call.index, key);
+            }).pipe(Effect.ensuring(Effect.sync(releaseGateOnce)), Effect.result);
+            if (Result.isFailure(replayedOutcome)) {
+              return failRunFromHostLimit(replayedOutcome.failure.message);
             }
+            const replayed = replayedOutcome.success;
 
             if (stopRequested) {
               return yield* abortStoppedAgent(liveRecord);
@@ -3653,7 +4402,16 @@ const make = Effect.gen(function* () {
           onPhase: (title) => {
             if (workerClosed) return;
             const phaseInfo = ensurePhase(title);
-            if (!journalWriter.tryAppend({ type: "phase", title: phaseInfo.title })) {
+            let accepted: boolean;
+            try {
+              accepted = journalWriter.tryAppend({ type: "phase", title: phaseInfo.title });
+            } catch (err) {
+              if (isJournalRecordTooLargeError(err)) {
+                failRunFromHostLimit(err.message);
+              }
+              throw err;
+            }
+            if (!accepted) {
               failRunFromHostLimit(
                 `Workflow journal write backlog exceeded its ${MAX_PENDING_JOURNAL_ENTRIES}-entry or ${MAX_PENDING_JOURNAL_BYTES / (1024 * 1024)} MiB limit.`,
               );
@@ -3663,7 +4421,16 @@ const make = Effect.gen(function* () {
           },
           onLog: (message) => {
             if (workerClosed) return;
-            if (!journalWriter.tryAppend({ type: "log", message })) {
+            let accepted: boolean;
+            try {
+              accepted = journalWriter.tryAppend({ type: "log", message });
+            } catch (err) {
+              if (isJournalRecordTooLargeError(err)) {
+                failRunFromHostLimit(err.message);
+              }
+              throw err;
+            }
+            if (!accepted) {
               failRunFromHostLimit(
                 `Workflow journal write backlog exceeded its ${MAX_PENDING_JOURNAL_ENTRIES}-entry or ${MAX_PENDING_JOURNAL_BYTES / (1024 * 1024)} MiB limit.`,
               );
@@ -3825,6 +4592,42 @@ const make = Effect.gen(function* () {
         const runSandboxScript = yield* WorkflowSandboxRunner;
         let spawnedWorker: WorkflowSandboxWorker | undefined;
         let trackedWorkerEntry: TrackedSandboxWorker | undefined;
+        let spawnedWorkerIdentityPromise:
+          | Promise<
+              | { readonly ok: true; readonly identity: SandboxProcessIdentity }
+              | { readonly ok: false; readonly reason: string }
+            >
+          | undefined;
+        const buildSandboxCleanupPending = Effect.fn("WorkflowService.buildSandboxCleanupPending")(
+          function* (): Effect.fn.Return<PersistedSandboxCleanupPending> {
+            const pid = spawnedWorker?.pid;
+            if (spawnedWorkerIdentityPromise !== undefined) {
+              const captured = yield* Effect.promise(() => spawnedWorkerIdentityPromise!);
+              if (captured.ok) {
+                return {
+                  pid: captured.identity.pid,
+                  startTime: captured.identity.startTime,
+                };
+              }
+              return {
+                ...(pid === undefined ? {} : { pid }),
+                reason: captured.reason,
+              };
+            }
+            if (pid !== undefined) {
+              const captured = yield* processInspector.captureIdentity(pid);
+              if (captured.ok) {
+                return {
+                  pid: captured.identity.pid,
+                  startTime: captured.identity.startTime,
+                };
+              }
+              return { pid, reason: captured.reason };
+            }
+            return { reason: "Sandbox worker PID was unavailable." };
+          },
+        );
+
         const scriptOutcome = yield* Effect.tryPromise({
           try: (signal) => {
             signal.addEventListener(
@@ -3847,7 +4650,21 @@ const make = Effect.gen(function* () {
               concurrency,
               onWorkerSpawned: (worker) => {
                 spawnedWorker = worker;
-                const entry: TrackedSandboxWorker = { runId, taskId, worker };
+                const workerPid = worker.pid;
+                if (workerPid !== undefined) {
+                  spawnedWorkerIdentityPromise = runPromise(
+                    processInspector.captureIdentity(workerPid),
+                  ).catch((cause) => ({
+                    ok: false as const,
+                    reason: `Failed to capture sandbox worker identity for pid ${workerPid}: ${errorMessage(cause)}`,
+                  }));
+                }
+                const entry: TrackedSandboxWorker = {
+                  runId,
+                  taskId,
+                  worker,
+                  getSandboxCleanupPending: () => buildSandboxCleanupPending(),
+                };
                 trackedWorkerEntry = entry;
                 trackedWorkers.set(runId, entry);
               },
@@ -3895,12 +4712,14 @@ const make = Effect.gen(function* () {
           Result.isFailure(scriptOutcome) &&
           scriptOutcome.failure._tag === "WorkflowSandboxCleanupPendingError";
         const sandboxCleanupPending = workerStillAlive || sandboxKillAlreadyAttempted;
+        let childrenCleanupDone = false;
         if (sandboxCleanupPending) {
+          const pendingSandboxGate = yield* buildSandboxCleanupPending();
           const pendingAt = yield* Clock.currentTimeMillis;
           yield* writePersistedRun({
             ...buildPersistedRecord(pendingAt),
             status: "running",
-            cleanupPending: true,
+            sandboxCleanupPending: pendingSandboxGate,
           });
         }
 
@@ -3958,6 +4777,18 @@ const make = Effect.gen(function* () {
         const sandboxCleanupFiber =
           spawnedWorker !== undefined && !spawnedWorker.isConfirmedDone()
             ? yield* confirmSandboxWorkerExited(spawnedWorker, sandboxKillAlreadyAttempted).pipe(
+                Effect.tap(() =>
+                  Effect.gen(function* () {
+                    if (!childrenCleanupDone && sandboxCleanupPending) {
+                      const exitedAt = yield* Clock.currentTimeMillis;
+                      yield* writePersistedRun({
+                        ...buildPersistedRecord(exitedAt),
+                        status: "running",
+                        cleanupPending: true,
+                      });
+                    }
+                  }),
+                ),
                 Effect.forkScoped,
               )
             : undefined;
@@ -3996,6 +4827,7 @@ const make = Effect.gen(function* () {
           extraChildren: trackedOwnedChildren(),
           maxAttempts: Number.POSITIVE_INFINITY,
         });
+        childrenCleanupDone = true;
         if (sandboxCleanupFiber !== undefined) {
           yield* Fiber.join(sandboxCleanupFiber);
         }
@@ -4218,7 +5050,7 @@ const make = Effect.gen(function* () {
       );
     }
 
-    let cursor: ReplayCursor | undefined;
+    let replaySource: { readonly journalPath: string; readonly index: ReplayIndex } | undefined;
     if (input.resumeFromRunId !== undefined) {
       const sourceRunId = input.resumeFromRunId;
       if (!isSafeRunId(sourceRunId)) {
@@ -4253,6 +5085,21 @@ const make = Effect.gen(function* () {
           `Workflow run "${sourceRunId}" still has child cleanup pending and cannot be resumed until its child stops are confirmed.`,
         );
       }
+      if (sourcePersisted.value.sandboxCleanupPending !== undefined) {
+        const sandboxCheck = yield* verifySandboxCleanupPending(
+          processInspector,
+          sourceRunId,
+          sourcePersisted.value.taskId,
+          sourcePersisted.value.sandboxCleanupPending,
+        );
+        if (!sandboxCheck.confirmedExited) {
+          return yield* failure(
+            "invalid_request",
+            `Workflow run "${sourceRunId}" still has sandbox cleanup pending (${sandboxCheck.reason}) and cannot be resumed until sandbox exit is confirmed.`,
+          );
+        }
+        yield* writePersistedRun(withoutSandboxCleanupPending(sourcePersisted.value));
+      }
       if (sourcePersisted.value.status === "running") {
         return yield* failure(
           "invalid_request",
@@ -4273,7 +5120,7 @@ const make = Effect.gen(function* () {
         }
       }
       const prevJournalPath = journalPathFor(sourceRunId);
-      const prevJournal = yield* readReplayCursorFromJournal(prevJournalPath).pipe(
+      const prevJournal = yield* readReplayIndexFromJournal(prevJournalPath).pipe(
         Effect.mapError((error) =>
           error._tag === "WorkflowJournalCorruptError"
             ? failure("invalid_request", error.message)
@@ -4289,7 +5136,7 @@ const make = Effect.gen(function* () {
           `Journal not found for workflow run "${sourceRunId}".`,
         );
       }
-      cursor = prevJournal.cursor;
+      replaySource = { journalPath: prevJournalPath, index: prevJournal.index };
     }
 
     const runId = yield* generateRunId;
@@ -4417,7 +5264,7 @@ const make = Effect.gen(function* () {
       args: input.args,
       runTarget: input.target,
       tokenBudget: input.tokenBudget,
-      cursor,
+      replaySource,
       done,
       onRegisterLive: (live) => {
         liveRuns.set(runId, live);
@@ -4555,6 +5402,14 @@ const make = Effect.gen(function* () {
     }
 
     const record = Option.getOrThrow(persisted);
+    const hasPendingSandbox = record.sandboxCleanupPending !== undefined;
+    const checkStoppedSandbox = () =>
+      verifySandboxCleanupPending(
+        processInspector,
+        runId,
+        targetTaskId,
+        record.sandboxCleanupPending,
+      );
     const readStopJournal = () =>
       scanCanonicalJournalForRecovery(journalPathFor(runId)).pipe(
         Effect.catch((error) =>
@@ -4573,18 +5428,33 @@ const make = Effect.gen(function* () {
       );
     if (targetTaskId === null) {
       const nextStatus = record.status === "running" ? "cancelled" : record.status;
-      if (record.status === "running" || record.cleanupPending === true) {
-        const journalScan = yield* readStopJournal();
-        yield* stopAllWorkflowChildren({
-          threadManagement,
-          parentThreadId: targetThreadId,
-          workflowTaskId: null,
-          runId,
-          reason: "Workflow stopped.",
-          extraChildren: journalScan.journalChildren,
-          maxAttempts: STARTUP_RECOVERY_MAX_ATTEMPTS,
-        }).pipe(Effect.mapError(threadManagementFailure));
-        yield* writePersistedRun({ ...withoutCleanupPending(record), status: nextStatus });
+      if (record.status === "running" || record.cleanupPending === true || hasPendingSandbox) {
+        if (record.status === "running" || record.cleanupPending === true) {
+          const journalScan = yield* readStopJournal();
+          yield* stopAllWorkflowChildren({
+            threadManagement,
+            parentThreadId: targetThreadId,
+            workflowTaskId: null,
+            runId,
+            reason: "Workflow stopped.",
+            extraChildren: journalScan.journalChildren,
+            maxAttempts: STARTUP_RECOVERY_MAX_ATTEMPTS,
+          }).pipe(Effect.mapError(threadManagementFailure));
+        }
+        const sandboxCheck = yield* checkStoppedSandbox();
+        if (!sandboxCheck.confirmedExited) {
+          if (record.cleanupPending === true) {
+            yield* writePersistedRun(withoutChildCleanupPending(record));
+          }
+          return yield* failure(
+            "orchestration_error",
+            `Workflow sandbox cleanup for run "${runId}" is still pending: ${sandboxCheck.reason}`,
+          );
+        }
+        yield* writePersistedRun({
+          ...withoutSandboxCleanupPending(withoutChildCleanupPending(record)),
+          status: nextStatus,
+        });
       }
       return { runId, status: nextStatus };
     }
@@ -4596,24 +5466,39 @@ const make = Effect.gen(function* () {
     ).pipe(Effect.mapError(threadManagementFailure));
     if (sqlTask === undefined) {
       const nextStatus = record.status === "running" ? "cancelled" : record.status;
-      if (record.status === "running" || record.cleanupPending === true) {
-        const journalScan = yield* readStopJournal();
-        yield* stopAllWorkflowChildren({
-          threadManagement,
-          parentThreadId: targetThreadId,
-          workflowTaskId: targetTaskId,
-          runId,
-          reason: "Workflow stopped.",
-          extraChildren: journalScan.journalChildren,
-          maxAttempts: STARTUP_RECOVERY_MAX_ATTEMPTS,
-        }).pipe(Effect.mapError(threadManagementFailure));
-        yield* writePersistedRun({ ...withoutCleanupPending(record), status: nextStatus });
+      if (record.status === "running" || record.cleanupPending === true || hasPendingSandbox) {
+        if (record.status === "running" || record.cleanupPending === true) {
+          const journalScan = yield* readStopJournal();
+          yield* stopAllWorkflowChildren({
+            threadManagement,
+            parentThreadId: targetThreadId,
+            workflowTaskId: targetTaskId,
+            runId,
+            reason: "Workflow stopped.",
+            extraChildren: journalScan.journalChildren,
+            maxAttempts: STARTUP_RECOVERY_MAX_ATTEMPTS,
+          }).pipe(Effect.mapError(threadManagementFailure));
+        }
+        const sandboxCheck = yield* checkStoppedSandbox();
+        if (!sandboxCheck.confirmedExited) {
+          if (record.cleanupPending === true) {
+            yield* writePersistedRun(withoutChildCleanupPending(record));
+          }
+          return yield* failure(
+            "orchestration_error",
+            `Workflow sandbox cleanup for run "${runId}" is still pending: ${sandboxCheck.reason}`,
+          );
+        }
+        yield* writePersistedRun({
+          ...withoutSandboxCleanupPending(withoutChildCleanupPending(record)),
+          status: nextStatus,
+        });
       }
       return { runId, status: nextStatus };
     }
     if (isTerminalSubagentStatus(sqlTask.status)) {
       const sqlStatus = subagentStatusToWorkflowStatus(sqlTask.status);
-      if (record.status === "running" || record.cleanupPending === true) {
+      if (record.status === "running" || record.cleanupPending === true || hasPendingSandbox) {
         const confirmedChildren = record.cleanupPending === true || sqlTask.status !== "completed";
         const needsEndEntry =
           record.status === "running" &&
@@ -4639,6 +5524,16 @@ const make = Effect.gen(function* () {
             maxAttempts: STARTUP_RECOVERY_MAX_ATTEMPTS,
           }).pipe(Effect.mapError(threadManagementFailure));
         }
+        const sandboxCheck = yield* checkStoppedSandbox();
+        if (!sandboxCheck.confirmedExited) {
+          if (confirmedChildren && record.cleanupPending === true) {
+            yield* writePersistedRun(withoutChildCleanupPending(record));
+          }
+          return yield* failure(
+            "orchestration_error",
+            `Workflow sandbox cleanup for run "${runId}" is still pending: ${sandboxCheck.reason}`,
+          );
+        }
         yield* reconcilePersistedFromSql(
           storeDeps,
           record,
@@ -4647,6 +5542,7 @@ const make = Effect.gen(function* () {
           "Stopped.",
           {
             clearCleanupPending: confirmedChildren,
+            clearSandboxCleanupPending: true,
           },
         );
       }
@@ -4681,6 +5577,17 @@ const make = Effect.gen(function* () {
       maxAttempts: STARTUP_RECOVERY_MAX_ATTEMPTS,
     }).pipe(Effect.mapError(threadManagementFailure));
 
+    const sandboxCheck = yield* checkStoppedSandbox();
+    if (!sandboxCheck.confirmedExited) {
+      if (record.cleanupPending === true) {
+        yield* writePersistedRun(withoutChildCleanupPending(record));
+      }
+      return yield* failure(
+        "orchestration_error",
+        `Workflow sandbox cleanup for run "${runId}" is still pending: ${sandboxCheck.reason}`,
+      );
+    }
+
     const stoppedAt = yield* Clock.currentTimeMillis;
     const latestTask = yield* readWorkflowTaskStrict(
       threadManagement,
@@ -4701,8 +5608,11 @@ const make = Effect.gen(function* () {
     }).pipe(Effect.mapError(threadManagementFailure));
 
     const finalStatus = subagentStatusToWorkflowStatus(confirmedTask.status);
-    if (record.status === "running" || record.cleanupPending === true) {
-      yield* writePersistedRun({ ...withoutCleanupPending(record), status: finalStatus });
+    if (record.status === "running" || record.cleanupPending === true || hasPendingSandbox) {
+      yield* writePersistedRun({
+        ...withoutSandboxCleanupPending(withoutChildCleanupPending(record)),
+        status: finalStatus,
+      });
     }
     return { runId, status: finalStatus };
   });
