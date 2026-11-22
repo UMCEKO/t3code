@@ -12,17 +12,21 @@ import {
   WORKFLOW_MESSAGE_LIMITS,
   WORKFLOW_PROGRESS_LIMITS,
   WORKFLOW_SANDBOX_PROCESS_LIMITS,
+  WorkflowSandboxCleanupError,
   WorkflowScriptError,
   buildWorkflowSandboxCommand,
   createWorkflowHostMessageReceiver,
+  getUnconfirmedSandboxChildPids,
   makeBoundedLineSplitter,
   parseWorkflowMeta,
+  reapUnconfirmedSandboxChildren,
   resolveWorkflowSandboxEntryPath,
   runWorkflowScript,
   terminateSandboxChild,
   workflowConcurrency,
   type WorkflowAgentCall,
   type WorkflowHost,
+  type WorkflowSandboxCleanupFailure,
 } from "./sandbox.ts";
 import {
   WORKFLOW_SANDBOX_WORKER_ARG,
@@ -1191,6 +1195,7 @@ describe("sandbox", () => {
       // A kill failure other than ESRCH must not claim the child exited.
       let destroyed = 0;
       let confirmedExit = false;
+      let killAttempts = 0;
       const epermOutcome = await terminateSandboxChild({
         child: {
           pid: 999_999,
@@ -1212,6 +1217,7 @@ describe("sandbox", () => {
             },
           },
           kill: () => {
+            killAttempts += 1;
             const err = new Error("Operation not permitted") as Error & { code: string };
             err.code = "EPERM";
             throw err;
@@ -1222,10 +1228,17 @@ describe("sandbox", () => {
           confirmedExit = true;
         },
         waitForExit: () => new Promise<void>(() => {}),
+        maxKillAttempts: 2,
+        retryDelayMs: 0,
       });
       expect(destroyed).toBe(3);
+      expect(killAttempts).toBe(2);
       expect(confirmedExit).toBe(false);
-      expect(epermOutcome).toBe("kill_failed");
+      expect(epermOutcome).toMatchObject({
+        status: "kill_failed",
+        pid: 999_999,
+        attempts: 2,
+      });
 
       // ESRCH means the process is already gone and confirms exit.
       let esrchConfirmed = false;
@@ -1248,9 +1261,161 @@ describe("sandbox", () => {
           esrchConfirmed = true;
         },
         waitForExit: () => new Promise<void>(() => {}),
+        retryDelayMs: 0,
       });
       expect(esrchConfirmed).toBe(true);
-      expect(esrchOutcome).toBe("exited");
+      expect(esrchOutcome).toEqual({ status: "exited" });
+    });
+
+    it("retries transient kill failures in runWorkflowScript, keeps ownership on persistent kill failures, and distinguishes spawn errors from live-PID errors", async () => {
+      // 1. Transient EPERM kill failure succeeds on bounded retry and confirms exit on real child exit/close.
+      let transientAttempts = 0;
+      await expect(
+        runWorkflowScript({
+          script: makeScript("return 1;"),
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+          handshakeTimeoutMs: 80,
+          maxKillAttempts: 4,
+          killRetryDelayMs: 0,
+          spawnCommand: {
+            command: process.execPath,
+            args: ["-e", "setInterval(() => {}, 60_000);"],
+            env: { ELECTRON_RUN_AS_NODE: "1" },
+          },
+          spawnChild: (command, args, opts) => {
+            const realChild = NodeChildProcess.spawn(command, args, opts);
+            const origKill = realChild.kill.bind(realChild);
+            realChild.kill = ((signal?: NodeJS.Signals | number) => {
+              transientAttempts += 1;
+              if (transientAttempts < 3) {
+                const err = new Error("Operation not permitted") as Error & { code: string };
+                err.code = "EPERM";
+                throw err;
+              }
+              return origKill(signal);
+            }) as typeof realChild.kill;
+            return realChild;
+          },
+        }),
+      ).rejects.toThrow(/startup handshake/i);
+      expect(transientAttempts).toBe(3);
+
+      // 2. Persistent EPERM kill failure retries boundedly, keeps PID ownership, reports cleanup failure,
+      //    and rejects with WorkflowSandboxCleanupError until real exit releases ownership.
+      let persistentAttempts = 0;
+      let leakedChild: NodeChildProcess.ChildProcessWithoutNullStreams | undefined;
+      let realKill: NodeChildProcess.ChildProcessWithoutNullStreams["kill"] | undefined;
+      const cleanupFailures: Array<WorkflowSandboxCleanupFailure> = [];
+      try {
+        let caught: unknown;
+        try {
+          await runWorkflowScript({
+            script: makeScript("return 1;"),
+            args: undefined,
+            host: makeHost(),
+            concurrency: 1,
+            handshakeTimeoutMs: 80,
+            maxKillAttempts: 3,
+            killRetryDelayMs: 0,
+            onCleanupFailure: (failure) => {
+              cleanupFailures.push(failure);
+            },
+            spawnCommand: {
+              command: process.execPath,
+              args: ["-e", "setInterval(() => {}, 60_000);"],
+              env: { ELECTRON_RUN_AS_NODE: "1" },
+            },
+            spawnChild: (command, args, opts) => {
+              const child = NodeChildProcess.spawn(command, args, opts);
+              leakedChild = child;
+              realKill = child.kill.bind(child);
+              child.kill = (() => {
+                persistentAttempts += 1;
+                const err = new Error("Operation not permitted") as Error & { code: string };
+                err.code = "EPERM";
+                throw err;
+              }) as typeof child.kill;
+              return child;
+            },
+          });
+        } catch (err) {
+          caught = err;
+        }
+        expect(caught).toBeInstanceOf(WorkflowSandboxCleanupError);
+        expect(persistentAttempts).toBe(3);
+        const leakedPid = leakedChild?.pid;
+        expect(leakedPid).toBeDefined();
+        expect(cleanupFailures).toHaveLength(1);
+        expect(cleanupFailures[0]?.pid).toBe(leakedPid);
+        expect(cleanupFailures[0]?.attempts).toBe(3);
+        expect(getUnconfirmedSandboxChildPids()).toContain(leakedPid);
+
+        // Restoring kill allows reapUnconfirmedSandboxChildren() to retry and release ownership on exit.
+        leakedChild!.kill = realKill!;
+        await reapUnconfirmedSandboxChildren();
+        expect(getUnconfirmedSandboxChildPids()).not.toContain(leakedPid);
+      } finally {
+        if (leakedChild !== undefined && realKill !== undefined && leakedChild.exitCode === null) {
+          realKill("SIGKILL");
+        }
+      }
+
+      // 3. An "error" event on a live spawned PID does NOT mark exited: runner still SIGKILLs and waits for exit.
+      let liveErrorKillCalled = false;
+      let liveChildExitCode: number | null = null;
+      let liveChildSignal: NodeJS.Signals | null = null;
+      const liveErrRun = runWorkflowScript({
+        script: makeScript("return 1;"),
+        args: undefined,
+        host: makeHost(),
+        concurrency: 1,
+        handshakeTimeoutMs: 5_000,
+        spawnCommand: {
+          command: process.execPath,
+          args: ["-e", "setInterval(() => {}, 60_000);"],
+          env: { ELECTRON_RUN_AS_NODE: "1" },
+        },
+        spawnChild: (command, args, opts) => {
+          const child = NodeChildProcess.spawn(command, args, opts);
+          const origKill = child.kill.bind(child);
+          child.kill = ((signal?: NodeJS.Signals | number) => {
+            liveErrorKillCalled = true;
+            return origKill(signal);
+          }) as typeof child.kill;
+          child.once("exit", (code, signal) => {
+            liveChildExitCode = code;
+            liveChildSignal = signal;
+          });
+          child.once("spawn", () => {
+            const err = new Error("simulated live process error") as Error & { code: string };
+            err.code = "EPIPE";
+            child.emit("error", err);
+          });
+          return child;
+        },
+      });
+      await expect(liveErrRun).rejects.toThrow(
+        /Workflow sandbox process error \(EPIPE\): simulated live process error/,
+      );
+      expect(liveErrorKillCalled).toBe(true);
+      expect(liveChildExitCode !== null || liveChildSignal !== null).toBe(true);
+
+      // 4. A real spawn failure (ENOENT, no PID) reports "failed to start" cleanly without hanging.
+      await expect(
+        runWorkflowScript({
+          script: makeScript("return 1;"),
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+          spawnCommand: {
+            command: "/nonexistent-t3-workflow-sandbox-binary",
+            args: [],
+            env: { ELECTRON_RUN_AS_NODE: "1" },
+          },
+        }),
+      ).rejects.toThrow(/Workflow sandbox failed to start \(ENOENT\)/);
     });
 
     it.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
@@ -1679,6 +1844,154 @@ describe("sandbox", () => {
           },
         }),
       ).rejects.toThrow(/output backlog exceeded/i);
+    });
+
+    it("flushes queued worker stdout before writing the final done frame", async () => {
+      const workerModuleUrl = new URL("./sandboxWorker.ts", import.meta.url).href;
+      const cap = 1024;
+      const guardedCorkWorkerScript = `
+        const origWrite = process.stdout.write.bind(process.stdout);
+        let readySent = false;
+        let uncorkScheduled = false;
+        process.stdout.write = (chunk, ...rest) => {
+          const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+          if (readySent && text === "" && !uncorkScheduled) {
+            uncorkScheduled = true;
+            setImmediate(() => process.stdout.uncork());
+            return origWrite(chunk, ...rest);
+          }
+          const ok = origWrite(chunk, ...rest);
+          if (readySent && process.stdout.writableLength > ${cap}) {
+            process.exit(42);
+          }
+          if (!readySent && text.includes('"type":"ready"')) {
+            readySent = true;
+            process.stdout.cork();
+          } else if (text.includes('"type":"done"') || text.includes('"type":"error"')) {
+            process.stdout.uncork();
+          }
+          return ok;
+        };
+        import(${JSON.stringify(workerModuleUrl)}).then((m) => m.runWorkflowSandboxWorker());
+      `;
+      const result = await runWorkflowScript({
+        script: makeScript(`
+          log("x".repeat(600));
+          return "y".repeat(600);
+        `),
+        args: undefined,
+        host: makeHost(),
+        concurrency: 1,
+        maxStdoutBufferedBytes: cap,
+        spawnCommand: {
+          command: process.execPath,
+          args: ["-e", guardedCorkWorkerScript],
+          env: { ELECTRON_RUN_AS_NODE: "1" },
+        },
+      });
+      expect(result).toBe("y".repeat(600));
+    });
+
+    it("limits in-flight nested loadScript requests on the host before opening files", async () => {
+      const gate = Promise.withResolvers<void>();
+      let opened = 0;
+      const limit = WORKFLOW_LIMITS.maxInFlightScriptLoads;
+
+      const runPromise = runWorkflowScript({
+        script: makeScript(`
+          const promises = Array.from({ length: ${limit + 4} }, (_, i) =>
+            workflow({ scriptPath: "/nested-" + i + ".js" }),
+          );
+          // Ordered after all loadScript frames on the stdout pipe so the host sees the full batch before gate releases.
+          phase("all-sent");
+          const settled = await Promise.allSettled(promises);
+          const after = await workflow({ scriptPath: "/nested-after.js" });
+          return {
+            fulfilled: settled.filter((r) => r.status === "fulfilled").map((r) => r.value),
+            rejected: settled
+              .filter((r) => r.status === "rejected")
+              .map((r) => ({ name: r.reason?.name, message: r.reason?.message })),
+            after,
+          };
+        `),
+        args: undefined,
+        host: makeHost({
+          onPhase: (title) => {
+            if (title === "all-sent") {
+              gate.resolve();
+            }
+          },
+          loadScript: async ({ scriptPath }) => {
+            opened += 1;
+            if (scriptPath === "/nested-after.js") {
+              return makeScript(`return "after-ok";`);
+            }
+            await gate.promise;
+            return makeScript(`return ${JSON.stringify(scriptPath)};`);
+          },
+        }),
+        concurrency: 1,
+      });
+
+      const outcome = (await runPromise) as {
+        readonly fulfilled: ReadonlyArray<string>;
+        readonly rejected: ReadonlyArray<{ readonly name?: string; readonly message?: string }>;
+        readonly after: string;
+      };
+      expect(opened).toBe(limit + 1);
+      expect(outcome.fulfilled).toHaveLength(limit);
+      expect(outcome.rejected).toHaveLength(4);
+      for (const rejection of outcome.rejected) {
+        expect(rejection.name).toBe("WorkflowScriptError");
+        expect(rejection.message).toMatch(/too many concurrent workflow\(\) script loads/i);
+      }
+      expect(outcome.after).toBe("after-ok");
+
+      // Direct forged loadScript frames on the host receiver obey maxInFlightScriptLoads before opening files.
+      const forgedGate = Promise.withResolvers<void>();
+      const forgedOpenedBoth = Promise.withResolvers<void>();
+      let forgedOpened = 0;
+      const posted: Array<Record<string, unknown>> = [];
+      const receiver = createWorkflowHostMessageReceiver({
+        script: makeScript("return 1;"),
+        argsJson: undefined,
+        host: makeHost({
+          loadScript: async () => {
+            forgedOpened += 1;
+            if (forgedOpened === 2) {
+              forgedOpenedBoth.resolve();
+            }
+            await forgedGate.promise;
+            return makeScript("return 1;");
+          },
+        }),
+        concurrency: 1,
+        syncTimeoutMs: 5_000,
+        initialSpent: 0,
+        maxInFlightScriptLoads: 2,
+        postToChild: (message) => {
+          posted.push(JSON.parse(message) as Record<string, unknown>);
+          return true;
+        },
+        onIdleSettled: () => {},
+        onSucceed: () => {},
+        onFail: () => {},
+        isSettled: () => false,
+      });
+      receiver.push(Buffer.from('{"type":"loadScript","id":1,"scriptPath":"/a.js"}\n', "utf8"));
+      receiver.push(Buffer.from('{"type":"loadScript","id":2,"scriptPath":"/b.js"}\n', "utf8"));
+      receiver.push(Buffer.from('{"type":"loadScript","id":3,"scriptPath":"/c.js"}\n', "utf8"));
+      expect(posted).toEqual([
+        expect.objectContaining({
+          type: "loadScriptResult",
+          id: 3,
+          ok: false,
+          errorKind: "WorkflowScriptError",
+        }),
+      ]);
+      await forgedOpenedBoth.promise;
+      forgedGate.resolve();
+      expect(forgedOpened).toBe(2);
     });
 
     it("fails the run once the log budget is spent, even when the script catches", async () => {

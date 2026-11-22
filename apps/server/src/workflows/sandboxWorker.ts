@@ -1331,12 +1331,30 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
       return;
     }
     const msg = '{"type":"done","value":' + valueJson + "}";
+    const frameBytes = byteLength(msg, "utf8") + 1;
     runClosed = true;
     for (const closeContext of activeContexts) {
       closeContext();
     }
     activeContexts.clear();
-    writeRawMessage(msg);
+    pendingAgents.clear();
+    pendingLoads.clear();
+    const queued = typeof stdout.writableLength === "number" ? stdout.writableLength : 0;
+    const cap = maxStdoutBufferedBytes();
+    if (queued === 0 || queued + frameBytes <= cap) {
+      writeRawMessage(msg);
+      return;
+    }
+    if (stdout.destroyed || stdout.writableEnded) return;
+    const writeFinal = () => {
+      if (stdout.destroyed || stdout.writableEnded) return;
+      writeRawMessage(msg);
+    };
+    if (stdout.writableNeedDrain) {
+      stdout.once("drain", writeFinal);
+    } else {
+      stdout.write("", writeFinal);
+    }
   }
 
   function postSmallMessage(payload, capLabel) {
