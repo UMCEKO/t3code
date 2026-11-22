@@ -567,6 +567,9 @@ const awaitSubagentStatus = (taskId: NodeId, status: string, afterSequence: numb
     );
   });
 
+const sampleWorkflowScript =
+  'export const meta = { name: "Review workflow", description: "Inspect changes across modules." };\nreturn "ok";';
+
 const startWorkflow = (
   parent: { readonly threadId: ThreadId; readonly runId: RunId; readonly rootNodeId: NodeId },
   key: string,
@@ -581,6 +584,7 @@ const startWorkflow = (
       parentNodeId: parent.rootNodeId,
       title: "Review workflow",
       description: "Inspect changes across modules.",
+      scriptText: sampleWorkflowScript,
       modelSelection,
       workflow: sampleWorkflow,
     };
@@ -590,18 +594,26 @@ const startWorkflow = (
     );
     const taskId =
       taskEvent?.event.type === "subagent.updated" ? taskEvent.event.payload.id : undefined;
+    const coordinatorThreadId =
+      taskEvent?.event.type === "subagent.updated"
+        ? taskEvent.event.payload.childThreadId
+        : undefined;
     assert.isDefined(taskId);
-    return { command, recorded, taskId: taskId! };
+    assert.isNotNull(coordinatorThreadId);
+    return { command, recorded, taskId: taskId!, coordinatorThreadId: coordinatorThreadId! };
   });
 
 it.layer(layerWorkflowTest)("a server workflow task", (it) => {
   it.effect(
-    "records workflow.start once, updates workflow.progress, and treats terminal updates as no-ops",
+    "records workflow.start once with coordinator thread C, mirrors root node on progress/complete, refuses messages to C, and treats terminal updates as no-ops",
     () =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const parent = yield* seedLiveParent("wf-lifecycle");
-        const { command, taskId } = yield* startWorkflow(parent, "wf-lifecycle");
+        const { command, taskId, coordinatorThreadId } = yield* startWorkflow(
+          parent,
+          "wf-lifecycle",
+        );
 
         // Retry with the same commandId is idempotent and records nothing new.
         const replay = yield* orchestrator.dispatch(command);
@@ -612,12 +624,12 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
         const task = started.subagents[0]!;
         assert.equal(task.id, taskId);
         assert.equal(task.origin, "app_owned");
-        assert.equal(task.childThreadId, null);
+        assert.equal(task.childThreadId, coordinatorThreadId);
         assert.equal(task.nativeTaskRef, null);
         assert.equal(task.driver, driver);
         assert.equal(task.providerInstanceId, modelSelection.instanceId);
-        assert.equal(task.prompt, "Inspect changes across modules.");
-        assert.equal(task.title, "Review workflow");
+        assert.equal(task.prompt, sampleWorkflowScript);
+        assert.equal(task.title, "Inspect changes across modules.");
         assert.equal(task.model, modelSelection.model);
         assert.deepEqual(task.modelSelection, modelSelection);
         assert.equal(task.completionWake, "always");
@@ -635,7 +647,51 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
           (candidate) => candidate.type === "subagent" && candidate.subagentId === taskId,
         );
         assert.equal(item?.status, "running");
-        assert.equal(item?.type === "subagent" ? item.childThreadId : undefined, null);
+        assert.equal(
+          item?.type === "subagent" ? item.childThreadId : undefined,
+          coordinatorThreadId,
+        );
+        assert.equal(item?.title, "Inspect changes across modules.");
+        assert.equal(item?.type === "subagent" ? item.prompt : undefined, sampleWorkflowScript);
+
+        // Coordinator thread C holds a runless root_turn and the workflowScript opening message.
+        const coordinator = yield* orchestrator.getThreadProjection(coordinatorThreadId);
+        assert.equal(coordinator.thread.creationSource, "server");
+        assert.equal(coordinator.thread.title, "Workflow · Review workflow");
+        assert.deepEqual(coordinator.thread.lineage, {
+          parentThreadId: parent.threadId,
+          relationshipToParent: "subagent",
+          rootThreadId: parent.threadId,
+        });
+        assert.deepEqual(coordinator.thread.forkedFrom, { type: "node", nodeId: taskId });
+        assert.lengthOf(coordinator.runs, 0);
+        const coordinatorRoot = coordinator.nodes.find(
+          (candidate) => candidate.kind === "root_turn" && candidate.runId === null,
+        );
+        assert.isDefined(coordinatorRoot);
+        assert.equal(coordinatorRoot?.status, "running");
+        assert.lengthOf(coordinator.messages, 1);
+        assert.equal(coordinator.messages[0]?.role, "user");
+        assert.equal(coordinator.messages[0]?.workflowScript, true);
+        assert.equal(coordinator.messages[0]?.text, sampleWorkflowScript);
+        assert.lengthOf(coordinator.turnItems, 1);
+        assert.equal(coordinator.turnItems[0]?.type, "user_message");
+
+        // Coordinator thread C is read-only: user messages are refused.
+        const refusedMessage = yield* orchestrator
+          .dispatch({
+            type: "message.dispatch",
+            createdBy: "user",
+            creationSource: "web",
+            commandId: CommandId.make("command:wf-lifecycle:msg-c"),
+            threadId: coordinatorThreadId,
+            messageId: MessageId.make("message:wf-lifecycle:msg-c"),
+            text: "Hello C",
+            attachments: [],
+            dispatchMode: { type: "start_immediately" },
+          })
+          .pipe(Effect.flip);
+        assert.equal(refusedMessage._tag, "OrchestratorSubagentThreadReadOnlyError");
 
         const progressedWorkflow = {
           ...sampleWorkflow,
@@ -649,9 +705,9 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
           workflow: progressedWorkflow,
           progress: "Checking module A",
         });
-        assert.deepEqual(
+        assert.include(
           progressResult.storedEvents.map((stored) => stored.event.type),
-          ["subagent.updated"],
+          "subagent.updated",
         );
         const afterProgress = (yield* orchestrator.getThreadProjection(parent.threadId))
           .subagents[0]!;
@@ -722,44 +778,153 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
           finishedItem?.type === "subagent" ? finishedItem.result : undefined,
           "Workflow done.",
         );
+        const finishedCoordinator = yield* orchestrator.getThreadProjection(coordinatorThreadId);
+        const finishedRoot = finishedCoordinator.nodes.find(
+          (candidate) => candidate.id === coordinatorRoot?.id,
+        );
+        assert.equal(finishedRoot?.status, "completed");
+        assert.isNotNull(finishedRoot?.completedAt);
       }),
   );
 
   it.effect(
-    "accepts delegated_task.request under a running workflow node after parent run ends, and rejects a finished workflow",
+    "creates member threads under C via workflow.agent.request with no turn item on C, supports deferStart + workflow.agent.start, and rejects after stop, completion, or archived P",
     () =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const parent = yield* seedLiveParent("wf-parenting");
-        const { taskId: workflowId } = yield* startWorkflow(parent, "wf-parenting");
+        const { taskId: workflowId, coordinatorThreadId } = yield* startWorkflow(
+          parent,
+          "wf-parenting",
+        );
 
         yield* completeParentRun(parent.threadId, parent.runId, "wf-parenting");
 
         yield* orchestrator.dispatch({
-          type: "delegated_task.request",
+          type: "workflow.agent.request",
           createdBy: "agent",
           creationSource: "mcp",
           commandId: CommandId.make("command:wf-parenting:under-workflow"),
-          parentThreadId: parent.threadId,
-          parentRunId: parent.runId,
-          parentNodeId: workflowId,
+          parentThreadId: coordinatorThreadId,
           task: "Run after parent turn ended.",
           title: "Worker 1",
           modelSelection,
           runtimeMode: "full-access",
           interactionMode: "default",
-          completionWake: "never",
         });
 
-        const projection = yield* orchestrator.getThreadProjection(parent.threadId);
-        const childTask = projection.subagents.find(
-          (candidate) => candidate.parentNodeId === workflowId,
+        // Parent P has no member subagents or member turn items.
+        const parentProjection = yield* orchestrator.getThreadProjection(parent.threadId);
+        assert.lengthOf(parentProjection.subagents, 1);
+        assert.equal(
+          parentProjection.turnItems.filter((item) => item.type === "subagent").length,
+          1,
         );
-        assert.isDefined(childTask);
-        assert.equal(childTask?.completionWake, "never");
-        assert.isNotNull(childTask?.childThreadId);
 
-        // Once the workflow ends, new delegations under its node are rejected too.
+        // Coordinator C holds the member subagent row and no extra turn item beyond its script.
+        const coordinatorProjection = yield* orchestrator.getThreadProjection(coordinatorThreadId);
+        const childTask = coordinatorProjection.subagents[0];
+        assert.isDefined(childTask);
+        assert.equal(childTask?.runId, null);
+        assert.equal(childTask?.completionWake, "never");
+        assert.deepEqual(childTask?.completionDelivery, {
+          state: "disposed",
+          observedByRunId: null,
+        });
+        assert.isNotNull(childTask?.childThreadId);
+        assert.equal(
+          coordinatorProjection.turnItems.filter((item) => item.type === "subagent").length,
+          0,
+        );
+        const memberProjection = yield* orchestrator.getThreadProjection(childTask!.childThreadId!);
+        assert.equal(memberProjection.thread.lineage.parentThreadId, coordinatorThreadId);
+        assert.equal(memberProjection.thread.creationSource, "mcp");
+        assert.lengthOf(memberProjection.runs, 1);
+
+        // deferStart creates a queued member thread under C without starting a run, then workflow.agent.start starts it.
+        yield* orchestrator.dispatch({
+          type: "workflow.agent.request",
+          createdBy: "agent",
+          creationSource: "mcp",
+          commandId: CommandId.make("command:wf-parenting:deferred"),
+          parentThreadId: coordinatorThreadId,
+          task: "Queued worker.",
+          title: "Worker 2",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          deferStart: true,
+        });
+        const afterDefer = yield* orchestrator.getThreadProjection(coordinatorThreadId);
+        const deferredTask = afterDefer.subagents.find((s) => s.title === "Worker 2");
+        assert.isDefined(deferredTask);
+        assert.equal(deferredTask?.status, "pending");
+        assert.equal(deferredTask?.startedAt, null);
+        const deferredMemberBefore = yield* orchestrator.getThreadProjection(
+          deferredTask!.childThreadId!,
+        );
+        assert.lengthOf(deferredMemberBefore.runs, 0);
+
+        yield* orchestrator.dispatch({
+          type: "workflow.agent.start",
+          createdBy: "agent",
+          creationSource: "mcp",
+          commandId: CommandId.make("command:wf-parenting:deferred:start"),
+          parentThreadId: coordinatorThreadId,
+          taskId: deferredTask!.id,
+          childThreadId: deferredTask!.childThreadId!,
+        });
+        const afterStart = yield* orchestrator.getThreadProjection(coordinatorThreadId);
+        assert.equal(
+          afterStart.subagents.find((s) => s.id === deferredTask!.id)?.status,
+          "running",
+        );
+        const deferredMemberAfter = yield* orchestrator.getThreadProjection(
+          deferredTask!.childThreadId!,
+        );
+        assert.lengthOf(deferredMemberAfter.runs, 1);
+
+        // Cancelling a pending (deferStart) member settles its subagent row and node on C.
+        yield* orchestrator.dispatch({
+          type: "workflow.agent.request",
+          createdBy: "agent",
+          creationSource: "mcp",
+          commandId: CommandId.make("command:wf-parenting:deferred-cancel"),
+          parentThreadId: coordinatorThreadId,
+          task: "Queued worker to cancel.",
+          title: "Worker 3",
+          modelSelection,
+          runtimeMode: "full-access",
+          interactionMode: "default",
+          deferStart: true,
+        });
+        const pendingCancelTask = (yield* orchestrator.getThreadProjection(
+          coordinatorThreadId,
+        )).subagents.find((s) => s.title === "Worker 3")!;
+        assert.equal(pendingCancelTask.status, "pending");
+        yield* orchestrator.cancelDelegatedTask({
+          parentThreadId: coordinatorThreadId,
+          taskId: pendingCancelTask.id,
+          command: {
+            type: "thread.stop",
+            commandId: CommandId.make("command:wf-parenting:deferred-cancel:stop"),
+            threadId: pendingCancelTask.childThreadId!,
+            reason: "Workflow stopped.",
+          },
+          stopDescendants: () => Effect.void,
+        });
+        const afterCancelPending = yield* orchestrator.getThreadProjection(coordinatorThreadId);
+        const cancelledPendingTask = afterCancelPending.subagents.find(
+          (s) => s.id === pendingCancelTask.id,
+        );
+        assert.equal(cancelledPendingTask?.status, "cancelled");
+        assert.equal(cancelledPendingTask?.result, "Workflow stopped.");
+        assert.equal(
+          afterCancelPending.nodes.find((n) => n.id === pendingCancelTask.id)?.status,
+          "cancelled",
+        );
+
+        // Once the workflow ends, new workflow.agent.request calls are rejected.
         yield* orchestrator.dispatch({
           type: "workflow.complete",
           commandId: CommandId.make("command:wf-parenting:complete"),
@@ -770,56 +935,90 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
         });
         const afterEnd = yield* orchestrator
           .dispatch({
-            type: "delegated_task.request",
+            type: "workflow.agent.request",
             createdBy: "agent",
             creationSource: "mcp",
             commandId: CommandId.make("command:wf-parenting:after-end"),
-            parentThreadId: parent.threadId,
-            parentRunId: parent.runId,
-            parentNodeId: workflowId,
+            parentThreadId: coordinatorThreadId,
             task: "Should fail after workflow ends.",
             modelSelection,
             runtimeMode: "full-access",
             interactionMode: "default",
-            completionWake: "never",
           })
           .pipe(Effect.flip);
         assert.equal(afterEnd._tag, "OrchestratorDispatchError");
+
+        // An archived parent P also refuses workflow.agent.request on a running workflow.
+        const sink = yield* EventSink.EventSinkV2;
+        const parentArchived = yield* seedLiveParent("wf-parenting-archived");
+        const { coordinatorThreadId: archivedCoord } = yield* startWorkflow(
+          parentArchived,
+          "wf-parenting-archived",
+        );
+        const archivedThread = (yield* orchestrator.getThreadProjection(parentArchived.threadId))
+          .thread;
+        const archivedAt = DateTime.makeUnsafe("2026-04-20T00:05:00.000Z");
+        yield* sink.write({
+          commandId: CommandId.make("command:wf-parenting-archived:archive"),
+          events: [
+            {
+              id: EventId.make("event:wf-parenting-archived:archive"),
+              type: "thread.archived",
+              threadId: parentArchived.threadId,
+              providerInstanceId: archivedThread.providerInstanceId,
+              occurredAt: archivedAt,
+              payload: { ...archivedThread, archivedAt, updatedAt: archivedAt },
+            },
+          ],
+        });
+        const afterArchive = yield* orchestrator
+          .dispatch({
+            type: "workflow.agent.request",
+            createdBy: "agent",
+            creationSource: "mcp",
+            commandId: CommandId.make("command:wf-parenting-archived:child"),
+            parentThreadId: archivedCoord,
+            task: "Should fail on archived P.",
+            modelSelection,
+            runtimeMode: "full-access",
+            interactionMode: "default",
+          })
+          .pipe(Effect.flip);
+        assert.equal(afterArchive._tag, "OrchestratorDispatchError");
       }),
   );
 
   it.effect(
-    "suppresses parent wakes for completionWake never children and follow-ups, while workflow.complete wakes the parent",
+    "suppresses parent wakes for workflow members and creates no follow-up task on runless C, while workflow.complete wakes the parent",
     () =>
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const sink = yield* EventSink.EventSinkV2;
         const offers = yield* Offers;
         const parent = yield* seedLiveParent("wf-wake-never");
-        const { taskId: workflowId } = yield* startWorkflow(parent, "wf-wake-never");
+        const { taskId: workflowId, coordinatorThreadId } = yield* startWorkflow(
+          parent,
+          "wf-wake-never",
+        );
 
         yield* completeParentRun(parent.threadId, parent.runId, "wf-wake-never");
         yield* Ref.set(offers, []);
 
         yield* orchestrator.dispatch({
-          type: "delegated_task.request",
+          type: "workflow.agent.request",
           createdBy: "agent",
           creationSource: "mcp",
           commandId: CommandId.make("command:wf-wake-never:child"),
-          parentThreadId: parent.threadId,
-          parentRunId: parent.runId,
-          parentNodeId: workflowId,
+          parentThreadId: coordinatorThreadId,
           task: "Produce structured output.",
           title: "Agent 1",
           modelSelection,
           runtimeMode: "full-access",
           interactionMode: "default",
-          completionWake: "never",
         });
 
-        const childTask = (yield* orchestrator.getThreadProjection(parent.threadId)).subagents.find(
-          (candidate) => candidate.parentNodeId === workflowId,
-        )!;
+        const childTask = (yield* orchestrator.getThreadProjection(coordinatorThreadId))
+          .subagents[0]!;
         const childThreadId = childTask.childThreadId!;
         const firstChildRun = (yield* orchestrator.getThreadProjection(childThreadId)).runs[0]!;
 
@@ -828,7 +1027,7 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
         yield* awaitSubagentStatus(childTask.id, "completed", beforeFirstComplete);
         yield* orchestrator.recoverDelegatedTask(childThreadId);
 
-        const afterChild = yield* orchestrator.getThreadProjection(parent.threadId);
+        const afterChild = yield* orchestrator.getThreadProjection(coordinatorThreadId);
         const settledChild = afterChild.subagents.find(
           (candidate) => candidate.id === childTask.id,
         );
@@ -838,45 +1037,34 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
           observedByRunId: null,
         });
         assert.isUndefined(
-          afterChild.runs.find((run) => run.id === parent.runId)?.delegatedCompletion,
+          (yield* orchestrator.getThreadProjection(parent.threadId)).runs.find(
+            (run) => run.id === parent.runId,
+          )?.delegatedCompletion,
         );
         assert.lengthOf(yield* Ref.get(offers), 0);
 
-        // A follow-up turn into the same child thread (e.g. schema re-prompt) inherits never.
+        // A follow-up turn into the member creates no task on runless C and wakes nobody.
         yield* orchestrator.dispatch({
           type: "message.dispatch",
           createdBy: "agent",
           creationSource: "mcp",
           commandId: CommandId.make("command:wf-wake-never:reprompt"),
           threadId: childThreadId,
-          senderThreadId: parent.threadId,
+          senderThreadId: coordinatorThreadId,
           messageId: MessageId.make("message:wf-wake-never:reprompt"),
           text: "Your result did not match the schema.",
           attachments: [],
           dispatchMode: { type: "queue_after_active" },
         });
-        const followupTask = (yield* orchestrator.getThreadProjection(
-          parent.threadId,
-        )).subagents.find(
-          (candidate) => candidate.childThreadId === childThreadId && candidate.id !== childTask.id,
-        )!;
-        assert.isDefined(followupTask);
-        assert.equal(followupTask.completionWake, "never");
-        assert.equal(followupTask.parentNodeId, workflowId);
+        const coordAfterFollowup = yield* orchestrator.getThreadProjection(coordinatorThreadId);
+        assert.lengthOf(coordAfterFollowup.subagents, 1);
         const followupRun = (yield* orchestrator.getThreadProjection(childThreadId)).runs.find(
-          (run) => run.delegatedTaskId === followupTask.id,
+          (run) => run.id !== firstChildRun.id,
         )!;
-        const beforeFollowupComplete = yield* sink.latestSequence();
+        assert.isDefined(followupRun);
+        assert.isUndefined(followupRun.delegatedTaskId);
         yield* completeChildRun(childThreadId, followupRun.id, '{"ok":true}', "wf-never-2");
-        yield* awaitSubagentStatus(followupTask.id, "completed", beforeFollowupComplete);
         yield* orchestrator.recoverDelegatedTask(childThreadId);
-
-        const afterFollowup = yield* orchestrator.getThreadProjection(parent.threadId);
-        assert.deepEqual(
-          afterFollowup.subagents.find((candidate) => candidate.id === followupTask.id)
-            ?.completionDelivery,
-          { state: "disposed", observedByRunId: null },
-        );
         assert.lengthOf(yield* Ref.get(offers), 0);
 
         // Completing the workflow itself wakes the parent as an async delegated task does.
@@ -901,6 +1089,23 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
         const offered = yield* Ref.get(offers);
         assert.equal(offered.length, 1);
         assert.equal(offered[0]?.threadId, parent.threadId);
+
+        // A user follow-up to M_i after workflow completion creates no task on C.
+        yield* orchestrator.dispatch({
+          type: "message.dispatch",
+          createdBy: "user",
+          creationSource: "web",
+          commandId: CommandId.make("command:wf-wake-never:user-followup"),
+          threadId: childThreadId,
+          messageId: MessageId.make("message:wf-wake-never:user-followup"),
+          text: "Tell me more about that check.",
+          attachments: [],
+          dispatchMode: { type: "start_immediately" },
+        });
+        assert.lengthOf(
+          (yield* orchestrator.getThreadProjection(coordinatorThreadId)).subagents,
+          1,
+        );
       }),
   );
 
@@ -1080,11 +1285,14 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
       }),
   );
 
-  it.effect("refuses delegated_task.request once workflow.stop-request is recorded", () =>
+  it.effect("refuses workflow.agent.request once workflow.stop-request is recorded", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const parent = yield* seedLiveParent("wf-stop-admission");
-      const { taskId: workflowId } = yield* startWorkflow(parent, "wf-stop-admission");
+      const { taskId: workflowId, coordinatorThreadId } = yield* startWorkflow(
+        parent,
+        "wf-stop-admission",
+      );
       yield* completeParentRun(parent.threadId, parent.runId, "wf-stop-admission");
 
       yield* orchestrator.dispatch({
@@ -1096,18 +1304,15 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
 
       const rejected = yield* orchestrator
         .dispatch({
-          type: "delegated_task.request",
+          type: "workflow.agent.request",
           createdBy: "agent",
           creationSource: "mcp",
           commandId: CommandId.make("command:wf-stop-admission:child"),
-          parentThreadId: parent.threadId,
-          parentRunId: parent.runId,
-          parentNodeId: workflowId,
+          parentThreadId: coordinatorThreadId,
           task: "Must not start after stop-request.",
           modelSelection,
           runtimeMode: "full-access",
           interactionMode: "default",
-          completionWake: "never",
         })
         .pipe(Effect.flip);
       assert.equal(rejected._tag, "OrchestratorDispatchError");
@@ -1120,28 +1325,27 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const threads = yield* ThreadManagementService.ThreadManagementService;
-        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
         const sink = yield* EventSink.EventSinkV2;
         const projectId = ProjectId.make("project:remote-delegated-task");
 
         const parent = yield* seedLiveParent("wf-retry-gate");
-        const { taskId: workflowId } = yield* startWorkflow(parent, "wf-retry-gate");
+        const { taskId: workflowId, coordinatorThreadId } = yield* startWorkflow(
+          parent,
+          "wf-retry-gate",
+        );
 
-        // Launch a workflow child and a non-workflow delegated child under the same parent.
+        // Launch a workflow child under C and a non-workflow delegated child under P.
         yield* orchestrator.dispatch({
-          type: "delegated_task.request",
+          type: "workflow.agent.request",
           createdBy: "agent",
           creationSource: "mcp",
           commandId: CommandId.make("command:wf-retry-gate:wf-child"),
-          parentThreadId: parent.threadId,
-          parentRunId: parent.runId,
-          parentNodeId: workflowId,
+          parentThreadId: coordinatorThreadId,
           task: "Workflow worker",
           title: "Workflow worker",
           modelSelection,
           runtimeMode: "full-access",
           interactionMode: "default",
-          completionWake: "never",
         });
         yield* orchestrator.dispatch({
           type: "delegated_task.request",
@@ -1158,15 +1362,16 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
           interactionMode: "default",
         });
 
-        const parentProjection = yield* orchestrator.getThreadProjection(parent.threadId);
-        const wfChildTask = parentProjection.subagents.find(
-          (candidate) => candidate.parentNodeId === workflowId,
-        )!;
+        const wfChildTask = (yield* orchestrator.getThreadProjection(coordinatorThreadId))
+          .subagents[0]!;
         const wfChildThreadId = wfChildTask.childThreadId!;
         const wfFirstRun = (yield* orchestrator.getThreadProjection(wfChildThreadId)).runs[0]!;
+        const parentProjection = yield* orchestrator.getThreadProjection(parent.threadId);
         const plainChildTask = parentProjection.subagents.find(
           (candidate) =>
-            candidate.parentNodeId === parent.rootNodeId && candidate.childThreadId !== null,
+            candidate.id !== workflowId &&
+            candidate.parentNodeId === parent.rootNodeId &&
+            candidate.childThreadId !== null,
         )!;
         const plainChildThreadId = plainChildTask.childThreadId!;
         const plainFirstRun = (yield* orchestrator.getThreadProjection(plainChildThreadId))
@@ -1177,7 +1382,7 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
           projectId,
           commandId: CommandId.make("command:wf-retry-gate:queued-before-stop"),
           threadId: wfChildThreadId,
-          senderThreadId: parent.threadId,
+          senderThreadId: coordinatorThreadId,
           messageId: MessageId.make("message:wf-retry-gate:queued-before-stop"),
           text: "Your result did not match the schema.",
           attachments: [],
@@ -1201,7 +1406,7 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
             projectId,
             commandId: CommandId.make("command:wf-retry-gate:send-after-stop-request"),
             threadId: wfChildThreadId,
-            senderThreadId: parent.threadId,
+            senderThreadId: coordinatorThreadId,
             messageId: MessageId.make("message:wf-retry-gate:send-after-stop-request"),
             text: "Must be refused after stop-request.",
             attachments: [],
@@ -1215,7 +1420,6 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
         // Completing the active run must NOT promote the already-queued retry.
         yield* completeChildRun(wfChildThreadId, wfFirstRun.id, "bad json", "wf-retry-gate-first");
 
-        assert.isFalse(yield* projectionStore.canStartQueuedRun(wfChildThreadId));
         yield* orchestrator.resumeQueuedRuns;
 
         const wfAfterFinish = yield* orchestrator.getThreadProjection(wfChildThreadId);
@@ -1255,7 +1459,7 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
             projectId,
             commandId: CommandId.make("command:wf-retry-gate:send-after-complete"),
             threadId: wfChildThreadId,
-            senderThreadId: parent.threadId,
+            senderThreadId: coordinatorThreadId,
             messageId: MessageId.make("message:wf-retry-gate:send-after-complete"),
             text: "Must be refused after workflow complete.",
             attachments: [],
@@ -1265,7 +1469,6 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
           })
           .pipe(Effect.flip);
         assert.equal(refusedAfterComplete._tag, "OrchestratorDispatchError");
-        assert.isFalse(yield* projectionStore.canStartQueuedRun(wfChildThreadId));
 
         // Non-workflow delegated children are unaffected by workflow stop/completion.
         const plainQueued = yield* threads.sendToThread({
@@ -1321,7 +1524,8 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
           parentRunId: parent.runId,
           parentNodeId: parent.rootNodeId,
           title: longTitle,
-          description: "Large workflow output test.",
+          description: longTitle,
+          scriptText: sampleWorkflowScript,
           modelSelection,
           workflow: {
             ...sampleWorkflow,
@@ -1550,11 +1754,11 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
       }),
   );
 
-  it.effect("forwards outputSchema from delegated_task.request to the child's first run", () =>
+  it.effect("forwards outputSchema from workflow.agent.request to the child's first run", () =>
     Effect.gen(function* () {
       const orchestrator = yield* Orchestrator.OrchestratorV2;
       const parent = yield* seedLiveParent("wf-output-schema");
-      const { taskId: workflowId } = yield* startWorkflow(parent, "wf-output-schema");
+      const { coordinatorThreadId } = yield* startWorkflow(parent, "wf-output-schema");
       const outputSchema = {
         type: "object",
         properties: {
@@ -1566,24 +1770,20 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
       };
 
       yield* orchestrator.dispatch({
-        type: "delegated_task.request",
+        type: "workflow.agent.request",
         createdBy: "agent",
         creationSource: "mcp",
         commandId: CommandId.make("command:wf-output-schema:child"),
-        parentThreadId: parent.threadId,
-        parentRunId: parent.runId,
-        parentNodeId: workflowId,
+        parentThreadId: coordinatorThreadId,
         task: "Check the module and submit structured output.",
         modelSelection,
         runtimeMode: "full-access",
         interactionMode: "default",
-        completionWake: "never",
         outputSchema,
       });
 
-      const childTask = (yield* orchestrator.getThreadProjection(parent.threadId)).subagents.find(
-        (candidate) => candidate.parentNodeId === workflowId,
-      )!;
+      const childTask = (yield* orchestrator.getThreadProjection(coordinatorThreadId))
+        .subagents[0]!;
       assert.isNotNull(childTask.childThreadId);
       const childProjection = yield* orchestrator.getThreadProjection(childTask.childThreadId!);
       assert.deepEqual(childProjection.runs[0]?.outputSchema, outputSchema);

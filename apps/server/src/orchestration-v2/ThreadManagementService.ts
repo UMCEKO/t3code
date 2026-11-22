@@ -133,6 +133,7 @@ function existingThreadIdsForCommand(
     case "delegated_task.completion-delivery.acknowledge":
     case "delegated_task.completion-delivery.dispose":
     case "workflow.start":
+    case "workflow.agent.request":
     case "workflow.progress":
     case "workflow.stop-request":
     case "workflow.complete":
@@ -140,6 +141,10 @@ function existingThreadIdsForCommand(
     case "delegated_task.remote.complete":
     case "delegated_task.remote.stop":
       return [command.parentThreadId];
+    case "workflow.agent.start":
+      return command.parentThreadId === command.childThreadId
+        ? [command.parentThreadId]
+        : [command.parentThreadId, command.childThreadId];
     case "thread.created.record":
       return command.parentThreadId === command.targetThreadId
         ? [command.parentThreadId]
@@ -817,12 +822,23 @@ const make = Effect.gen(function* () {
           ),
         );
       case "delegated_task.request":
+      case "workflow.agent.request":
         return orchestrator.getThreadRecords(command.parentThreadId, []).pipe(
           Effect.flatMap((parent) =>
             assertProviderInstanceEnabled({
               projectId: parent.thread.projectId,
               commandId: command.commandId,
               instanceId: command.modelSelection.instanceId,
+            }),
+          ),
+        );
+      case "workflow.agent.start":
+        return orchestrator.getThreadRecords(command.childThreadId, []).pipe(
+          Effect.flatMap((child) =>
+            assertProviderInstanceEnabled({
+              projectId: child.thread.projectId,
+              commandId: command.commandId,
+              instanceId: child.thread.modelSelection.instanceId,
             }),
           ),
         );
@@ -1646,7 +1662,7 @@ const make = Effect.gen(function* () {
         ) {
           return yield* new OrchestrationV2StopWorkflowError({ ...input, reason: "not-running" });
         }
-        if (task.origin === "app_owned" && task.childThreadId === null) {
+        if (task.origin === "app_owned") {
           return task.id;
         }
         if (task.origin !== "provider_native" || task.driver !== "claudeAgent") {
@@ -1776,26 +1792,26 @@ const make = Effect.gen(function* () {
     const stoppedChildThreadIds = new Set<ThreadId>();
     for (const task of subagents) {
       if (task.origin !== "app_owned") continue;
+      if (task.workflow !== undefined) {
+        if (task.status !== "running") continue;
+        const commandId = CommandId.make(`${input.commandId}:stop:${task.id}`);
+        yield* (input.remoteDispatch ?? dispatch)({
+          type: "workflow.stop-request",
+          commandId,
+          parentThreadId: input.threadId,
+          taskId: task.id,
+        }).pipe(
+          Effect.catch((error) =>
+            Effect.logWarning("Unable to stop a delegated task", {
+              parentThreadId: input.threadId,
+              taskId: task.id,
+              error,
+            }).pipe(Effect.andThen(Effect.sync(() => failures.push(error)))),
+          ),
+        );
+        continue;
+      }
       if (task.childThreadId === null) {
-        if (task.workflow !== undefined) {
-          if (task.status !== "running") continue;
-          const commandId = CommandId.make(`${input.commandId}:stop:${task.id}`);
-          yield* (input.remoteDispatch ?? dispatch)({
-            type: "workflow.stop-request",
-            commandId,
-            parentThreadId: input.threadId,
-            taskId: task.id,
-          }).pipe(
-            Effect.catch((error) =>
-              Effect.logWarning("Unable to stop a delegated task", {
-                parentThreadId: input.threadId,
-                taskId: task.id,
-                error,
-              }).pipe(Effect.andThen(Effect.sync(() => failures.push(error)))),
-            ),
-          );
-          continue;
-        }
         // A task in a linked environment ends here; its follower then stops it there.
         // One with its result keeps it, but its thread there may run follow-up work.
         if (task.remoteChild === undefined) continue;
