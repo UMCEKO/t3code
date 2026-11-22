@@ -36,6 +36,7 @@ export interface WorkflowMeta {
   readonly name: string;
   readonly description: string;
   readonly whenToUse?: string;
+  readonly concurrency?: number;
   readonly phases: ReadonlyArray<{
     readonly title: string;
     readonly detail?: string;
@@ -550,6 +551,14 @@ function validateMetaObject(raw: unknown): WorkflowMeta {
     throw new WorkflowScriptError("meta.whenToUse must be a string");
   }
 
+  const rawConcurrency = ownProperty(raw, "concurrency");
+  if (
+    rawConcurrency !== undefined &&
+    (typeof rawConcurrency !== "number" || !Number.isInteger(rawConcurrency) || rawConcurrency < 1)
+  ) {
+    throw new WorkflowScriptError("meta.concurrency must be a positive integer");
+  }
+
   const rawPhases = ownProperty(raw, "phases");
   const phases: Array<{
     readonly title: string;
@@ -618,6 +627,7 @@ function validateMetaObject(raw: unknown): WorkflowMeta {
     name,
     description,
     ...(whenToUse !== undefined ? { whenToUse } : {}),
+    ...(rawConcurrency !== undefined ? { concurrency: rawConcurrency } : {}),
     phases,
   };
 }
@@ -1038,6 +1048,7 @@ export interface WorkflowHostMessageReceiverOptions {
   readonly argsJson: string | undefined;
   readonly host: WorkflowHost;
   readonly concurrency: number;
+  readonly hostManagedConcurrency?: boolean;
   readonly syncTimeoutMs: number;
   readonly initialSpent: number;
   readonly postToChild: (message: string, maxBytes: number, capMessage: string) => boolean;
@@ -1049,6 +1060,35 @@ export interface WorkflowHostMessageReceiverOptions {
   readonly progressLimits?: WorkflowProgressLimits;
   readonly maxStdoutBufferedBytes?: number;
   readonly maxInFlightScriptLoads?: number;
+}
+
+class HostFifoSemaphore {
+  private active = 0;
+  private readonly queue: Array<() => void> = [];
+  private readonly limit: number;
+
+  constructor(limit: number) {
+    this.limit = Math.max(1, Math.trunc(limit));
+  }
+
+  acquire(): Promise<void> {
+    if (this.active < this.limit) {
+      this.active += 1;
+      return Promise.resolve();
+    }
+    return new Promise<void>((resolve) => {
+      this.queue.push(resolve);
+    });
+  }
+
+  release(): void {
+    if (this.queue.length > 0) {
+      const next = this.queue.shift()!;
+      next();
+      return;
+    }
+    this.active = Math.max(0, this.active - 1);
+  }
 }
 
 function resolveMaxStdoutBufferedBytes(value: number | undefined): number {
@@ -1072,6 +1112,10 @@ export function createWorkflowHostMessageReceiver(
       ? Math.max(1, Math.trunc(options.maxInFlightScriptLoads))
       : WORKFLOW_LIMITS.maxInFlightScriptLoads;
   const progressBudget = makeWorkflowProgressBudget(progressLimits);
+  const agentSemaphore =
+    options.hostManagedConcurrency === true
+      ? undefined
+      : new HostFifoSemaphore(options.concurrency);
   let started = false;
   let lastSentSeq = 0;
   let lastIdleSeq = 0;
@@ -1264,86 +1308,129 @@ export function createWorkflowHostMessageReceiver(
         phase,
       };
 
-      void Promise.resolve()
-        .then(() => options.host.runAgent(call))
-        .then(
-          (value) => {
-            if (options.isSettled()) return;
-            let spent: number;
-            try {
-              spent = readBudgetSpent(options.host);
-            } catch (err) {
-              options.onFail(err);
-              return;
-            }
-            const seq = (lastSentSeq += 1);
-            if (value === undefined) {
-              options.postToChild(
-                JSON.stringify({ type: "agentResult", seq, id, ok: true, spent, hasValue: false }),
-                WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
-                "Workflow agent() result exceeds the 4 MiB limit.",
-              );
-              return;
-            }
-            let valueJson: string;
-            try {
-              valueJson = serializeHostValue(value);
-            } catch (err) {
-              const spec = toRealmErrorSpec(err);
-              options.postToChild(
-                JSON.stringify({
-                  type: "agentResult",
-                  seq,
-                  id,
-                  ok: false,
-                  spent,
-                  errorKind: spec.kind,
-                  errorMessage: spec.message,
-                }),
-                WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
-                "Workflow agent() result exceeds the 4 MiB limit.",
-              );
-              return;
-            }
-            if (Buffer.byteLength(valueJson, "utf8") > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
-              options.onFail(
-                new WorkflowScriptError("Workflow agent() result exceeds the 4 MiB limit."),
-              );
-              return;
-            }
-            const resultMsg = `{"type":"agentResult","seq":${seq},"id":${id},"ok":true,"spent":${spent},"hasValue":true,"value":${valueJson}}`;
-            options.postToChild(
-              resultMsg,
-              MAX_VALUE_MESSAGE_BYTES,
-              "Workflow agent() result exceeds the 4 MiB limit.",
-            );
-          },
-          (err) => {
-            if (options.isSettled() || options.host.signal.aborted) return;
-            let spent: number;
-            try {
-              spent = readBudgetSpent(options.host);
-            } catch (budgetErr) {
-              options.onFail(budgetErr);
-              return;
-            }
-            const seq = (lastSentSeq += 1);
-            const spec = toRealmErrorSpec(err);
-            options.postToChild(
-              JSON.stringify({
-                type: "agentResult",
-                seq,
-                id,
-                ok: false,
-                spent,
-                errorKind: spec.kind,
-                errorMessage: spec.message,
-              }),
-              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
-              "Workflow agent() result exceeds the 4 MiB limit.",
-            );
-          },
+      const sendAgentSuccess = (value: unknown): void => {
+        if (options.isSettled()) return;
+        let spent: number;
+        try {
+          spent = readBudgetSpent(options.host);
+        } catch (err) {
+          options.onFail(err);
+          return;
+        }
+        const seq = (lastSentSeq += 1);
+        if (value === undefined) {
+          options.postToChild(
+            JSON.stringify({ type: "agentResult", seq, id, ok: true, spent, hasValue: false }),
+            WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+            "Workflow agent() result exceeds the 4 MiB limit.",
+          );
+          return;
+        }
+        let valueJson: string;
+        try {
+          valueJson = serializeHostValue(value);
+        } catch (err) {
+          const spec = toRealmErrorSpec(err);
+          options.postToChild(
+            JSON.stringify({
+              type: "agentResult",
+              seq,
+              id,
+              ok: false,
+              spent,
+              errorKind: spec.kind,
+              errorMessage: spec.message,
+            }),
+            WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+            "Workflow agent() result exceeds the 4 MiB limit.",
+          );
+          return;
+        }
+        if (Buffer.byteLength(valueJson, "utf8") > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
+          options.onFail(
+            new WorkflowScriptError("Workflow agent() result exceeds the 4 MiB limit."),
+          );
+          return;
+        }
+        const resultMsg = `{"type":"agentResult","seq":${seq},"id":${id},"ok":true,"spent":${spent},"hasValue":true,"value":${valueJson}}`;
+        options.postToChild(
+          resultMsg,
+          MAX_VALUE_MESSAGE_BYTES,
+          "Workflow agent() result exceeds the 4 MiB limit.",
         );
+      };
+
+      const sendAgentFailure = (err: unknown): void => {
+        if (options.isSettled() || options.host.signal.aborted) return;
+        let spent: number;
+        try {
+          spent = readBudgetSpent(options.host);
+        } catch (budgetErr) {
+          options.onFail(budgetErr);
+          return;
+        }
+        const seq = (lastSentSeq += 1);
+        const spec = toRealmErrorSpec(err);
+        options.postToChild(
+          JSON.stringify({
+            type: "agentResult",
+            seq,
+            id,
+            ok: false,
+            spent,
+            errorKind: spec.kind,
+            errorMessage: spec.message,
+          }),
+          WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+          "Workflow agent() result exceeds the 4 MiB limit.",
+        );
+      };
+
+      if (agentSemaphore === undefined) {
+        let agentPromise: Promise<unknown>;
+        try {
+          agentPromise = Promise.resolve(options.host.runAgent(call));
+        } catch (err) {
+          agentPromise = Promise.reject(err);
+        }
+        void agentPromise.then(sendAgentSuccess, sendAgentFailure);
+        return;
+      }
+
+      void agentSemaphore.acquire().then(() => {
+        if (options.isSettled() || options.host.signal.aborted) {
+          agentSemaphore.release();
+          return;
+        }
+        const budgetTotal = options.host.budget.total;
+        if (budgetTotal !== null) {
+          let spent: number;
+          try {
+            spent = readBudgetSpent(options.host);
+          } catch (budgetErr) {
+            agentSemaphore.release();
+            options.onFail(budgetErr);
+            return;
+          }
+          if (spent >= budgetTotal) {
+            agentSemaphore.release();
+            sendAgentFailure(new WorkflowScriptError("The workflow's token budget is spent."));
+            return;
+          }
+        }
+        void Promise.resolve()
+          .then(() => options.host.runAgent(call))
+          .then(
+            (value) => {
+              agentSemaphore.release();
+              sendAgentSuccess(value);
+            },
+            (err) => {
+              agentSemaphore.release();
+              sendAgentFailure(err);
+            },
+          );
+      });
       return;
     }
 
@@ -1487,6 +1574,7 @@ export async function runWorkflowScript(input: {
   readonly args: unknown;
   readonly host: WorkflowHost;
   readonly concurrency: number;
+  readonly hostManagedConcurrency?: boolean;
   readonly syncTimeoutMs?: number;
   readonly handshakeTimeoutMs?: number;
   readonly maxStdoutBufferedBytes?: number;
@@ -1674,6 +1762,9 @@ export async function runWorkflowScript(input: {
     argsJson,
     host: input.host,
     concurrency: limit,
+    ...(input.hostManagedConcurrency === undefined
+      ? {}
+      : { hostManagedConcurrency: input.hostManagedConcurrency }),
     syncTimeoutMs,
     initialSpent,
     postToChild,

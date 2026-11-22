@@ -28,6 +28,7 @@ import {
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2TurnItem,
   type OrchestrationV2WorkflowAgent,
+  type OrchestrationV2WorkflowLimits,
   type OrchestratorMcpDelegateTaskInput,
   type OrchestratorMcpTarget,
   type OrchestratorMcpTaskRole,
@@ -102,6 +103,7 @@ import {
   type ReplayIndexEntry,
 } from "./journal.ts";
 import {
+  WORKFLOW_LIMITS,
   WORKFLOW_MESSAGE_LIMITS,
   WorkflowSandboxCleanupError,
   WorkflowScriptError,
@@ -142,6 +144,24 @@ const TASK_ROLE_LITERALS: ReadonlySet<string> = new Set<OrchestratorMcpTaskRole>
   "general",
 ]);
 
+const WORKFLOW_AGENT_TOOL_TURN_ITEM_TYPES = [
+  "command_execution",
+  "file_change",
+  "file_search",
+  "web_search",
+  "dynamic_tool",
+] as const satisfies ReadonlyArray<OrchestrationV2TurnItem["type"]>;
+
+const WORKFLOW_AGENT_TOOL_TURN_ITEM_TYPE_SET: ReadonlySet<OrchestrationV2TurnItem["type"]> =
+  new Set(WORKFLOW_AGENT_TOOL_TURN_ITEM_TYPES);
+
+const WORKFLOW_AGENT_SNAPSHOT_TURN_ITEM_TYPES = [
+  ...SUBAGENT_RESULT_TURN_ITEM_TYPES,
+  ...WORKFLOW_AGENT_TOOL_TURN_ITEM_TYPES,
+] as const satisfies ReadonlyArray<OrchestrationV2TurnItem["type"]>;
+
+const TOKEN_BUDGET_SPENT_MESSAGE = "The workflow's token budget is spent.";
+
 const PersistedSandboxCleanupPending = Schema.Struct({
   pid: Schema.optional(
     Schema.Int.check(Schema.isBetween({ minimum: 1, maximum: Number.MAX_SAFE_INTEGER })),
@@ -180,6 +200,11 @@ const decodeTargetOptionsSync = Schema.decodeUnknownSync(OrchestratorMcpTargetOp
 
 class WorkflowAbortedError extends Schema.TaggedError<WorkflowAbortedError>()(
   "WorkflowAbortedError",
+  {},
+) {}
+
+class WorkflowBudgetExceededError extends Schema.TaggedError<WorkflowBudgetExceededError>()(
+  "WorkflowBudgetExceededError",
   {},
 ) {}
 
@@ -884,9 +909,9 @@ function truncateUtf8Bytes(text: string, maxBytes: number): string {
 }
 
 function isAppOwnedWorkflowTask(
-  task: Pick<OrchestrationV2Subagent, "origin" | "childThreadId" | "workflow">,
+  task: Pick<OrchestrationV2Subagent, "origin" | "workflow">,
 ): boolean {
-  return task.origin === "app_owned" && task.childThreadId === null && task.workflow !== undefined;
+  return task.origin === "app_owned" && task.workflow !== undefined;
 }
 
 function isLiveChildRun(run: OrchestrationV2Run): boolean {
@@ -1147,9 +1172,13 @@ function liveFailures(agents: Iterable<OrchestrationV2WorkflowAgent>): {
   readonly failures?: NonNullable<OrchestratorMcpWorkflowStatusResult["failures"]>;
 } {
   const failures = [...agents]
-    .filter((agent) => agent.state === "failed" && agent.result !== undefined)
+    .filter((agent) => agent.state === "failed" && (agent.error ?? agent.result) !== undefined)
     .toSorted((a, b) => a.index - b.index)
-    .map((agent) => ({ index: agent.index, label: agent.label, error: agent.result! }));
+    .map((agent) => ({
+      index: agent.index,
+      label: agent.label,
+      error: (agent.error ?? agent.result)!,
+    }));
   return failures.length === 0 ? {} : { failures };
 }
 
@@ -1457,6 +1486,7 @@ function buildStoppedSnapshotFromSql(
 interface OwnedChildTarget {
   readonly childThreadId: ThreadId;
   readonly childTaskId: NodeId | undefined;
+  readonly parentThreadId?: ThreadId | undefined;
 }
 
 const foldBoundedJournalFile = Effect.fn("WorkflowService.foldBoundedJournalFile")(function* (
@@ -1690,44 +1720,88 @@ const discoverOwnedChildThreads = Effect.fn("WorkflowService.discoverOwnedChildT
   workflowTaskId: NodeId | null,
   extraChildren: ReadonlyArray<OwnedChildTarget> = [],
 ): Effect.fn.Return<ReadonlyArray<OwnedChildTarget>, Orchestrator.OrchestratorV2Error> {
-  const byThread = new Map<ThreadId, NodeId | undefined>();
+  const byThread = new Map<
+    ThreadId,
+    { readonly childTaskId: NodeId | undefined; readonly parentThreadId: ThreadId | undefined }
+  >();
   for (const extra of extraChildren) {
-    byThread.set(extra.childThreadId, extra.childTaskId ?? byThread.get(extra.childThreadId));
+    const existing = byThread.get(extra.childThreadId);
+    byThread.set(extra.childThreadId, {
+      childTaskId: extra.childTaskId ?? existing?.childTaskId,
+      parentThreadId: extra.parentThreadId ?? existing?.parentThreadId,
+    });
   }
   if (workflowTaskId === null && byThread.size === 0) {
     return [];
   }
   const parentShell = yield* threadManagement.getThreadShell(parentThreadId);
+  let coordinatorThreadId: ThreadId | null = null;
   if (parentShell !== null && parentShell.deletedAt === null) {
     const { subagents } = yield* threadManagement.getThreadRecords(parentThreadId, ["subagents"]);
-    if (workflowTaskId !== null) {
+    const workflowTask =
+      workflowTaskId === null
+        ? undefined
+        : subagents.find((candidate) => candidate.id === workflowTaskId);
+    coordinatorThreadId = workflowTask?.childThreadId ?? null;
+
+    if (coordinatorThreadId !== null) {
+      const coordinatorShell = yield* threadManagement.getThreadShell(coordinatorThreadId);
+      if (coordinatorShell !== null && coordinatorShell.deletedAt === null) {
+        const { subagents: memberSubagents } = yield* threadManagement.getThreadRecords(
+          coordinatorThreadId,
+          ["subagents"],
+        );
+        for (const subagent of memberSubagents) {
+          if (subagent.origin === "app_owned" && subagent.childThreadId !== null) {
+            const existing = byThread.get(subagent.childThreadId);
+            if (existing?.childTaskId === undefined || !isTerminalSubagentStatus(subagent.status)) {
+              byThread.set(subagent.childThreadId, {
+                childTaskId: subagent.id,
+                parentThreadId: coordinatorThreadId,
+              });
+            }
+          }
+        }
+      }
+    } else {
+      // Legacy rows (childThreadId === null) keep members directly on P.
+      if (workflowTaskId !== null) {
+        for (const subagent of subagents) {
+          if (
+            subagent.origin === "app_owned" &&
+            subagent.childThreadId !== null &&
+            subagent.parentNodeId === workflowTaskId
+          ) {
+            const existing = byThread.get(subagent.childThreadId);
+            if (existing?.childTaskId === undefined || !isTerminalSubagentStatus(subagent.status)) {
+              byThread.set(subagent.childThreadId, {
+                childTaskId: subagent.id,
+                parentThreadId,
+              });
+            }
+          }
+        }
+      }
       for (const subagent of subagents) {
         if (
           subagent.origin === "app_owned" &&
           subagent.childThreadId !== null &&
-          subagent.parentNodeId === workflowTaskId
+          byThread.has(subagent.childThreadId) &&
+          !isTerminalSubagentStatus(subagent.status)
         ) {
-          const existing = byThread.get(subagent.childThreadId);
-          if (existing === undefined || !isTerminalSubagentStatus(subagent.status)) {
-            byThread.set(subagent.childThreadId, subagent.id);
-          }
+          byThread.set(subagent.childThreadId, {
+            childTaskId: subagent.id,
+            parentThreadId,
+          });
         }
       }
     }
-    for (const subagent of subagents) {
-      if (
-        subagent.origin === "app_owned" &&
-        subagent.childThreadId !== null &&
-        byThread.has(subagent.childThreadId) &&
-        !isTerminalSubagentStatus(subagent.status)
-      ) {
-        byThread.set(subagent.childThreadId, subagent.id);
-      }
-    }
   }
-  return [...byThread.entries()].map(([childThreadId, childTaskId]) => ({
+  const fallbackParent = coordinatorThreadId ?? parentThreadId;
+  return [...byThread.entries()].map(([childThreadId, entry]) => ({
     childThreadId,
-    childTaskId,
+    childTaskId: entry.childTaskId,
+    parentThreadId: entry.parentThreadId ?? fallbackParent,
   }));
 });
 
@@ -1839,10 +1913,11 @@ const dispatchStopForChildTree = Effect.fn("WorkflowService.dispatchStopForChild
           const commandId = CommandId.make(
             `server:workflow-stop-child:${runId}:${childThreadId}:a${attempt}`,
           );
-          const parentShell = yield* threadManagement.getThreadShell(parentThreadId);
+          const effectiveParentThreadId = childShell.lineage.parentThreadId ?? parentThreadId;
+          const parentShell = yield* threadManagement.getThreadShell(effectiveParentThreadId);
           if (childTaskId !== undefined && parentShell !== null && parentShell.deletedAt === null) {
             yield* threadManagement.cancelDelegatedTask({
-              parentThreadId,
+              parentThreadId: effectiveParentThreadId,
               taskId: childTaskId,
               command: {
                 type: "thread.stop",
@@ -2111,7 +2186,7 @@ const stopAllWorkflowChildren = Effect.fn("WorkflowService.stopAllWorkflowChildr
             (child) =>
               dispatchStopForChildTree({
                 threadManagement: input.threadManagement,
-                parentThreadId: input.parentThreadId,
+                parentThreadId: child.parentThreadId ?? input.parentThreadId,
                 runId: input.runId,
                 childThreadId: child.childThreadId,
                 childTaskId: child.childTaskId,
@@ -2575,7 +2650,7 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
           (child) =>
             dispatchStopForChildTree({
               threadManagement,
-              parentThreadId: item.candidate.parentThreadId,
+              parentThreadId: child.parentThreadId ?? item.candidate.parentThreadId,
               runId: item.runId,
               childThreadId: child.childThreadId,
               childTaskId: child.childTaskId,
@@ -3063,7 +3138,7 @@ const make = Effect.gen(function* () {
   );
 
   const liveRuns = new Map<string, LiveWorkflowRun>();
-  const concurrency = workflowConcurrency(NodeOS.cpus().length);
+  const defaultConcurrency = workflowConcurrency(NodeOS.cpus().length);
 
   const requireCapability = (scope: McpInvocationContext.McpInvocationScope) =>
     scope.capabilities.has("orchestration")
@@ -3095,7 +3170,7 @@ const make = Effect.gen(function* () {
     readonly scope: McpInvocationContext.McpThreadInvocationScope;
     readonly parentProjectId: ProjectId;
     readonly parentThreadId: ThreadId;
-    readonly parentRunId: RunId;
+    readonly coordinatorThreadId: ThreadId;
     readonly taskId: NodeId;
     readonly runId: string;
     readonly meta: WorkflowMeta;
@@ -3107,6 +3182,8 @@ const make = Effect.gen(function* () {
     readonly args: unknown;
     readonly runTarget: OrchestratorMcpTarget | undefined;
     readonly tokenBudget: number | undefined;
+    readonly effectiveConcurrency: number;
+    readonly limits: OrchestrationV2WorkflowLimits;
     readonly replaySource:
       | { readonly journalPath: string; readonly index: ReplayIndex }
       | undefined;
@@ -3117,7 +3194,7 @@ const make = Effect.gen(function* () {
       scope,
       parentProjectId,
       parentThreadId,
-      parentRunId,
+      coordinatorThreadId,
       taskId,
       runId,
       meta,
@@ -3129,6 +3206,8 @@ const make = Effect.gen(function* () {
       args,
       runTarget,
       tokenBudget,
+      effectiveConcurrency,
+      limits,
       replaySource,
       done,
     } = params;
@@ -3306,7 +3385,66 @@ const make = Effect.gen(function* () {
         let progressDirty = false;
         let progressSeq = 0;
         let lastDispatchedProgress: string | undefined;
-        let replayGate: Promise<void> = Promise.resolve();
+        let lastProgressSentAt: number | undefined;
+        let intakeGate: Promise<void> = Promise.resolve();
+        let pendingIntakeCount = 0;
+        const intakeIdleWaiters: Array<() => void> = [];
+        let runningSlots = 0;
+        let startGate: Promise<void> = Promise.resolve();
+
+        interface QueuedAdmission {
+          readonly index: number;
+          cancelled: boolean;
+          admitted: boolean;
+          prevStartGate: Promise<void>;
+          releaseStartGate: () => void;
+          readonly acquire: () => void;
+        }
+        const admissionQueue: Array<QueuedAdmission> = [];
+
+        const notifyIntakeIdle = (): void => {
+          const waiters = intakeIdleWaiters.splice(0);
+          for (const notify of waiters) notify();
+        };
+
+        const waitForIntakeIdle: Effect.Effect<void> = Effect.callback<void>((resume) => {
+          if (pendingIntakeCount === 0) {
+            resume(Effect.void);
+            return;
+          }
+          const notify = () => resume(Effect.void);
+          intakeIdleWaiters.push(notify);
+          return Effect.sync(() => {
+            const idx = intakeIdleWaiters.indexOf(notify);
+            if (idx !== -1) intakeIdleWaiters.splice(idx, 1);
+          });
+        });
+
+        const drainAdmissionQueue = (): void => {
+          if (pendingIntakeCount > 0) return;
+          while (admissionQueue.length > 0 && admissionQueue[0]!.cancelled) {
+            admissionQueue.shift();
+          }
+          while (runningSlots < effectiveConcurrency && admissionQueue.length > 0) {
+            const next = admissionQueue.shift()!;
+            if (next.cancelled) continue;
+            runningSlots += 1;
+            const prevStart = startGate;
+            let releaseStart!: () => void;
+            startGate = new Promise<void>((resolve) => {
+              releaseStart = resolve;
+            });
+            let startReleased = false;
+            next.admitted = true;
+            next.prevStartGate = prevStart;
+            next.releaseStartGate = () => {
+              if (startReleased) return;
+              startReleased = true;
+              releaseStart();
+            };
+            next.acquire();
+          }
+        };
 
         const phases: Array<OrchestrationV2WorkflowPhase> = [];
         const phaseIndexByTitle = new Map<string, number>();
@@ -3321,6 +3459,7 @@ const make = Effect.gen(function* () {
         const logs: Array<string> = [];
         const agentsByIndex = new Map<number, OrchestrationV2WorkflowAgent>();
         const activeAgents = new Map<number, LiveAgentRecord>();
+        let usageToolCalls = 0;
         const usage: MutableUsage = {
           agents: 0,
           done: 0,
@@ -3409,15 +3548,59 @@ const make = Effect.gen(function* () {
             runId,
             scriptPath,
             transcriptDir: runDirFor(runId),
+            journalPath,
           },
           phases: [...phases],
           agents: [...agentsByIndex.values()].toSorted((a, b) => a.index - b.index),
+          ...(logs.length === 0 ? {} : { logs: [...logs] }),
+          limits,
           totalTokens: usage.tokens,
+          ...(usageToolCalls > 0 ? { toolCalls: usageToolCalls } : {}),
           durationMs: Math.max(0, Math.trunc(nowMs - startedAt)),
           ...(observedStopRequestedAt === undefined
             ? {}
             : { stopRequestedAt: observedStopRequestedAt }),
         });
+
+        const dispatchProgress = Effect.fn("WorkflowService.dispatchProgress")(
+          function* (options?: { readonly forceStopped?: boolean; readonly atMs?: number }) {
+            const forceStopped = options?.forceStopped === true;
+            if (!forceStopped && (!progressDirty || stopRequested)) return;
+            progressDirty = false;
+            const sentAt = options?.atMs ?? (yield* Clock.currentTimeMillis);
+            lastProgressSentAt = sentAt;
+            progressSeq += 1;
+            const latestLog = logs.at(-1);
+            yield* threadManagement
+              .dispatch({
+                type: "workflow.progress",
+                commandId: stableCommandId({
+                  scope,
+                  operation: "workflow-progress",
+                  key: `${runId}:${progressSeq}`,
+                }),
+                parentThreadId,
+                taskId,
+                workflow: buildWorkflowSnapshot(sentAt),
+                ...(latestLog === undefined ? {} : { progress: latestLog }),
+              })
+              .pipe(
+                Effect.provideService(DispatchModeLimit, undefined),
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    if (latestLog !== undefined) lastDispatchedProgress = latestLog;
+                  }),
+                ),
+                Effect.catch((error) =>
+                  Effect.logWarning("workflow.progress.dispatch-failed", {
+                    runId,
+                    taskId,
+                    error,
+                  }),
+                ),
+              );
+          },
+        );
 
         const buildPersistedRecord = (nowMs: number): PersistedWorkflowRun => ({
           runId,
@@ -3517,7 +3700,7 @@ const make = Effect.gen(function* () {
             : (record.childTaskId ?? latestFollowupTaskId);
           yield* stopOwnedChildThread({
             threadManagement,
-            parentThreadId,
+            parentThreadId: coordinatorThreadId,
             runId,
             childThreadId: record.childThreadId,
             childTaskId: targetTaskId,
@@ -3556,7 +3739,7 @@ const make = Effect.gen(function* () {
           function* (childTaskId: NodeId, childThreadId: ThreadId, fromSequence: number) {
             const readCurrent = Effect.gen(function* () {
               const { subagents } = yield* threadManagement.getThreadRecords(
-                parentThreadId,
+                coordinatorThreadId,
                 ["subagents"],
                 { subagentIds: [childTaskId] },
               );
@@ -3573,7 +3756,7 @@ const make = Effect.gen(function* () {
               [
                 threadManagement
                   .streamStoredEventsFrom({
-                    threadId: parentThreadId,
+                    threadId: coordinatorThreadId,
                     afterSequence: fromSequence,
                     eventType: "subagent.updated",
                   })
@@ -3683,15 +3866,22 @@ const make = Effect.gen(function* () {
               messageRoles: ["assistant"],
               messageRunIds: runIds,
               turnItemRunIds: runIds,
-              turnItemTypes: SUBAGENT_RESULT_TURN_ITEM_TYPES,
+              turnItemTypes: WORKFLOW_AGENT_SNAPSHOT_TURN_ITEM_TYPES,
             },
           );
+          let toolCalls = 0;
+          for (const item of details.turnItems) {
+            if (WORKFLOW_AGENT_TOOL_TURN_ITEM_TYPE_SET.has(item.type)) {
+              toolCalls += 1;
+            }
+          }
           return {
             run,
             runs: base.runs,
             providerTurns: base.providerTurns,
             messages: details.messages,
             turnItems: details.turnItems,
+            toolCalls,
             model: run?.modelSelection.model ?? base.thread.modelSelection.model,
           };
         });
@@ -3761,28 +3951,65 @@ const make = Effect.gen(function* () {
           call: WorkflowAgentCall,
           resolvedTarget: Result.Result<OrchestratorMcpTarget | undefined, OrchestratorMcpFailure>,
           liveRecord: LiveAgentRecord,
-          prevReplayGate: Promise<void>,
-          releaseReplayGate: () => void,
-        ): Effect.fn.Return<unknown, WorkflowAbortedError | WorkflowInternalError> {
+          prevIntakeGate: Promise<void>,
+          releaseIntakeGate: () => void,
+        ): Effect.fn.Return<
+          unknown,
+          WorkflowAbortedError | WorkflowBudgetExceededError | WorkflowInternalError
+        > {
           const label = liveRecord.label;
           const phaseInfo = liveRecord.phaseInfo;
           const promptPreview = previewText(call.prompt);
           const effort = call.opts.effort?.trim();
-          let gateReleased = false;
-          const releaseGateOnce = () => {
-            if (gateReleased) return;
-            gateReleased = true;
-            releaseReplayGate();
+          let intakeHeld = true;
+          let admissionEntry: QueuedAdmission | undefined;
+
+          const finishIntakeSync = (): void => {
+            if (!intakeHeld) return;
+            intakeHeld = false;
+            releaseIntakeGate();
+            pendingIntakeCount = Math.max(0, pendingIntakeCount - 1);
+            if (pendingIntakeCount === 0) {
+              notifyIntakeIdle();
+              if (progressDirty) signalProgressSync();
+              drainAdmissionQueue();
+            }
           };
+
+          const finishIntake = Effect.gen(function* () {
+            if (!intakeHeld) return;
+            intakeHeld = false;
+            releaseIntakeGate();
+            const hasQueuedBacklog =
+              admissionQueue.length > Math.max(0, effectiveConcurrency - runningSlots);
+            if (
+              pendingIntakeCount === 1 &&
+              progressDirty &&
+              !stopRequested &&
+              (lastProgressSentAt === undefined || hasQueuedBacklog)
+            ) {
+              yield* dispatchProgress();
+            }
+            pendingIntakeCount = Math.max(0, pendingIntakeCount - 1);
+            if (pendingIntakeCount === 0) {
+              notifyIntakeIdle();
+              if (progressDirty) signalProgressSync();
+              drainAdmissionQueue();
+            }
+          });
 
           return yield* Effect.gen(function* () {
             if (stopRequested) {
-              releaseGateOnce();
+              finishIntakeSync();
               return yield* abortStoppedAgent(liveRecord);
             }
             if (abortController.signal.aborted) {
-              releaseGateOnce();
+              finishIntakeSync();
               return yield* new WorkflowAbortedError();
+            }
+            if (scriptSettled) {
+              finishIntakeSync();
+              return yield* cancelUnawaitedAgent(liveRecord);
             }
 
             const resolvedModelSelection = Result.isFailure(resolvedTarget)
@@ -3797,22 +4024,39 @@ const make = Effect.gen(function* () {
             );
             liveRecord.key = key;
 
-            yield* Effect.promise(() => prevReplayGate);
+            yield* Effect.promise(() => prevIntakeGate);
+
+            if (stopRequested) {
+              finishIntakeSync();
+              return yield* abortStoppedAgent(liveRecord);
+            }
+            if (abortController.signal.aborted) {
+              finishIntakeSync();
+              return yield* new WorkflowAbortedError();
+            }
+            if (scriptSettled) {
+              finishIntakeSync();
+              return yield* cancelUnawaitedAgent(liveRecord);
+            }
+
             const replayedOutcome = yield* Effect.gen(function* () {
               if (stopRequested || abortController.signal.aborted || cursor === undefined) {
                 return { cached: false } as const;
               }
               return yield* cursor.take(call.index, key);
-            }).pipe(Effect.ensuring(Effect.sync(releaseGateOnce)), Effect.result);
+            }).pipe(Effect.result);
             if (Result.isFailure(replayedOutcome)) {
+              finishIntakeSync();
               return failRunFromHostLimit(replayedOutcome.failure.message);
             }
             const replayed = replayedOutcome.success;
 
             if (stopRequested) {
+              finishIntakeSync();
               return yield* abortStoppedAgent(liveRecord);
             }
             if (abortController.signal.aborted) {
+              finishIntakeSync();
               return yield* new WorkflowAbortedError();
             }
 
@@ -3837,6 +4081,7 @@ const make = Effect.gen(function* () {
                 queuedAt: now,
                 startedAt: now,
                 completedAt: now,
+                cached: true,
                 ...(promptPreview === undefined ? {} : { prompt: promptPreview }),
                 ...(resultPreview === undefined ? {} : { result: resultPreview }),
               });
@@ -3848,13 +4093,21 @@ const make = Effect.gen(function* () {
                 value: replayed.value,
                 cached: true,
               });
-              signalProgressSync();
+              progressDirty = true;
+              yield* finishIntake;
               yield* flushJournal;
               return replayed.value;
             }
 
             if (scriptSettled) {
+              finishIntakeSync();
               return yield* cancelUnawaitedAgent(liveRecord);
+            }
+
+            if (tokenBudget !== undefined && usage.tokens >= tokenBudget) {
+              agentsByIndex.delete(call.index);
+              yield* finishIntake;
+              return yield* new WorkflowBudgetExceededError();
             }
 
             const queuedAt = yield* Clock.currentTimeMillis;
@@ -3873,7 +4126,7 @@ const make = Effect.gen(function* () {
               queuedAt,
               ...(promptPreview === undefined ? {} : { prompt: promptPreview }),
             });
-            signalProgressSync();
+            progressDirty = true;
 
             if (Result.isFailure(resolvedTarget) || Result.isFailure(resolvedModelSelection)) {
               liveRecord.startedJournaled = true;
@@ -3892,7 +4145,7 @@ const make = Effect.gen(function* () {
                 state: "failed",
                 completedAt: failedAt,
                 durationMs: Math.max(0, failedAt - queuedAt),
-                ...(reason === undefined ? {} : { result: reason }),
+                ...(reason === undefined ? {} : { error: reason, result: reason }),
               });
               yield* appendJournal({
                 type: "started",
@@ -3911,7 +4164,8 @@ const make = Effect.gen(function* () {
                 value: null,
                 ...(reason === undefined ? {} : { error: reason }),
               });
-              signalProgressSync();
+              progressDirty = true;
+              yield* finishIntake;
               yield* flushJournal;
               return null;
             }
@@ -3932,27 +4186,27 @@ const make = Effect.gen(function* () {
               | Readonly<Record<string, Schema.Json>>
               | undefined;
 
-            const beforeDelegateSeq = yield* threadManagement
-              .getThreadEventSequence(parentThreadId)
-              .pipe(Effect.orElseSucceed(() => afterSequence));
-
             if (stopRequested || (yield* checkSqlStopRequested())) {
+              finishIntakeSync();
               return yield* abortStoppedAgent(liveRecord);
             }
             if (abortController.signal.aborted) {
+              finishIntakeSync();
               return yield* new WorkflowAbortedError();
             }
             if (scriptSettled) {
+              finishIntakeSync();
               return yield* cancelUnawaitedAgent(liveRecord);
             }
 
+            // Phase 1 (intake): create the member thread under C immediately in visible `queued` state.
             const delegated = yield* orchestratorMcp
               .delegateWorkflowAgent(scope, {
-                parentRunId,
-                workflowNodeId: taskId,
+                coordinatorThreadId,
                 requestKey: `${runId}:${call.index}`,
                 task: delegateTaskInput,
                 ...(outputSchema === undefined ? {} : { outputSchema }),
+                deferStart: true,
               })
               .pipe(Effect.result);
 
@@ -3962,9 +4216,11 @@ const make = Effect.gen(function* () {
                 abortController.signal.aborted ||
                 (yield* checkSqlStopRequested())
               ) {
+                finishIntakeSync();
                 return yield* abortStoppedAgent(liveRecord);
               }
               if (scriptSettled) {
+                finishIntakeSync();
                 return yield* cancelUnawaitedAgent(liveRecord);
               }
               liveRecord.startedJournaled = true;
@@ -3977,7 +4233,7 @@ const make = Effect.gen(function* () {
                 state: "failed",
                 completedAt: failedAt,
                 durationMs: Math.max(0, failedAt - queuedAt),
-                ...(reason === undefined ? {} : { result: reason }),
+                ...(reason === undefined ? {} : { error: reason, result: reason }),
               });
               yield* appendJournal({
                 type: "started",
@@ -3996,7 +4252,8 @@ const make = Effect.gen(function* () {
                 value: null,
                 ...(reason === undefined ? {} : { error: reason }),
               });
-              signalProgressSync();
+              progressDirty = true;
+              yield* finishIntake;
               yield* flushJournal;
               return null;
             }
@@ -4005,17 +4262,183 @@ const make = Effect.gen(function* () {
             liveRecord.childTaskId = childTaskId;
             liveRecord.childThreadId = childThreadId;
 
-            const startedAtAgent = yield* Clock.currentTimeMillis;
-            liveRecord.startedAt = startedAtAgent;
+            if (stopRequested || abortController.signal.aborted) {
+              finishIntakeSync();
+              return yield* stopRequested
+                ? abortStoppedAgent(liveRecord)
+                : new WorkflowAbortedError();
+            }
+            if (scriptSettled) {
+              finishIntakeSync();
+              return yield* cancelUnawaitedAgent(liveRecord);
+            }
+
             const requestedModel = resolvedModelSelection.success.model.trim();
             agentsByIndex.set(call.index, {
               ...agentsByIndex.get(call.index)!,
               agentId: childTaskId,
               childThreadId,
               providerInstanceId: resolvedModelSelection.success.instanceId,
+              state: "queued",
+              ...(requestedModel.length > 0 ? { model: requestedModel } : {}),
+            });
+            progressDirty = true;
+
+            const slotAcquired = yield* Deferred.make<void>();
+            const entry: QueuedAdmission = {
+              index: call.index,
+              cancelled: false,
+              admitted: false,
+              prevStartGate: Promise.resolve(),
+              releaseStartGate: () => {},
+              acquire: () => {
+                Deferred.doneUnsafe(slotAcquired, Exit.void);
+              },
+            };
+            admissionEntry = entry;
+            admissionQueue.push(entry);
+
+            // Finish intake: once the batch of simultaneous calls has created all queued members,
+            // flush the queued snapshot and admit up to `effectiveConcurrency` in strict FIFO order.
+            yield* finishIntake;
+
+            // Phase 2 (admission): wait for a FIFO concurrency slot or abort.
+            const waitedSlot = yield* Effect.raceFirst(
+              Deferred.await(slotAcquired).pipe(Effect.as("acquired" as const)),
+              Deferred.await(agentsAbortDeferred).pipe(Effect.as("aborted" as const)),
+            );
+            if (waitedSlot === "aborted") {
+              entry.cancelled = true;
+              if (stopRequested) {
+                return yield* abortStoppedAgent(liveRecord);
+              }
+              if (scriptSettled) {
+                return yield* cancelUnawaitedAgent(liveRecord);
+              }
+              return yield* new WorkflowAbortedError();
+            }
+
+            // Serialize startWorkflowAgent dispatch in strict FIFO admission order.
+            yield* Effect.promise(() => entry.prevStartGate);
+
+            if (stopRequested || (yield* checkSqlStopRequested())) {
+              entry.releaseStartGate();
+              return yield* abortStoppedAgent(liveRecord);
+            }
+            if (abortController.signal.aborted) {
+              entry.releaseStartGate();
+              return yield* new WorkflowAbortedError();
+            }
+            if (scriptSettled) {
+              entry.releaseStartGate();
+              return yield* cancelUnawaitedAgent(liveRecord);
+            }
+
+            if (tokenBudget !== undefined && usage.tokens >= tokenBudget) {
+              entry.releaseStartGate();
+              yield* cancelLiveAgent(liveRecord);
+              liveRecord.startedJournaled = true;
+              liveRecord.resultJournaled = true;
+              const failedAt = yield* Clock.currentTimeMillis;
+              usage.errors += 1;
+              agentsByIndex.set(call.index, {
+                ...agentsByIndex.get(call.index)!,
+                state: "failed",
+                completedAt: failedAt,
+                durationMs: Math.max(0, failedAt - queuedAt),
+                error: TOKEN_BUDGET_SPENT_MESSAGE,
+                result: TOKEN_BUDGET_SPENT_MESSAGE,
+              });
+              yield* appendJournal({
+                type: "started",
+                index: call.index,
+                key,
+                label,
+                phase: phaseInfo?.title ?? null,
+                agentId: childTaskId,
+                childThreadId,
+              });
+              yield* appendJournal({
+                type: "result",
+                index: call.index,
+                key,
+                outcome: "null",
+                value: null,
+                error: TOKEN_BUDGET_SPENT_MESSAGE,
+              });
+              signalProgressSync();
+              yield* flushJournal;
+              return yield* new WorkflowBudgetExceededError();
+            }
+
+            const beforeDelegateSeq = yield* threadManagement
+              .getThreadEventSequence(coordinatorThreadId)
+              .pipe(Effect.orElseSucceed(() => 0));
+
+            const startedMember = yield* orchestratorMcp
+              .startWorkflowAgent(scope, {
+                coordinatorThreadId,
+                taskId: childTaskId,
+                childThreadId,
+                requestKey: `${runId}:${call.index}`,
+                ...(call.opts.isolation === undefined ? {} : { isolation: call.opts.isolation }),
+                ...(outputSchema === undefined ? {} : { outputSchema }),
+              })
+              .pipe(Effect.result);
+
+            if (Result.isFailure(startedMember)) {
+              entry.releaseStartGate();
+              if (
+                stopRequested ||
+                abortController.signal.aborted ||
+                (yield* checkSqlStopRequested())
+              ) {
+                return yield* abortStoppedAgent(liveRecord);
+              }
+              if (scriptSettled) {
+                return yield* cancelUnawaitedAgent(liveRecord);
+              }
+              yield* cancelLiveAgent(liveRecord);
+              liveRecord.startedJournaled = true;
+              liveRecord.resultJournaled = true;
+              const failedAt = yield* Clock.currentTimeMillis;
+              usage.errors += 1;
+              const reason = previewText(startedMember.failure.message);
+              agentsByIndex.set(call.index, {
+                ...agentsByIndex.get(call.index)!,
+                state: "failed",
+                completedAt: failedAt,
+                durationMs: Math.max(0, failedAt - queuedAt),
+                ...(reason === undefined ? {} : { error: reason, result: reason }),
+              });
+              yield* appendJournal({
+                type: "started",
+                index: call.index,
+                key,
+                label,
+                phase: phaseInfo?.title ?? null,
+                agentId: childTaskId,
+                childThreadId,
+              });
+              yield* appendJournal({
+                type: "result",
+                index: call.index,
+                key,
+                outcome: "null",
+                value: null,
+                ...(reason === undefined ? {} : { error: reason }),
+              });
+              signalProgressSync();
+              yield* flushJournal;
+              return null;
+            }
+
+            const startedAtAgent = yield* Clock.currentTimeMillis;
+            liveRecord.startedAt = startedAtAgent;
+            agentsByIndex.set(call.index, {
+              ...agentsByIndex.get(call.index)!,
               state: "running",
               startedAt: startedAtAgent,
-              ...(requestedModel.length > 0 ? { model: requestedModel } : {}),
             });
             liveRecord.startedJournaled = true;
             yield* appendJournal({
@@ -4028,6 +4451,7 @@ const make = Effect.gen(function* () {
               childThreadId,
             });
             signalProgressSync();
+            entry.releaseStartGate();
 
             if (stopRequested) {
               return yield* abortStoppedAgent(liveRecord);
@@ -4046,11 +4470,13 @@ const make = Effect.gen(function* () {
               readonly countAs: "done" | "error" | "empty";
               readonly model?: string | undefined;
               readonly tokens: number;
+              readonly toolCalls: number;
               readonly error?: string | undefined;
             }) {
               liveRecord.resultJournaled = true;
               const completedAt = yield* Clock.currentTimeMillis;
               usage.tokens += finish.tokens;
+              usageToolCalls += finish.toolCalls;
               if (finish.countAs === "done") usage.done += 1;
               else if (finish.countAs === "error") usage.errors += 1;
               else usage.empty += 1;
@@ -4067,9 +4493,11 @@ const make = Effect.gen(function* () {
                   ? { model: resolvedModel }
                   : {}),
                 totalTokens: finish.tokens,
+                ...(finish.toolCalls > 0 ? { toolCalls: finish.toolCalls } : {}),
                 completedAt,
                 durationMs: Math.max(0, completedAt - startedAtAgent),
                 ...(resultPreview === undefined ? {} : { result: resultPreview }),
+                ...(errorPreview === undefined ? {} : { error: errorPreview }),
               });
               const resultExceedsLimit =
                 finish.outcome === "ok" &&
@@ -4127,6 +4555,7 @@ const make = Effect.gen(function* () {
               ),
             );
             const initialTokens = sumThreadTokens(initialSnapshot.providerTurns);
+            let accumulatedToolCalls = initialSnapshot.toolCalls;
             const initialRun =
               initialSnapshot.runs.find((candidate) => candidate.delegatedTaskId === childTaskId) ??
               initialSnapshot.run;
@@ -4152,6 +4581,7 @@ const make = Effect.gen(function* () {
                 countAs: "error",
                 model: initialSnapshot.model,
                 tokens: initialTokens,
+                toolCalls: accumulatedToolCalls,
                 error:
                   rootFailure?.message ??
                   settledTask?.result ??
@@ -4173,6 +4603,7 @@ const make = Effect.gen(function* () {
                   countAs: "empty",
                   model: initialSnapshot.model,
                   tokens: initialTokens,
+                  toolCalls: accumulatedToolCalls,
                 });
               }
               return yield* finishAgent({
@@ -4182,6 +4613,7 @@ const make = Effect.gen(function* () {
                 countAs: "done",
                 model: initialSnapshot.model,
                 tokens: initialTokens,
+                toolCalls: accumulatedToolCalls,
               });
             }
 
@@ -4199,6 +4631,7 @@ const make = Effect.gen(function* () {
                   countAs: "done",
                   model: currentSnapshot.model,
                   tokens: sumThreadTokens(currentSnapshot.providerTurns),
+                  toolCalls: accumulatedToolCalls,
                 });
               }
 
@@ -4217,6 +4650,7 @@ const make = Effect.gen(function* () {
                   countAs: "done",
                   model: currentSnapshot.model,
                   tokens: sumThreadTokens(currentSnapshot.providerTurns),
+                  toolCalls: accumulatedToolCalls,
                 });
               }
 
@@ -4228,6 +4662,7 @@ const make = Effect.gen(function* () {
                   countAs: "error",
                   model: currentSnapshot.model,
                   tokens: sumThreadTokens(currentSnapshot.providerTurns),
+                  toolCalls: accumulatedToolCalls,
                   error: `Result did not match the schema after ${MAX_SCHEMA_REPROMPTS} re-prompts: ${formatOutputRejection(checked.failure)}`,
                 });
               }
@@ -4307,6 +4742,7 @@ const make = Effect.gen(function* () {
                   countAs: "error",
                   model: currentSnapshot.model,
                   tokens: sumThreadTokens(currentSnapshot.providerTurns),
+                  toolCalls: accumulatedToolCalls,
                   error: `Could not re-prompt the agent: ${errorMessage(sent.failure)}`,
                 });
               }
@@ -4366,6 +4802,7 @@ const make = Effect.gen(function* () {
                   (error) => new WorkflowInternalError({ messageText: errorMessage(error) }),
                 ),
               );
+              accumulatedToolCalls += currentSnapshot.toolCalls;
               currentRun = currentSnapshot.run ?? settledReprompt;
               latestTaskResult = null;
 
@@ -4390,6 +4827,7 @@ const make = Effect.gen(function* () {
                   countAs: "error",
                   model: currentSnapshot.model,
                   tokens: sumThreadTokens(currentSnapshot.providerTurns),
+                  toolCalls: accumulatedToolCalls,
                   error:
                     rootFailure?.message ??
                     `Re-prompt run ended ${currentRun?.status ?? "without a result"}.`,
@@ -4399,7 +4837,16 @@ const make = Effect.gen(function* () {
           }).pipe(
             Effect.ensuring(
               Effect.sync(() => {
-                releaseGateOnce();
+                finishIntakeSync();
+                if (admissionEntry !== undefined) {
+                  admissionEntry.cancelled = true;
+                  if (admissionEntry.admitted) {
+                    admissionEntry.admitted = false;
+                    admissionEntry.releaseStartGate();
+                    runningSlots = Math.max(0, runningSlots - 1);
+                    drainAdmissionQueue();
+                  }
+                }
                 activeAgents.delete(call.index);
                 Deferred.doneUnsafe(liveRecord.done, Exit.void);
               }),
@@ -4420,10 +4867,13 @@ const make = Effect.gen(function* () {
               call.phase !== undefined && call.phase.trim().length > 0
                 ? ensurePhase(call.phase)
                 : undefined;
+            const label = agentLabel(call);
+            const effort = call.opts.effort?.trim();
+            const promptPreview = previewText(call.prompt);
             const record: LiveAgentRecord = {
               index: call.index,
               key: "",
-              label: agentLabel(call),
+              label,
               phaseInfo,
               done: Deferred.makeUnsafe<void>(),
               queuedAt: undefined,
@@ -4438,19 +4888,43 @@ const make = Effect.gen(function* () {
               cancelled: false,
             };
             activeAgents.set(call.index, record);
-            // Serialize cursor.take in synchronous call order even while model resolution runs asynchronously.
-            const prevReplayGate = replayGate;
-            let releaseReplayGate!: () => void;
-            replayGate = new Promise<void>((resolve) => {
-              releaseReplayGate = resolve;
+            // Make every call visible as `queued` at once before intake / slot admission runs.
+            agentsByIndex.set(call.index, {
+              index: call.index,
+              label,
+              state: "queued",
+              ...(phaseInfo === undefined
+                ? {}
+                : { phaseIndex: phaseInfo.index, phaseTitle: phaseInfo.title }),
+              ...(effort !== undefined && effort.length > 0 ? { effort } : {}),
+              attempt: 1,
+              ...(promptPreview === undefined ? {} : { prompt: promptPreview }),
+            });
+            pendingIntakeCount += 1;
+            // Serialize intake (replay cursor, queued member creation, FIFO admission enqueue) in call order.
+            const prevIntakeGate = intakeGate;
+            let releaseIntakeGate!: () => void;
+            intakeGate = new Promise<void>((resolve) => {
+              releaseIntakeGate = resolve;
             });
             return runPromise(
-              runAgentEffect(call, resolvedTarget, record, prevReplayGate, releaseReplayGate).pipe(
+              runAgentEffect(call, resolvedTarget, record, prevIntakeGate, releaseIntakeGate).pipe(
+                Effect.map((value) => ({ ok: true as const, value })),
                 Effect.catchTags({
-                  WorkflowInternalError: () => Effect.succeed(null),
+                  WorkflowInternalError: () => Effect.succeed({ ok: true as const, value: null }),
+                  WorkflowBudgetExceededError: () =>
+                    Effect.succeed({ ok: false as const, kind: "budget" as const }),
+                  WorkflowAbortedError: () =>
+                    Effect.succeed({ ok: false as const, kind: "aborted" as const }),
                 }),
               ),
-            );
+            ).then((outcome) => {
+              if (outcome.ok) return outcome.value;
+              if (outcome.kind === "budget") {
+                throw new WorkflowScriptError(TOKEN_BUDGET_SPENT_MESSAGE);
+              }
+              throw new WorkflowAbortedError();
+            });
           },
           onPhase: (title) => {
             if (workerClosed) return;
@@ -4532,48 +5006,9 @@ const make = Effect.gen(function* () {
         };
 
         const coalescerStop = yield* Deferred.make<void>();
-        const dispatchProgress = Effect.fn("WorkflowService.dispatchProgress")(
-          function* (options?: { readonly forceStopped?: boolean; readonly atMs?: number }) {
-            const forceStopped = options?.forceStopped === true;
-            if (!forceStopped && (!progressDirty || stopRequested)) return;
-            progressDirty = false;
-            const sentAt = options?.atMs ?? (yield* Clock.currentTimeMillis);
-            progressSeq += 1;
-            const latestLog = logs.at(-1);
-            yield* threadManagement
-              .dispatch({
-                type: "workflow.progress",
-                commandId: stableCommandId({
-                  scope,
-                  operation: "workflow-progress",
-                  key: `${runId}:${progressSeq}`,
-                }),
-                parentThreadId,
-                taskId,
-                workflow: buildWorkflowSnapshot(sentAt),
-                ...(latestLog === undefined ? {} : { progress: latestLog }),
-              })
-              .pipe(
-                Effect.provideService(DispatchModeLimit, undefined),
-                Effect.tap(() =>
-                  Effect.sync(() => {
-                    if (latestLog !== undefined) lastDispatchedProgress = latestLog;
-                  }),
-                ),
-                Effect.catch((error) =>
-                  Effect.logWarning("workflow.progress.dispatch-failed", {
-                    runId,
-                    taskId,
-                    error,
-                  }),
-                ),
-              );
-          },
-        );
 
         // Coalesce workflow.progress updates to at most once per second via Effect Clock.
         const coalescerFiber = yield* Effect.gen(function* () {
-          let lastSentAt: number | undefined;
           while (true) {
             const event = yield* Effect.raceFirst(
               Queue.take(progressSignal).pipe(Effect.as("signal" as const)),
@@ -4584,9 +5019,17 @@ const make = Effect.gen(function* () {
               return;
             }
             if (!progressDirty) continue;
+            if (pendingIntakeCount > 0) {
+              yield* Effect.raceFirst(waitForIntakeIdle, Deferred.await(coalescerStop));
+              if (yield* Deferred.isDone(coalescerStop)) {
+                yield* dispatchProgress();
+                return;
+              }
+              if (!progressDirty) continue;
+            }
             const now = yield* Clock.currentTimeMillis;
-            if (lastSentAt !== undefined) {
-              const remaining = PROGRESS_COALESCE_INTERVAL_MS - (now - lastSentAt);
+            if (lastProgressSentAt !== undefined) {
+              const remaining = PROGRESS_COALESCE_INTERVAL_MS - (now - lastProgressSentAt);
               if (remaining > 0) {
                 const slept = yield* Effect.raceFirst(
                   Effect.sleep(Duration.millis(remaining)).pipe(Effect.as("tick" as const)),
@@ -4599,7 +5042,6 @@ const make = Effect.gen(function* () {
               }
             }
             yield* dispatchProgress();
-            lastSentAt = yield* Clock.currentTimeMillis;
             if (yield* Deferred.isDone(coalescerStop)) {
               yield* dispatchProgress();
               return;
@@ -4700,7 +5142,8 @@ const make = Effect.gen(function* () {
               script: scriptSource,
               args,
               host,
-              concurrency,
+              concurrency: effectiveConcurrency,
+              hostManagedConcurrency: true,
               onWorkerSpawned: (worker) => {
                 spawnedWorker = worker;
                 const workerPid = worker.pid;
@@ -4758,6 +5201,12 @@ const make = Effect.gen(function* () {
               : new WorkflowExecutionError({ messageText: errorMessage(err) }),
         }).pipe(Effect.result);
         workerClosed = true;
+        if (Result.isFailure(scriptOutcome) || hostLimitError !== undefined) {
+          Deferred.doneUnsafe(agentsAbortDeferred, Exit.void);
+          if (!abortController.signal.aborted) {
+            abortController.abort(new WorkflowAbortedError());
+          }
+        }
         yield* awaitScriptReadsClosed;
 
         const workerStillAlive = spawnedWorker !== undefined && !spawnedWorker.isConfirmedDone();
@@ -4866,6 +5315,7 @@ const make = Effect.gen(function* () {
                     childThreadId: agent.childThreadId,
                     childTaskId:
                       agent.agentId === undefined ? undefined : NodeId.make(agent.agentId),
+                    parentThreadId: coordinatorThreadId,
                   },
                 ],
           );
@@ -5072,6 +5522,9 @@ const make = Effect.gen(function* () {
         "Workflow agents run in this thread's project. Omit target.projectId.",
       );
     }
+    if (input.target !== undefined) {
+      yield* orchestratorMcp.resolveWorkflowAgentModelSelection(scope, input.target);
+    }
 
     let scriptSource: string;
     if (input.scriptPath !== undefined) {
@@ -5219,6 +5672,13 @@ const make = Effect.gen(function* () {
         ),
       );
 
+    const effectiveConcurrency = input.concurrency ?? meta.concurrency ?? defaultConcurrency;
+    const limits: OrchestrationV2WorkflowLimits = {
+      ...(input.tokenBudget === undefined ? {} : { tokenBudget: input.tokenBudget }),
+      concurrency: effectiveConcurrency,
+      maxAgents: WORKFLOW_LIMITS.maxAgents,
+    };
+
     const initialPhases = meta.phases.map((p, index) => ({ index, title: p.title }));
     const initialWorkflow: OrchestrationV2SubagentWorkflow = {
       name: meta.name,
@@ -5226,9 +5686,11 @@ const make = Effect.gen(function* () {
         runId,
         scriptPath: snapshotScriptPath,
         transcriptDir: runDir,
+        journalPath,
       },
       phases: initialPhases,
       agents: [],
+      limits,
     };
 
     const startCommandId = stableCommandId({ scope, operation: "workflow-start", key: runId });
@@ -5269,6 +5731,7 @@ const make = Effect.gen(function* () {
         parentNodeId: parentRun.rootNodeId,
         title: truncateWorkflowTitle(meta.name),
         description: meta.description,
+        scriptText: scriptSource,
         modelSelection: parentRun.modelSelection,
         workflow: initialWorkflow,
       })
@@ -5294,6 +5757,13 @@ const make = Effect.gen(function* () {
       );
     }
     const taskId = taskEvent.event.payload.id;
+    const coordinatorThreadId = taskEvent.event.payload.childThreadId;
+    if (coordinatorThreadId === null) {
+      return yield* failure(
+        "orchestration_error",
+        "Workflow start command did not produce a coordinator thread.",
+      );
+    }
     if (taskId !== derivedTaskId) {
       yield* writePersistedRun({ ...initialPersistedRun, taskId });
     }
@@ -5305,7 +5775,7 @@ const make = Effect.gen(function* () {
       scope,
       parentProjectId: parent.thread.projectId,
       parentThreadId: scope.thread.threadId,
-      parentRunId: parentRun.id,
+      coordinatorThreadId,
       taskId,
       runId,
       meta,
@@ -5317,6 +5787,8 @@ const make = Effect.gen(function* () {
       args: input.args,
       runTarget: input.target,
       tokenBudget: input.tokenBudget,
+      effectiveConcurrency,
+      limits,
       replaySource,
       done,
       onRegisterLive: (live) => {

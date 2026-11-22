@@ -137,7 +137,7 @@ const TaskCancelTool = Tool.make("task_cancel", {
 
 const WorkflowRunTool = Tool.make("t3_workflow_run", {
   description:
-    "Run a workflow script on the server: many agents, any provider, deterministic. Returns runId at once; completion wakes this thread. Agents keep running after your turn ends. Script: `export const meta = {name, description, phases?}` then a body using agent(prompt, {label, phase, schema, target, model, effort, isolation}), parallel, pipeline, phase, log, args, budget. No Date.now, Math.random, fs or Node. Resume: resumeFromRunId with an edited scriptPath.",
+    "Run a workflow script on the server: many agents, any provider, deterministic. Returns runId at once; completion wakes this thread. Agents keep running after your turn ends. Script: `export const meta = {name, description, phases?, concurrency?}` then a body using agent(prompt, {label, phase, schema, target, model, effort, isolation}), parallel, pipeline, phase, log, args, budget. No Date.now, Math.random, fs or Node. Resume: resumeFromRunId with an edited scriptPath.",
   parameters: OrchestratorMcpWorkflowRunInput,
   success: OrchestratorMcpWorkflowRunResult,
   failure: OrchestratorMcpFailure,

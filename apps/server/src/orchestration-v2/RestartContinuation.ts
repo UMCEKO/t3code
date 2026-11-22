@@ -131,20 +131,21 @@ export const restartStopRequested = Effect.fn("RestartContinuation.restartStopRe
         { subagentIds: [currentTaskId] },
       );
       const task = parentRecords.subagents.find((candidate) => candidate.id === currentTaskId);
+      const isStoppedServerWorkflow = (
+        candidate: (typeof parentRecords.subagents)[number] | undefined,
+      ) =>
+        candidate?.origin === "app_owned" &&
+        candidate.workflow !== undefined &&
+        (options?.serverRestart === true ||
+          candidate.workflow.stopRequestedAt !== undefined ||
+          !isOrchestrationV2WorkActive(candidate.status));
       if (task !== undefined) {
+        // Server workflows never survive a server restart; fail closed even if cleanup has not marked them yet.
+        if (isStoppedServerWorkflow(task)) return true;
         const owner = (yield* getThreadRecords(parentThreadId, ["subagents"], {
           subagentIds: [task.parentNodeId],
         })).subagents.find((candidate) => candidate.id === task.parentNodeId);
-        // Server workflows never survive a server restart; fail closed even if cleanup has not marked them yet.
-        if (
-          owner?.origin === "app_owned" &&
-          owner.childThreadId === null &&
-          owner.workflow !== undefined &&
-          (options?.serverRestart === true ||
-            owner.workflow.stopRequestedAt !== undefined ||
-            !isOrchestrationV2WorkActive(owner.status))
-        )
-          return true;
+        if (isStoppedServerWorkflow(owner)) return true;
       }
       if (task === undefined) return false;
       const taskActive = task.result === null && isOrchestrationV2WorkActive(task.status);
