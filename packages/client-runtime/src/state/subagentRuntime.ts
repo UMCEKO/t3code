@@ -6,6 +6,7 @@ import type {
   OrchestrationV2Subagent,
   OrchestrationV2SubagentWorkflow,
   OrchestrationV2TurnItem,
+  ProviderInstanceId,
 } from "@t3tools/contracts";
 import { isOrchestrationV2WorkActive, isProviderNativeSubagentThread } from "@t3tools/contracts";
 import { mFallback, msg } from "gt-i18n";
@@ -54,6 +55,8 @@ export interface RuntimeSubagent {
   readonly title: string;
   readonly role: string | null;
   readonly model: string | null;
+  /** The instance a workflow member's own thread runs on; unknown for other kinds. */
+  readonly providerInstanceId?: ProviderInstanceId | undefined;
   readonly effort: string | null;
   readonly speed?: string | undefined;
   readonly status: RuntimeSubagentStatus;
@@ -269,6 +272,7 @@ function workflowMembersToRuntime(
       kind: "workflow_agent" as const,
       title: agent.label,
       model: agent.model ?? null,
+      providerInstanceId: agent.providerInstanceId,
       effort: agent.effort ?? null,
       ...(agent.speed === undefined ? {} : { speed: agent.speed }),
       status,

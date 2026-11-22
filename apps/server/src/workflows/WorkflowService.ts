@@ -3883,7 +3883,9 @@ const make = Effect.gen(function* () {
               const reason = previewText(
                 Result.isFailure(resolvedTarget)
                   ? resolvedTarget.failure.message
-                  : resolvedModelSelection.failure.message,
+                  : Result.isFailure(resolvedModelSelection)
+                    ? resolvedModelSelection.failure.message
+                    : undefined,
               );
               agentsByIndex.set(call.index, {
                 ...agentsByIndex.get(call.index)!,
@@ -4010,6 +4012,7 @@ const make = Effect.gen(function* () {
               ...agentsByIndex.get(call.index)!,
               agentId: childTaskId,
               childThreadId,
+              providerInstanceId: resolvedModelSelection.success.instanceId,
               state: "running",
               startedAt: startedAtAgent,
               ...(requestedModel.length > 0 ? { model: requestedModel } : {}),

@@ -90,7 +90,7 @@ import { useAtomCommand } from "../../state/use-atom-command";
 import { useEnvironmentQuery } from "../../state/query";
 import { AgentElapsed } from "./AgentElapsed";
 import { ThreadRelationshipIcon, threadRelationshipStatusLabel } from "./ThreadRelationshipIcon";
-import { ThreadLineageWorkflowRow } from "./ThreadLineageWorkflowRow";
+import { ThreadLineageWorkflowRow, type WorkflowDisclosure } from "./ThreadLineageWorkflowRow";
 import { useSideThreadTrigger } from "../../hooks/useSideThreadTrigger";
 import { openSideThread, resolveThreadOpenRoute } from "../../lib/sideChatPane";
 
@@ -1087,7 +1087,8 @@ export function ThreadRelationshipsPanel(props: {
     const trailingVisibilityClass = canStopWorkflow
       ? "group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:opacity-0 [@media(hover:none)]:opacity-0"
       : "";
-    const header = (
+    // A server workflow has no thread of its own, so its header opens the card's view of its phases and members.
+    const header = ({ expanded, toggle }: WorkflowDisclosure) => (
       <Tooltip>
         <TooltipTrigger
           delay={200}
@@ -1096,8 +1097,8 @@ export function ThreadRelationshipsPanel(props: {
               size="sm"
               variant="ghost"
               part="primary"
-              render={<div />}
-              className="cursor-default active:scale-100"
+              aria-expanded={expanded}
+              onClick={toggle}
             />
           }
         >

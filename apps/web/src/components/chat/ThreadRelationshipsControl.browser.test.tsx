@@ -542,3 +542,71 @@ it.each([1, 18])("continues scrolling the panel past a list of %i subagents", as
   await userEvent.wheel(list, { delta: { y: 300 } });
   await vi.waitFor(() => expect(viewport.scrollTop).toBeGreaterThan(0));
 });
+
+it("opens a server workflow's phases from its header and each member's thread from its row", async () => {
+  setup();
+  const projection = makeThreadProjectionFixture();
+  const environmentId = EnvironmentId.make("local");
+  const memberId = ThreadId.make("workflow-member");
+  state.projection = {
+    ...projection,
+    subagents: [
+      {
+        id: NodeId.make("workflow"),
+        threadId: projection.thread.id,
+        runId: null,
+        parentNodeId: NodeId.make("parent"),
+        origin: "app_owned",
+        createdBy: "agent",
+        driver: "codex",
+        providerInstanceId: projection.thread.providerInstanceId,
+        providerThreadId: null,
+        childThreadId: null,
+        nativeTaskRef: null,
+        prompt: "export const meta = {}",
+        title: "Review run",
+        model: null,
+        status: "running",
+        result: null,
+        startedAt: projection.thread.updatedAt,
+        completedAt: null,
+        updatedAt: projection.thread.updatedAt,
+        workflow: {
+          name: "Review run",
+          phases: [{ index: 0, title: "Scan" }],
+          agents: [
+            {
+              index: 0,
+              label: "scanner",
+              childThreadId: memberId,
+              state: "running",
+              phaseIndex: 0,
+              phaseTitle: "Scan",
+              startedAt: 1,
+            },
+          ],
+        },
+      },
+    ],
+  };
+  await using screen = await render(
+    <ThreadRelationshipsPanel
+      environmentId={environmentId}
+      threadId={projection.thread.id}
+      showLineage
+      showSideChats
+    />,
+  );
+  const header = screen.getByRole("button", { name: /^Review run/ });
+  await expect.element(header).toHaveAttribute("aria-expanded", "false");
+  await header.click();
+  await expect.element(header).toHaveAttribute("aria-expanded", "true");
+  await expect.element(screen.getByRole("button", { name: /Scan phase/ })).toBeVisible();
+  const member = screen.getByRole("button", { name: "Open scanner chat" });
+  await expect.element(member).toBeEnabled();
+  await member.click();
+  const panelRef = scopeThreadRef(environmentId, projection.thread.id);
+  expect(
+    selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, panelRef),
+  ).toMatchObject({ isOpen: true, surfaces: [{ kind: "thread", threadId: memberId }] });
+});

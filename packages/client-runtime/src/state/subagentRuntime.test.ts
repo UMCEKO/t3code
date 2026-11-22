@@ -95,6 +95,22 @@ describe("createWorkflowMemberRowFilter", () => {
 });
 
 describe("projectedSubagentsToRuntime workflow expansion", () => {
+  it("carries each member's own provider instance", () => {
+    const [, first, second] = projectedSubagentsToRuntime([
+      subagent({
+        workflow: {
+          phases: [],
+          agents: [
+            member({ index: 0, providerInstanceId: ProviderInstanceId.make("codex") }),
+            member({ index: 1, providerInstanceId: ProviderInstanceId.make("claude") }),
+          ],
+        },
+      }),
+    ]);
+    expect(first?.providerInstanceId).toBe("codex");
+    expect(second?.providerInstanceId).toBe("claude");
+  });
+
   it("uses a settled member's wall-clock completion separately from its execution duration", () => {
     const [, settled] = projectedSubagentsToRuntime([
       subagent({
