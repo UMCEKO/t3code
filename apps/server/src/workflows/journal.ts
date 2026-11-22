@@ -168,6 +168,15 @@ function isJournalEntry(value: unknown): value is JournalEntry {
   }
 }
 
+export function parseJournalLine(trimmedLine: string): JournalEntry | undefined {
+  try {
+    const parsed: unknown = JSON.parse(trimmedLine);
+    return isJournalEntry(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function decodeJournal(text: string): ReadonlyArray<JournalEntry> {
   const rawLines = text.split("\n");
   let lastNonEmpty = -1;
@@ -186,17 +195,9 @@ export function decodeJournal(text: string): ReadonlyArray<JournalEntry> {
     const trimmed = rawLines[i]!.trim();
     if (trimmed.length === 0) continue;
 
-    let parsed: unknown;
-    let valid = false;
-    try {
-      parsed = JSON.parse(trimmed);
-      valid = isJournalEntry(parsed);
-    } catch {
-      valid = false;
-    }
-
-    if (valid) {
-      entries.push(parsed as JournalEntry);
+    const parsed = parseJournalLine(trimmed);
+    if (parsed !== undefined) {
+      entries.push(parsed);
       continue;
     }
 

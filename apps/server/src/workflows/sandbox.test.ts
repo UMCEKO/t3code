@@ -1265,6 +1265,39 @@ describe("sandbox", () => {
       });
       expect(esrchConfirmed).toBe(true);
       expect(esrchOutcome).toEqual({ status: "exited" });
+
+      // A successful kill("SIGKILL") that never emits exit/close must be bounded and return kill_failed.
+      let hangKillAttempts = 0;
+      let hangConfirmed = false;
+      const hangOutcome = await terminateSandboxChild({
+        child: {
+          pid: 999_998,
+          exitCode: null,
+          signalCode: null,
+          stdin: { destroy: () => {} },
+          stdout: { destroy: () => {} },
+          stderr: { destroy: () => {} },
+          kill: () => {
+            hangKillAttempts += 1;
+            return true;
+          },
+        },
+        isExited: () => hangConfirmed,
+        markExited: () => {
+          hangConfirmed = true;
+        },
+        waitForExit: () => new Promise<void>(() => {}),
+        maxKillAttempts: 2,
+        retryDelayMs: 0,
+        exitConfirmTimeoutMs: 10,
+      });
+      expect(hangKillAttempts).toBe(2);
+      expect(hangConfirmed).toBe(false);
+      expect(hangOutcome).toMatchObject({
+        status: "kill_failed",
+        pid: 999_998,
+        attempts: 2,
+      });
     });
 
     it("retries transient kill failures in runWorkflowScript, keeps ownership on persistent kill failures, and distinguishes spawn errors from live-PID errors", async () => {
@@ -1808,13 +1841,22 @@ describe("sandbox", () => {
       const corkedWorkerScript = `
         const origWrite = process.stdout.write.bind(process.stdout);
         let readySent = false;
+        let uncorkScheduled = false;
         process.stdout.write = (chunk, ...rest) => {
           const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+          if (readySent && text === "" && !uncorkScheduled) {
+            uncorkScheduled = true;
+            setImmediate(() => process.stdout.uncork());
+            return origWrite(chunk, ...rest);
+          }
           if (text.includes('"type":"error"') || text.includes('"type":"done"')) {
             process.stdout.uncork();
             return origWrite(chunk, ...rest);
           }
           const ok = origWrite(chunk, ...rest);
+          if (readySent && process.stdout.writableLength > 1024) {
+            process.exit(42);
+          }
           if (!readySent && text.includes('"type":"ready"')) {
             readySent = true;
             process.stdout.cork();
@@ -1846,7 +1888,7 @@ describe("sandbox", () => {
       ).rejects.toThrow(/output backlog exceeded/i);
     });
 
-    it("flushes queued worker stdout before writing the final done frame", async () => {
+    it("flushes queued worker stdout before writing terminal done and error frames and enforces framing + newline within the backlog cap", async () => {
       const workerModuleUrl = new URL("./sandboxWorker.ts", import.meta.url).href;
       const cap = 1024;
       const guardedCorkWorkerScript = `
@@ -1890,6 +1932,43 @@ describe("sandbox", () => {
         },
       });
       expect(result).toBe("y".repeat(600));
+
+      // Terminal error frames must also drain queued stdout instead of overflowing the backlog cap.
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            log("x".repeat(600));
+            throw new Error("boom-" + "e".repeat(500));
+          `),
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+          maxStdoutBufferedBytes: cap,
+          spawnCommand: {
+            command: process.execPath,
+            args: ["-e", guardedCorkWorkerScript],
+            env: { ELECTRON_RUN_AS_NODE: "1" },
+          },
+        }),
+      ).rejects.toThrow(/boom-e+/);
+
+      // Even with an empty queue, a done frame that fits before framing but exceeds the cap with framing + newline is rejected.
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            return "z".repeat(1010);
+          `),
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+          maxStdoutBufferedBytes: cap,
+          spawnCommand: {
+            command: process.execPath,
+            args: ["-e", guardedCorkWorkerScript],
+            env: { ELECTRON_RUN_AS_NODE: "1" },
+          },
+        }),
+      ).rejects.toThrow(/exceeds.*limit/i);
     });
 
     it("limits in-flight nested loadScript requests on the host before opening files", async () => {
