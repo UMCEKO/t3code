@@ -52,6 +52,11 @@ export interface ReplayCursor {
   ) => { readonly cached: true; readonly value: unknown } | { readonly cached: false };
 }
 
+export interface ReplayCursorAccumulator {
+  readonly push: (entry: JournalEntry) => void;
+  readonly build: () => ReplayCursor;
+}
+
 function unwrapToJson(value: unknown): unknown {
   if (typeof value === "object" && value !== null && "toJSON" in value) {
     const candidate = (value as { readonly toJSON?: unknown }).toJSON;
@@ -216,52 +221,63 @@ interface RecordedResult {
   readonly value: unknown;
 }
 
-export function replayCursor(previous: ReadonlyArray<JournalEntry>): ReplayCursor {
+export function createReplayCursorAccumulator(): ReplayCursorAccumulator {
   const results = new Map<number, RecordedResult>();
-  for (const entry of previous) {
-    if (entry.type === "result") {
-      results.set(entry.index, {
-        key: entry.key,
-        outcome: entry.outcome,
-        value: entry.value,
-      });
-    }
-  }
-
-  let nextIndex = 0;
-  let broken = false;
-
   return {
-    take(index: number, key: string) {
-      if (index !== nextIndex) {
-        throw new Error(`Replay cursor expected index ${nextIndex}, got ${index}`);
+    push(entry: JournalEntry) {
+      if (entry.type === "result") {
+        results.set(entry.index, {
+          key: entry.key,
+          outcome: entry.outcome,
+          value: entry.outcome === "ok" ? entry.value : null,
+        });
       }
-      nextIndex += 1;
-
-      if (broken) {
-        return { cached: false };
-      }
-
-      const previousResult = results.get(index);
-      if (
-        previousResult === undefined ||
-        previousResult.key !== key ||
-        previousResult.outcome === "cancelled"
-      ) {
-        broken = true;
-        return { cached: false };
-      }
-
-      if (previousResult.outcome === "usage_limited") {
-        return { cached: false };
-      }
+    },
+    build() {
+      let nextIndex = 0;
+      let broken = false;
 
       return {
-        cached: true,
-        value: previousResult.outcome === "null" ? null : previousResult.value,
+        take(index: number, key: string) {
+          if (index !== nextIndex) {
+            throw new Error(`Replay cursor expected index ${nextIndex}, got ${index}`);
+          }
+          nextIndex += 1;
+
+          if (broken) {
+            return { cached: false };
+          }
+
+          const previousResult = results.get(index);
+          if (
+            previousResult === undefined ||
+            previousResult.key !== key ||
+            previousResult.outcome === "cancelled"
+          ) {
+            broken = true;
+            return { cached: false };
+          }
+
+          if (previousResult.outcome === "usage_limited") {
+            return { cached: false };
+          }
+
+          return {
+            cached: true,
+            value: previousResult.outcome === "null" ? null : previousResult.value,
+          };
+        },
       };
     },
   };
+}
+
+export function replayCursor(previous: ReadonlyArray<JournalEntry>): ReplayCursor {
+  const accumulator = createReplayCursorAccumulator();
+  for (const entry of previous) {
+    accumulator.push(entry);
+  }
+  return accumulator.build();
 }
 
 type JournalQueueItem =

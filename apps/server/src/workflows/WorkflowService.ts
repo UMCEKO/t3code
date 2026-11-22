@@ -85,9 +85,9 @@ import {
   MAX_PENDING_JOURNAL_BYTES,
   MAX_PENDING_JOURNAL_ENTRIES,
   agentCallKey,
+  createReplayCursorAccumulator,
   makeJournalWriter,
   parseJournalLine,
-  replayCursor,
   type JournalEntry,
   type ReplayCursor,
 } from "./journal.ts";
@@ -122,7 +122,6 @@ const STARTUP_STOP_CONFIRM_BUDGET_MS = 2_000;
 const STOP_CONFIRM_WAIT_MS = 2_000;
 const STOP_WAIT_BOUND_MS = 30_000;
 const MAX_PERSISTED_RUN_META_BYTES = 8 * 1024 * 1024;
-const MAX_JOURNAL_FILE_BYTES = 64 * 1024 * 1024;
 const MAX_JOURNAL_LINE_BYTES = 8 * 1024 * 1024;
 
 const TASK_ROLE_LITERALS: ReadonlySet<string> = new Set<OrchestratorMcpTaskRole>([
@@ -205,6 +204,17 @@ class WorkflowJournalCorruptError extends Schema.TaggedError<WorkflowJournalCorr
 ) {
   override get message(): string {
     return `Corrupt journal entry at line ${this.line}`;
+  }
+}
+
+class WorkflowJournalLineTooLargeError extends Schema.TaggedError<WorkflowJournalLineTooLargeError>()(
+  "WorkflowJournalLineTooLargeError",
+  {
+    journalPath: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Workflow journal entry at ${this.journalPath} exceeds the 8 MiB limit.`;
   }
 }
 
@@ -440,6 +450,15 @@ function previewValue(value: unknown): string | undefined {
     return previewText(JSON.stringify(value));
   } catch {
     return undefined;
+  }
+}
+
+function serializedValueExceedsLimit(value: unknown, maxBytes: number): boolean {
+  try {
+    const serialized = JSON.stringify(value);
+    return serialized !== undefined && Buffer.byteLength(serialized, "utf8") > maxBytes;
+  } catch {
+    return false;
   }
 }
 
@@ -1045,7 +1064,7 @@ const foldBoundedJournalFile = Effect.fn("WorkflowService.foldBoundedJournalFile
 ): Effect.fn.Return<
   boolean,
   | WorkflowScriptNotRegularFileError
-  | WorkflowScriptTooLargeError
+  | WorkflowJournalLineTooLargeError
   | WorkflowScriptReadError
   | WorkflowJournalCorruptError
 > {
@@ -1066,12 +1085,8 @@ const foldBoundedJournalFile = Effect.fn("WorkflowService.foldBoundedJournalFile
       if (!info.isRegularFile) {
         return yield* new WorkflowScriptNotRegularFileError({ scriptPath: journalPath });
       }
-      if (info.size > MAX_JOURNAL_FILE_BYTES) {
-        return yield* new WorkflowScriptTooLargeError({ scriptPath: journalPath });
-      }
 
       const decoder = new TextDecoder("utf-8");
-      let totalBytes = 0;
       let lineNumber = 0;
       let pendingInvalidLine: number | undefined;
       let lineChunks: Array<Uint8Array> = [];
@@ -1118,10 +1133,6 @@ const foldBoundedJournalFile = Effect.fn("WorkflowService.foldBoundedJournalFile
         const chunkOption = yield* file.readChunk(READ_SCRIPT_CHUNK_BYTES);
         if (Option.isNone(chunkOption) || chunkOption.value.byteLength === 0) break;
         const chunk = chunkOption.value;
-        totalBytes += chunk.byteLength;
-        if (totalBytes > MAX_JOURNAL_FILE_BYTES) {
-          return yield* new WorkflowScriptTooLargeError({ scriptPath: journalPath });
-        }
         const buf = Buffer.from(chunk.buffer, chunk.byteOffset, chunk.byteLength);
         let offset = 0;
         while (offset < buf.length) {
@@ -1129,7 +1140,7 @@ const foldBoundedJournalFile = Effect.fn("WorkflowService.foldBoundedJournalFile
           if (nl === -1) {
             const remaining = buf.length - offset;
             if (lineBytes + remaining > MAX_JOURNAL_LINE_BYTES) {
-              return yield* new WorkflowScriptTooLargeError({ scriptPath: journalPath });
+              return yield* new WorkflowJournalLineTooLargeError({ journalPath });
             }
             lineChunks.push(Buffer.from(buf.subarray(offset)));
             lineBytes += remaining;
@@ -1137,7 +1148,7 @@ const foldBoundedJournalFile = Effect.fn("WorkflowService.foldBoundedJournalFile
           }
           const segmentLen = nl - offset;
           if (lineBytes + segmentLen > MAX_JOURNAL_LINE_BYTES) {
-            return yield* new WorkflowScriptTooLargeError({ scriptPath: journalPath });
+            return yield* new WorkflowJournalLineTooLargeError({ journalPath });
           }
           const fullLine = concatLine(buf.subarray(offset, nl));
           lineChunks = [];
@@ -1164,36 +1175,35 @@ interface JournalRecoveryScan {
 const scanCanonicalJournalForRecovery = Effect.fn(
   "WorkflowService.scanCanonicalJournalForRecovery",
 )(function* (journalPath: string) {
-  const startedEntries: Array<{
-    readonly index: number;
-    readonly childThreadId: ThreadId;
-    readonly childTaskId: NodeId | undefined;
-  }> = [];
+  const openChildren = new Map<number, Array<OwnedChildTarget>>();
   const finishedIndices = new Set<number>();
   let lastEndEntry: Extract<JournalEntry, { readonly type: "end" }> | undefined;
 
   const exists = yield* foldBoundedJournalFile(journalPath, (entry) => {
     if (entry.type === "started" && entry.childThreadId !== null) {
-      startedEntries.push({
-        index: entry.index,
-        childThreadId: ThreadId.make(entry.childThreadId),
-        childTaskId: entry.agentId === null ? undefined : NodeId.make(entry.agentId),
-      });
+      if (!finishedIndices.has(entry.index)) {
+        const target: OwnedChildTarget = {
+          childThreadId: ThreadId.make(entry.childThreadId),
+          childTaskId: entry.agentId === null ? undefined : NodeId.make(entry.agentId),
+        };
+        const existing = openChildren.get(entry.index);
+        if (existing === undefined) {
+          openChildren.set(entry.index, [target]);
+        } else {
+          existing.push(target);
+        }
+      }
     } else if (entry.type === "result" && entry.outcome !== "cancelled") {
       finishedIndices.add(entry.index);
+      openChildren.delete(entry.index);
     } else if (entry.type === "end") {
       lastEndEntry = entry;
     }
   });
 
   const journalChildren: Array<OwnedChildTarget> = [];
-  for (const started of startedEntries) {
-    if (!finishedIndices.has(started.index)) {
-      journalChildren.push({
-        childThreadId: started.childThreadId,
-        childTaskId: started.childTaskId,
-      });
-    }
+  for (const targets of openChildren.values()) {
+    journalChildren.push(...targets);
   }
   return {
     exists,
@@ -1218,13 +1228,11 @@ const reconstructFromJournalFile = Effect.fn("WorkflowService.reconstructFromJou
   },
 );
 
-const readJournalEntriesForReplay = Effect.fn("WorkflowService.readJournalEntriesForReplay")(
+const readReplayCursorFromJournal = Effect.fn("WorkflowService.readReplayCursorFromJournal")(
   function* (canonicalJournalPath: string) {
-    const entries: Array<JournalEntry> = [];
-    const exists = yield* foldBoundedJournalFile(canonicalJournalPath, (entry) => {
-      entries.push(entry);
-    });
-    return { exists, entries } as const;
+    const accumulator = createReplayCursorAccumulator();
+    const exists = yield* foldBoundedJournalFile(canonicalJournalPath, accumulator.push);
+    return { exists, cursor: accumulator.build() } as const;
   },
 );
 
@@ -1544,24 +1552,6 @@ const confirmBatchWithBudget = Effect.fn("WorkflowService.confirmBatchWithBudget
   );
 
   yield* Effect.raceFirst(Effect.sleep(Duration.millis(budgetMs)), waitAll);
-
-  if (remaining.size > 0) {
-    yield* Effect.forEach(
-      [...remaining],
-      (childThreadId) =>
-        readChildStopState(threadManagement, childThreadId).pipe(
-          Effect.tap((state) =>
-            Effect.sync(() => {
-              if (state === undefined || isChildConfirmedStopped(state)) {
-                remaining.delete(childThreadId);
-              }
-            }),
-          ),
-          Effect.ignore,
-        ),
-      { concurrency, discard: true },
-    );
-  }
   return remaining;
 });
 
@@ -3289,13 +3279,18 @@ const make = Effect.gen(function* () {
                 durationMs: Math.max(0, completedAt - startedAtAgent),
                 ...(resultPreview === undefined ? {} : { result: resultPreview }),
               });
-              yield* appendJournal({
-                type: "result",
-                index: call.index,
-                key,
-                outcome: finish.outcome,
-                value: finish.value,
-              });
+              const resultExceedsLimit =
+                finish.outcome === "ok" &&
+                serializedValueExceedsLimit(finish.value, WORKFLOW_MESSAGE_LIMITS.maxValueBytes);
+              if (!resultExceedsLimit) {
+                yield* appendJournal({
+                  type: "result",
+                  index: call.index,
+                  key,
+                  outcome: finish.outcome,
+                  value: finish.value,
+                });
+              }
               signalProgressSync();
               yield* flushJournal;
               return finish.value;
@@ -3896,10 +3891,10 @@ const make = Effect.gen(function* () {
         yield* awaitScriptReadsClosed;
 
         const workerStillAlive = spawnedWorker !== undefined && !spawnedWorker.isConfirmedDone();
-        const sandboxCleanupPending =
-          workerStillAlive ||
-          (Result.isFailure(scriptOutcome) &&
-            scriptOutcome.failure._tag === "WorkflowSandboxCleanupPendingError");
+        const sandboxKillAlreadyAttempted =
+          Result.isFailure(scriptOutcome) &&
+          scriptOutcome.failure._tag === "WorkflowSandboxCleanupPendingError";
+        const sandboxCleanupPending = workerStillAlive || sandboxKillAlreadyAttempted;
         if (sandboxCleanupPending) {
           const pendingAt = yield* Clock.currentTimeMillis;
           yield* writePersistedRun({
@@ -3911,12 +3906,35 @@ const make = Effect.gen(function* () {
 
         const confirmSandboxWorkerExited = Effect.fn("WorkflowService.confirmSandboxWorkerExited")(
           function* (worker: WorkflowSandboxWorker, alreadyAttempted: boolean) {
+            const awaitWorkerExit = Effect.callback<void>((resume) => {
+              let active = true;
+              let unsubscribe: (() => void) | undefined;
+              const finish = () => {
+                if (!active) return;
+                active = false;
+                const unsub = unsubscribe;
+                unsubscribe = undefined;
+                unsub?.();
+                resume(Effect.void);
+              };
+              unsubscribe = worker.onExit(finish);
+              if (!active) {
+                unsubscribe();
+                unsubscribe = undefined;
+              }
+              return Effect.sync(() => {
+                active = false;
+                const unsub = unsubscribe;
+                unsubscribe = undefined;
+                unsub?.();
+              });
+            });
             for (let attempt = 0; ; attempt += 1) {
               if (worker.isConfirmedDone()) return;
               if (alreadyAttempted || attempt > 0) {
                 const delayAttempt = alreadyAttempted ? attempt : attempt - 1;
                 yield* Effect.raceFirst(
-                  Effect.promise(() => worker.waitForExit()),
+                  awaitWorkerExit,
                   Effect.sleep(Duration.millis(retryDelayMs(delayAttempt))),
                 );
                 if (worker.isConfirmedDone()) return;
@@ -3936,6 +3954,13 @@ const make = Effect.gen(function* () {
             }
           },
         );
+
+        const sandboxCleanupFiber =
+          spawnedWorker !== undefined && !spawnedWorker.isConfirmedDone()
+            ? yield* confirmSandboxWorkerExited(spawnedWorker, sandboxKillAlreadyAttempted).pipe(
+                Effect.forkScoped,
+              )
+            : undefined;
 
         if (!stopRequested) {
           scriptSettled = true;
@@ -3971,8 +3996,8 @@ const make = Effect.gen(function* () {
           extraChildren: trackedOwnedChildren(),
           maxAttempts: Number.POSITIVE_INFINITY,
         });
-        if (spawnedWorker !== undefined && !spawnedWorker.isConfirmedDone()) {
-          yield* confirmSandboxWorkerExited(spawnedWorker, sandboxCleanupPending);
+        if (sandboxCleanupFiber !== undefined) {
+          yield* Fiber.join(sandboxCleanupFiber);
         }
 
         if (stopRequested) {
@@ -4248,7 +4273,7 @@ const make = Effect.gen(function* () {
         }
       }
       const prevJournalPath = journalPathFor(sourceRunId);
-      const prevJournal = yield* readJournalEntriesForReplay(prevJournalPath).pipe(
+      const prevJournal = yield* readReplayCursorFromJournal(prevJournalPath).pipe(
         Effect.mapError((error) =>
           error._tag === "WorkflowJournalCorruptError"
             ? failure("invalid_request", error.message)
@@ -4264,7 +4289,7 @@ const make = Effect.gen(function* () {
           `Journal not found for workflow run "${sourceRunId}".`,
         );
       }
-      cursor = replayCursor(prevJournal.entries);
+      cursor = prevJournal.cursor;
     }
 
     const runId = yield* generateRunId;

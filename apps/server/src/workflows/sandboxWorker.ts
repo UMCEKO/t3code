@@ -36,6 +36,11 @@ export const MAX_SCRIPT_MESSAGE_BYTES =
 export const MAX_START_MESSAGE_BYTES =
   WORKFLOW_MESSAGE_LIMITS.maxValueBytes * (JSON_STRING_MAX_EXPANSION + 1) + 16_384;
 export const MAX_WORKER_STDOUT_BUFFERED_BYTES = 4 * 1024 * 1024;
+export const MIN_WORKER_STDOUT_BUFFERED_BYTES =
+  Buffer.byteLength(
+    JSON.stringify({ type: "error", kind: "WorkflowScriptError", message: "" }),
+    "utf8",
+  ) + 1;
 export const MAX_ERROR_MESSAGE_CHARS = 16_384;
 
 export type WorkflowProgressLimits = {
@@ -155,6 +160,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
   const MAX_START_BYTES = ${MAX_START_MESSAGE_BYTES};
   const MAX_SCRIPT_BYTES = ${MAX_SCRIPT_MESSAGE_BYTES};
   const DEFAULT_MAX_STDOUT_BUFFERED_BYTES = ${MAX_WORKER_STDOUT_BUFFERED_BYTES};
+  const MIN_STDOUT_BUFFERED_BYTES = ${MIN_WORKER_STDOUT_BUFFERED_BYTES};
   const MAX_ERROR_CHARS = ${MAX_ERROR_MESSAGE_CHARS};
   const MAX_META_DEPTH = 64;
   const ALLOWED_AGENT_OPT_KEYS = new Set([
@@ -1310,13 +1316,25 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     pendingLoads.clear();
   }
 
+  function abortOversizedTerminalFrame() {
+    stdin.destroy();
+    if (!stdout.destroyed && !stdout.writableEnded) {
+      stdout.destroy();
+    }
+    process.exit(1);
+  }
+
   function writeTerminalFrame(msg, frameBytes) {
     const bytes = frameBytes ?? byteLength(msg, "utf8") + 1;
     const cap = maxStdoutBufferedBytes();
+    if (!Number.isFinite(cap) || bytes > cap) {
+      abortOversizedTerminalFrame();
+      return false;
+    }
     const tryWrite = () => {
       if (stdout.destroyed || stdout.writableEnded) return;
       const queued = typeof stdout.writableLength === "number" ? stdout.writableLength : 0;
-      if (queued === 0 || queued + bytes <= cap) {
+      if (queued + bytes <= cap) {
         writeRawMessage(msg);
         return;
       }
@@ -1327,6 +1345,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
       }
     };
     tryWrite();
+    return true;
   }
 
   function buildBoundedErrorFrame(kind, message, cap) {
@@ -1338,7 +1357,10 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     }
     const empty = JSON.stringify({ type: "error", kind, message: "" });
     const emptyBytes = byteLength(empty, "utf8") + 1;
-    if (emptyBytes >= cap) {
+    if (emptyBytes > cap) {
+      return null;
+    }
+    if (emptyBytes === cap) {
       return { msg: empty, frameBytes: emptyBytes };
     }
     const available = cap - emptyBytes;
@@ -1363,8 +1385,12 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
   function postErrorAndClose(kind, message) {
     if (runClosed) return;
     closeRunState();
-    const { msg, frameBytes } = buildBoundedErrorFrame(kind, message, maxStdoutBufferedBytes());
-    writeTerminalFrame(msg, frameBytes);
+    const frame = buildBoundedErrorFrame(kind, message, maxStdoutBufferedBytes());
+    if (frame === null) {
+      abortOversizedTerminalFrame();
+      return;
+    }
+    writeTerminalFrame(frame.msg, frame.frameBytes);
   }
 
   function failCap(message) {
@@ -1891,6 +1917,13 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
       if (msg.type === "start") {
         if (started) return;
         started = true;
+        const configuredCap =
+          msg.maxStdoutBufferedBytes === undefined
+            ? DEFAULT_MAX_STDOUT_BUFFERED_BYTES
+            : typeof msg.maxStdoutBufferedBytes === "number" &&
+                Number.isFinite(msg.maxStdoutBufferedBytes)
+              ? Math.trunc(msg.maxStdoutBufferedBytes)
+              : -1;
         config = {
           concurrency: msg.concurrency,
           syncTimeoutMs: msg.syncTimeoutMs,
@@ -1901,11 +1934,17 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
           maxValueBytes: msg.maxValueBytes,
           maxLogChars: msg.maxLogChars,
           progressLimits: msg.progressLimits,
-          maxStdoutBufferedBytes:
-            typeof msg.maxStdoutBufferedBytes === "number"
-              ? msg.maxStdoutBufferedBytes
-              : DEFAULT_MAX_STDOUT_BUFFERED_BYTES,
+          maxStdoutBufferedBytes: Math.max(0, configuredCap),
         };
+        if (configuredCap < MIN_STDOUT_BUFFERED_BYTES) {
+          postErrorAndClose(
+            "WorkflowScriptError",
+            "Workflow sandbox stdout backlog cap must be at least " +
+              MIN_STDOUT_BUFFERED_BYTES +
+              " bytes.",
+          );
+          return;
+        }
         budgetSpent = msg.budgetSpent;
         progressBudget = makeProgressBudget(config.progressLimits);
         semaphore = new FifoSemaphore(config.concurrency);
