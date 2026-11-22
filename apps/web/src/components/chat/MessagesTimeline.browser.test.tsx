@@ -480,6 +480,95 @@ describe("MessagesTimeline work rows", () => {
     expect(output!.closest('[role="button"]')).toBeNull();
     expect(document.getElementById(toggle.getAttribute("aria-controls") ?? "")).toContain(output);
   });
+
+  it("renders only P's coordinator workflow card and no member rows without any client filter", async () => {
+    setup();
+    const now = DateTime.makeUnsafe(CREATED_AT);
+    const parentThreadId = ThreadId.make("thread-1");
+    const coordinatorThreadId = ThreadId.make("workflow-coordinator-1");
+    const memberThreadId = ThreadId.make("workflow-member-1");
+    const runId = RunId.make("run-workflow");
+    const workflowId = NodeId.make("wf-coord-1");
+    const workflowSubagent: OrchestrationV2Subagent = {
+      id: workflowId,
+      threadId: parentThreadId,
+      runId,
+      parentNodeId: NodeId.make("root-1"),
+      origin: "app_owned",
+      createdBy: "agent",
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      providerThreadId: null,
+      childThreadId: coordinatorThreadId,
+      nativeTaskRef: null,
+      prompt: 'export const meta = { name: "Audit" };',
+      title: "Audit workflow",
+      model: null,
+      status: "running",
+      progress: "Running Scan",
+      result: null,
+      startedAt: now,
+      completedAt: null,
+      updatedAt: now,
+      workflow: {
+        name: "Audit",
+        phases: [{ index: 0, title: "Scan" }],
+        agents: [
+          {
+            index: 0,
+            label: "scanner-member",
+            childThreadId: memberThreadId,
+            state: "running",
+            phaseIndex: 0,
+            phaseTitle: "Scan",
+          },
+        ],
+      },
+    };
+    const projectedWorkflowItem = v2Item("subagent", {
+      id: "wf-item-1",
+      threadId: parentThreadId,
+      runId,
+      subagentId: workflowId,
+      origin: "app_owned",
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      childThreadId: coordinatorThreadId,
+      title: "Audit workflow",
+      prompt: workflowSubagent.prompt,
+      progress: "Running Scan",
+      result: null,
+      status: "running",
+      startedAt: now,
+      completedAt: null,
+      updatedAt: now,
+    });
+    using _threadAtom = vi.spyOn(environmentThreadDetails, "threadAtom").mockReturnValue(
+      Atom.make({
+        projection: {
+          subagents: [workflowSubagent],
+          turnItems: [(projectedWorkflowItem as { item: unknown }).item],
+          visibleTurnItems: [projectedWorkflowItem],
+        },
+      }) as never,
+    );
+    const entries = deriveTimelineEntriesFromVisibleTurnItems({
+      visibleTurnItems: [projectedWorkflowItem],
+      optimisticMessages: [],
+      attachmentUrlById: new Map(),
+      attempts: [],
+      nodes: [],
+      plans: [],
+    });
+    const onOpenThread = vi.fn();
+    await using screen = await renderTimeline(entries, { onOpenThread });
+    const cards = [...document.querySelectorAll('[data-v2-item-type="subagent"]')];
+    expect(cards).toHaveLength(1);
+    expect(screen.text()).toContain("Audit workflow");
+    expect(screen.text()).not.toContain("scanner-member");
+    await click(screen.buttons("Open Audit workflow")[0]!);
+    expect(onOpenThread).toHaveBeenCalledWith(coordinatorThreadId, undefined, "primary");
+  });
 });
 
 describe("MessagesTimeline messages", () => {
