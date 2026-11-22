@@ -34,8 +34,35 @@ function timestamp(value: unknown): number | undefined {
     : undefined;
 }
 
+const MAX_WORKFLOW_LOGS = 50;
+const MAX_WORKFLOW_LOG_CHARS = 2_000;
+
 function preview(value: unknown): string | undefined {
   return typeof value === "string" && value.length > 0 ? value : undefined;
+}
+
+function truncateLog(value: string): string {
+  if (value.length <= MAX_WORKFLOW_LOG_CHARS) return value;
+  let end = MAX_WORKFLOW_LOG_CHARS - 1;
+  const last = value.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) {
+    end -= 1;
+  }
+  return `${value.slice(0, end)}…`;
+}
+
+function appendDistinctWorkflowLog(
+  previous: ReadonlyArray<string> | undefined,
+  message: unknown,
+): ReadonlyArray<string> | undefined {
+  if (text(field(message, "subtype")) !== "task_progress") return previous;
+  const rawDescription = text(field(message, "description"));
+  if (rawDescription === undefined) return previous;
+  const entry = truncateLog(rawDescription);
+  const existing = previous ?? [];
+  if (existing.at(-1) === entry) return previous;
+  const next = [...existing, entry];
+  return next.length > MAX_WORKFLOW_LOGS ? next.slice(-MAX_WORKFLOW_LOGS) : next;
 }
 
 function optional<T>(key: string, value: T | undefined): Record<string, T> {
@@ -84,6 +111,7 @@ function parseAgent(entry: unknown): OrchestrationV2WorkflowAgent | null {
     ),
     ...optional("prompt", preview(field(entry, "promptPreview"))),
     ...optional("result", preview(field(entry, "resultPreview"))),
+    ...optional("error", state === "failed" ? preview(field(entry, "resultPreview")) : undefined),
   };
 }
 
@@ -174,13 +202,17 @@ export function mergeClaudeWorkflowProgress(input: {
     input.runHandles === undefined
       ? previous?.runHandles
       : { ...previous?.runHandles, ...input.runHandles };
+  const logs = appendDistinctWorkflowLog(previous?.logs, input.message);
   return {
     ...optional("name", input.name ?? previous?.name),
     ...optional("runHandles", runHandles),
     phases: Array.from(phasesByIndex.values()).sort((left, right) => left.index - right.index),
     agents: Array.from(agentsByIndex.values()).sort((left, right) => left.index - right.index),
+    ...(logs === undefined || logs.length === 0 ? {} : { logs }),
+    ...optional("limits", previous?.limits),
     ...optional("totalTokens", count(field(reported, "total_tokens")) ?? previous?.totalTokens),
     ...optional("toolCalls", count(field(reported, "tool_uses")) ?? previous?.toolCalls),
     ...optional("durationMs", count(field(reported, "duration_ms")) ?? previous?.durationMs),
+    ...optional("stopRequestedAt", previous?.stopRequestedAt),
   };
 }

@@ -24172,7 +24172,19 @@ describe("ClaudeAdapterV2 background wake turns", () => {
       assert.deepEqual(stoppedTasks, [WORKFLOW_TASK_ID]);
       assert.isFalse(interrupted);
       assert.isFalse(closed);
-      assert.equal(workflowCoordinatorEvents(harness.events).at(-1)?.subagent.status, "running");
+      let stoppingReceipt = yield* Queue.take(harness.subagentReceipts);
+      while (
+        stoppingReceipt.subagent.nativeTaskRef?.nativeId !== WORKFLOW_TASK_ID ||
+        stoppingReceipt.subagent.workflow?.stopRequestedAt === undefined
+      ) {
+        stoppingReceipt = yield* Queue.take(harness.subagentReceipts);
+      }
+      assert.equal(stoppingReceipt.subagent.status, "running");
+      assert.isNumber(stoppingReceipt.subagent.workflow?.stopRequestedAt);
+      assert.equal(
+        workflowCoordinatorEvents(harness.events).at(-1)?.subagent.workflow?.stopRequestedAt,
+        stoppingReceipt.subagent.workflow.stopRequestedAt,
+      );
       yield* harness.offerAndWait(
         workflowNotification({
           uuid: "00000000-0000-4000-8000-000000001101",

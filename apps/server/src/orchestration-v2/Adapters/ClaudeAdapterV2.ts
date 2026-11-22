@@ -15095,7 +15095,9 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
                 detail: "No running workflow task belongs to this provider thread",
               });
             }
-            workflowStopRequestedAt.set(taskId, DateTime.toEpochMillis(yield* DateTime.now));
+            const stopAt = yield* DateTime.now;
+            const stopRequestedAt = DateTime.toEpochMillis(stopAt);
+            workflowStopRequestedAt.set(taskId, stopRequestedAt);
             yield* liveQuery.query.stopTask(taskId).pipe(
               Effect.mapError(
                 (cause) =>
@@ -15107,6 +15109,32 @@ export const makeClaudeAdapterV2 = Effect.fn("makeClaudeAdapterV2")(function* (
               ),
               Effect.onError(() => Effect.sync(() => workflowStopRequestedAt.delete(taskId))),
             );
+            const currentTask = (yield* Ref.get(sessionSubagentsByTaskId)).get(taskId);
+            if (
+              currentTask !== undefined &&
+              currentTask.task.status === "running" &&
+              currentTask.task.workflow !== undefined
+            ) {
+              const updatedTask: OrchestrationV2Subagent = {
+                ...currentTask.task,
+                workflow: {
+                  ...currentTask.task.workflow,
+                  stopRequestedAt: currentTask.task.workflow.stopRequestedAt ?? stopRequestedAt,
+                },
+                updatedAt: stopAt,
+              };
+              yield* Ref.update(sessionSubagentsByTaskId, (current) => {
+                if (current.get(taskId) !== currentTask) return current;
+                const next = new Map(current);
+                next.set(taskId, { ...currentTask, task: updatedTask });
+                return next;
+              });
+              yield* emitProviderEvent({
+                type: "subagent.updated",
+                driver: CLAUDE_PROVIDER,
+                subagent: updatedTask,
+              });
+            }
           }),
           awaitBackgroundTasks: Effect.fn("ClaudeAdapterV2.awaitBackgroundTasks")(
             function* ({ providerThread, taskIds, awaited }) {
