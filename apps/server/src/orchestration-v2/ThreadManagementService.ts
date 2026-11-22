@@ -488,7 +488,6 @@ export interface ThreadManagementServiceShape {
   >;
   readonly getThreadShell: Orchestrator.OrchestratorV2["Service"]["getThreadShell"];
   readonly listAppOwnedChildThreadIds: Orchestrator.OrchestratorV2["Service"]["listAppOwnedChildThreadIds"];
-  readonly listWorkflowMemberSubagentIds: Orchestrator.OrchestratorV2["Service"]["listWorkflowMemberSubagentIds"];
   readonly getThreadLinkMetadata: Orchestrator.OrchestratorV2["Service"]["getThreadLinkMetadata"];
   readonly getThreadTitles: Orchestrator.OrchestratorV2["Service"]["getThreadTitles"];
   /** Omit `projectId` to list every project's threads. Side chats are never listed. */
@@ -1959,13 +1958,6 @@ const make = Effect.gen(function* () {
         );
       },
     ),
-    listWorkflowMemberSubagentIds: Effect.fn(
-      "ThreadManagementService.listWorkflowMemberSubagentIds",
-    )(function (threadId) {
-      return ensureProjectionTranscript(threadId).pipe(
-        Effect.andThen(orchestrator.listWorkflowMemberSubagentIds(threadId)),
-      );
-    }),
     getThreadTitles: orchestrator.getThreadTitles,
     getThreadLinkMetadata: orchestrator.getThreadLinkMetadata,
     listProjectThreads,

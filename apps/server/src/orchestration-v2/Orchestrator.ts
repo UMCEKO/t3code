@@ -482,9 +482,6 @@ export interface OrchestratorV2Shape {
   readonly listAppOwnedChildThreadIds: (
     threadId: ThreadId,
   ) => Effect.Effect<ReadonlyArray<ThreadId>, OrchestratorV2Error>;
-  readonly listWorkflowMemberSubagentIds: (
-    threadId: ThreadId,
-  ) => Effect.Effect<ReadonlyArray<NodeId>, OrchestratorV2Error>;
   readonly getThreadProjection: (
     threadId: ThreadId,
   ) => Effect.Effect<OrchestrationV2ThreadProjection, OrchestratorV2Error>;
@@ -18674,13 +18671,6 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
       function (threadId) {
         return projectionStore
           .listAppOwnedChildThreadIds(threadId)
-          .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
-      },
-    ),
-    listWorkflowMemberSubagentIds: Effect.fn("OrchestratorV2.listWorkflowMemberSubagentIds")(
-      function (threadId) {
-        return projectionStore
-          .listWorkflowMemberSubagentIds(threadId)
           .pipe(Effect.mapError((cause) => new OrchestratorProjectionError({ threadId, cause })));
       },
     ),
