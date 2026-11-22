@@ -324,14 +324,14 @@ describe("deriveThreadTurnSubagents", () => {
     });
   });
 
-  it("hides app-owned subagents spawned under a server workflow from the turn roster", () => {
+  it("includes a server workflow coordinator row alongside standalone subagents on P", () => {
     const turn = deriveThreadTurnSubagents({
       runs: [finishedRun],
       subagents: [
         subagent({
           id: "wf-1",
           origin: "app_owned",
-          childThreadId: null,
+          childThreadId: ThreadId.make("coord-1"),
           status: "running",
           workflow: {
             name: "audit",
@@ -345,13 +345,6 @@ describe("deriveThreadTurnSubagents", () => {
               },
             ],
           },
-        }),
-        subagent({
-          id: "wf-agent-1",
-          origin: "app_owned",
-          parentNodeId: NodeId.make("wf-1"),
-          childThreadId: ThreadId.make("child-1"),
-          status: "running",
         }),
         subagent({
           id: "standalone",

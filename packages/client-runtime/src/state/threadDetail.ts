@@ -14,7 +14,6 @@ import {
   getUserQueuedThreadRuns,
   type ThreadQueueWorkflowState,
 } from "./threadWorkflows.ts";
-import { createWorkflowMemberRowFilter } from "./subagentRuntime.ts";
 import { deriveThreadTurnSubagents, type ThreadTurnSubagents } from "./threadSubagents.ts";
 import {
   deriveUsageLimitNoticeRows,
@@ -357,15 +356,13 @@ export function createEnvironmentThreadDetailAtoms<E>(
   // Presentation only: the projection keeps every row for other readers.
   const visibleTurnItemsAtomFamily = Atom.family((key: string) => {
     const projectQuestionHistory = createQuestionHistoryProjector();
-    const withoutWorkflowMembers =
-      createWorkflowMemberRowFilter<OrchestrationV2ThreadProjection["visibleTurnItems"][number]>();
     let previousRows: OrchestrationV2ThreadProjection["visibleTurnItems"] | null = null;
     let previousNotice: UsageLimitNoticeRows | null = null;
     let previous = EMPTY_VISIBLE_TURN_ITEMS;
     return Atom.make((get): OrchestrationV2ThreadProjection["visibleTurnItems"] => {
       const projection = Option.getOrNull(get(threadStateValueAtomFamily(key)).data);
       if (projection === null) return EMPTY_VISIBLE_TURN_ITEMS;
-      const rows = withoutWorkflowMembers(projectQuestionHistory(projection), projection.subagents);
+      const rows = projectQuestionHistory(projection);
       const notice = get(usageLimitNoticeRowsAtomFamily(key));
       if (rows !== previousRows || notice !== previousNotice) {
         previousRows = rows;
@@ -378,15 +375,11 @@ export function createEnvironmentThreadDetailAtoms<E>(
 
   const quietVisibleTurnItemsAtomFamily = Atom.family((key: string) => {
     const projectQuestionHistory = createQuestionHistoryProjector<ThreadStructureVisibleTurnItem>();
-    const withoutWorkflowMembers = createWorkflowMemberRowFilter<ThreadStructureVisibleTurnItem>();
     return Atom.make((get) => {
       const thread = get(quietThreadAtomFamily(key));
       return thread === null
         ? EMPTY_THREAD_STRUCTURE_TURN_ITEMS
-        : withoutWorkflowMembers(
-            projectQuestionHistory(thread.projection),
-            thread.projection.subagents,
-          );
+        : projectQuestionHistory(thread.projection);
     }).pipe(
       Atom.setIdleTTL(0),
       Atom.withLabel(`environment-quiet-thread-visible-turn-items:${key}`),

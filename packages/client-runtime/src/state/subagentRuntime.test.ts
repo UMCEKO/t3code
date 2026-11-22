@@ -9,10 +9,7 @@ import {
 import * as DateTime from "effect/DateTime";
 
 import {
-  createWorkflowMemberRowFilter,
   deriveWorkflowGroups,
-  excludeWorkflowMemberSubagents,
-  isServerWorkflow,
   isStoppableWorkflow,
   isWorkflowScriptMessage,
   projectedSubagentsToRuntime,
@@ -55,44 +52,6 @@ const member = (
 
 const groupsOf = (subagents: ReadonlyArray<ProjectedSubagent>) =>
   deriveWorkflowGroups(projectedSubagentsToRuntime(subagents));
-
-describe("createWorkflowMemberRowFilter", () => {
-  const row = (subagentId: string) =>
-    ({ item: { type: "subagent", subagentId } }) as {
-      item: { type: "subagent"; subagentId: string };
-    };
-  const other = { item: { type: "assistant_message" } } as const;
-
-  it("drops turn items of workflow members and keeps other rows", () => {
-    const filter = createWorkflowMemberRowFilter<{ item: { type: string; subagentId?: string } }>();
-    const rows = [row("plain"), row("member"), other];
-    const result = filter(rows, [
-      { id: "plain" },
-      { id: "member", completionWake: "never" },
-    ] as never);
-    expect(result).toEqual([row("plain"), other]);
-  });
-
-  it("drops rows of members spawned under a workflow task", () => {
-    const filter = createWorkflowMemberRowFilter<{ item: { type: string; subagentId?: string } }>();
-    const result = filter([row("child"), row("wf")], [
-      { id: "wf", origin: "app_owned", workflow: { agents: [] } },
-      { id: "child", origin: "app_owned", parentNodeId: "wf" },
-    ] as never);
-    expect(result.map((entry) => entry.item.subagentId)).toEqual(["wf"]);
-  });
-
-  it("returns the same rows when no member is present and caches by identity", () => {
-    const filter = createWorkflowMemberRowFilter<{ item: { type: string; subagentId?: string } }>();
-    const rows = [row("plain"), other];
-    const subagents = [{ id: "plain" }] as never;
-    expect(filter(rows, subagents)).toBe(rows);
-    const withMember = [row("member"), other];
-    const members = [{ id: "member", completionWake: "never" }] as never;
-    const first = filter(withMember, members);
-    expect(filter(withMember, members)).toBe(first);
-  });
-});
 
 describe("projectedSubagentsToRuntime workflow expansion", () => {
   it("carries each member's own provider instance", () => {
@@ -225,88 +184,81 @@ describe("projectedSubagentsToRuntime workflow expansion", () => {
     expect(untitled?.title).toBe(`${"a".repeat(76)}...`);
   });
 
-  it("hides app-owned subagents whose parentNodeId is a workflow task", () => {
-    const workflow = subagent({
-      id: "wf-1",
-      origin: "app_owned",
-      parentNodeId: "root-node",
-      childThreadId: null,
-      workflow: {
-        name: "audit",
-        phases: [{ index: 0, title: "Review" }],
-        agents: [
-          member({
-            index: 0,
-            label: "mod-a",
-            phaseIndex: 0,
-            childThreadId: ThreadId.make("child-a"),
-          }),
-        ],
-      },
-    });
-    const workflowChild = subagent({
-      id: "task-a",
-      origin: "app_owned",
-      parentNodeId: "wf-1",
-      childThreadId: ThreadId.make("child-a"),
-    });
-    const standalone = subagent({
-      id: "task-b",
-      origin: "app_owned",
-      parentNodeId: "root-node",
-      childThreadId: ThreadId.make("child-b"),
-    });
-    const nativeUnderSameParent = subagent({
-      id: "native-c",
-      origin: "provider_native",
-      parentNodeId: "wf-1",
-      childThreadId: null,
-    });
-
-    const filtered = excludeWorkflowMemberSubagents([
-      workflow,
-      workflowChild,
-      standalone,
-      nativeUnderSameParent,
+  it("maps additive workflow fields: error over result, cached badge, logs, limits, journalPath, and stopRequestedAt", () => {
+    const [wf, cachedMember, failedMember, fallbackFailedMember] = projectedSubagentsToRuntime([
+      subagent({
+        id: "wf-1",
+        origin: "app_owned",
+        childThreadId: ThreadId.make("coord-1"),
+        workflow: {
+          name: "audit",
+          phases: [{ index: 0, title: "Review" }],
+          logs: ["step 1", "step 2"],
+          limits: { tokenBudget: 50_000, concurrency: 4, maxAgents: 1000 },
+          stopRequestedAt: 1_700_000_000_000,
+          runHandles: {
+            runId: "wf_1",
+            scriptPath: "/tmp/wf_1/script.js",
+            journalPath: "/tmp/wf_1/journal.jsonl",
+          },
+          agents: [
+            member({
+              index: 0,
+              label: "cached-worker",
+              state: "completed",
+              phaseIndex: 0,
+              cached: true,
+              result: "ok",
+            }),
+            member({
+              index: 1,
+              label: "failed-worker",
+              state: "failed",
+              phaseIndex: 0,
+              error: "Provider is not authenticated.",
+              result: "outcome: null",
+            }),
+            member({
+              index: 2,
+              label: "legacy-failed",
+              state: "failed",
+              phaseIndex: 0,
+              result: "Legacy failure",
+            }),
+          ],
+        },
+      }),
     ]);
-    expect(filtered.map((entry) => entry.id)).toEqual(["wf-1", "task-b", "native-c"]);
-
-    const runtime = projectedSubagentsToRuntime([
-      workflow,
-      workflowChild,
-      standalone,
-      nativeUnderSameParent,
-    ]);
-    expect(runtime.map((entry) => [entry.id, entry.kind])).toEqual([
-      ["wf-1", "workflow"],
-      ["wf-1:agent:0", "workflow_agent"],
-      ["task-b", "subagent"],
-      ["native-c", "subagent"],
-    ]);
+    expect(wf?.logs).toEqual(["step 1", "step 2"]);
+    expect(wf?.limits).toEqual({ tokenBudget: 50_000, concurrency: 4, maxAgents: 1000 });
+    expect(wf?.stopRequestedAt).toBe(1_700_000_000_000);
+    expect(wf?.runHandles?.journalPath).toBe("/tmp/wf_1/journal.jsonl");
+    expect(cachedMember?.cached).toBe(true);
+    expect(cachedMember?.logs).toBeUndefined();
+    expect(cachedMember?.limits).toBeUndefined();
+    expect(cachedMember?.stopRequestedAt).toBeUndefined();
+    expect(failedMember?.error).toBe("Provider is not authenticated.");
+    expect(failedMember?.result).toBeNull();
+    expect(fallbackFailedMember?.error).toBe("Legacy failure");
   });
 });
 
-describe("server workflow predicates", () => {
+describe("workflow stop predicate", () => {
   const workflow = { name: "audit", phases: [], agents: [] };
   const base = {
     status: "running" as const,
     origin: "app_owned" as const,
     driver: ProviderDriverKind.make("codex"),
-    childThreadId: null as ThreadId | null,
+    childThreadId: ThreadId.make("coord") as ThreadId | null,
     nativeTaskRef: null as OrchestrationV2Subagent["nativeTaskRef"],
     workflow,
   };
 
-  it("identifies server workflows and gates workflow Stop across server and Claude workflows", () => {
-    expect(isServerWorkflow(base)).toBe(true);
-    expect(isServerWorkflow({ ...base, childThreadId: ThreadId.make("child") })).toBe(false);
-    expect(isServerWorkflow({ ...base, origin: "provider_native" })).toBe(false);
-    expect(isServerWorkflow({ ...base, workflow: undefined })).toBe(false);
-
+  it("gates workflow Stop across app-owned and Claude native workflows", () => {
     expect(isStoppableWorkflow(base)).toBe(true);
+    expect(isStoppableWorkflow({ ...base, childThreadId: null })).toBe(true);
     expect(isStoppableWorkflow({ ...base, status: "waiting" })).toBe(false);
     expect(isStoppableWorkflow({ ...base, status: "completed" })).toBe(false);
-    expect(isStoppableWorkflow({ ...base, childThreadId: ThreadId.make("child") })).toBe(false);
     expect(isStoppableWorkflow({ ...base, workflow: undefined })).toBe(false);
 
     const claudeNative = {
@@ -463,6 +415,8 @@ describe("resolveWorkflowOpening", () => {
       script: SCRIPT,
       name: "probe-wf",
       description: "Run the alpha workflow",
+      parentThreadId: ThreadId.make("parent"),
+      subagentId: "coordinator",
     });
     expect(
       opening?.group?.phases.map((phase) => ({
@@ -470,6 +424,46 @@ describe("resolveWorkflowOpening", () => {
         members: phase.members.map((agent) => [agent.title, agent.status, agent.childThreadId]),
       })),
     ).toEqual([{ title: "Alpha", members: [["alpha:one", "running", "member-1"]] }]);
+  });
+
+  it("opens a server coordinator thread (creationSource: server) with stoppable=true and additive fields", () => {
+    const serverCoord = {
+      ...childThread,
+      creationSource: "server" as const,
+    };
+    const opening = resolveWorkflowOpening({
+      thread: serverCoord,
+      messages: [brief(SCRIPT, true)],
+      parentSubagents: [
+        {
+          ...subagent({
+            id: "wf-server",
+            origin: "app_owned",
+            title: "Server workflow description",
+            childThreadId: "child",
+            workflow: {
+              name: "server-wf",
+              phases: [{ index: 0, title: "Work" }],
+              logs: ["started"],
+              limits: { concurrency: 2, tokenBudget: 1000 },
+              agents: [member({ index: 0, phaseIndex: 0, childThreadId: ThreadId.make("m-0") })],
+            },
+          }),
+          driver: ProviderDriverKind.make("codex"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+        },
+      ],
+    });
+    expect(opening).toMatchObject({
+      name: "server-wf",
+      description: "Server workflow description",
+      parentThreadId: ThreadId.make("parent"),
+      subagentId: "wf-server",
+      origin: "app_owned",
+      stoppable: true,
+    });
+    expect(opening?.group?.workflow.logs).toEqual(["started"]);
+    expect(opening?.group?.workflow.limits).toEqual({ concurrency: 2, tokenBudget: 1000 });
   });
 
   it("recognizes an unmarked script before the parent loads", () => {
