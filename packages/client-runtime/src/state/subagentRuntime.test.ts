@@ -9,6 +9,7 @@ import {
 import * as DateTime from "effect/DateTime";
 
 import {
+  createWorkflowMemberRowFilter,
   deriveWorkflowGroups,
   excludeWorkflowMemberSubagents,
   isServerWorkflow,
@@ -54,6 +55,44 @@ const member = (
 
 const groupsOf = (subagents: ReadonlyArray<ProjectedSubagent>) =>
   deriveWorkflowGroups(projectedSubagentsToRuntime(subagents));
+
+describe("createWorkflowMemberRowFilter", () => {
+  const row = (subagentId: string) =>
+    ({ item: { type: "subagent", subagentId } }) as {
+      item: { type: "subagent"; subagentId: string };
+    };
+  const other = { item: { type: "assistant_message" } } as const;
+
+  it("drops turn items of workflow members and keeps other rows", () => {
+    const filter = createWorkflowMemberRowFilter<{ item: { type: string; subagentId?: string } }>();
+    const rows = [row("plain"), row("member"), other];
+    const result = filter(rows, [
+      { id: "plain" },
+      { id: "member", completionWake: "never" },
+    ] as never);
+    expect(result).toEqual([row("plain"), other]);
+  });
+
+  it("drops rows of members spawned under a workflow task", () => {
+    const filter = createWorkflowMemberRowFilter<{ item: { type: string; subagentId?: string } }>();
+    const result = filter([row("child"), row("wf")], [
+      { id: "wf", origin: "app_owned", workflow: { agents: [] } },
+      { id: "child", origin: "app_owned", parentNodeId: "wf" },
+    ] as never);
+    expect(result.map((entry) => entry.item.subagentId)).toEqual(["wf"]);
+  });
+
+  it("returns the same rows when no member is present and caches by identity", () => {
+    const filter = createWorkflowMemberRowFilter<{ item: { type: string; subagentId?: string } }>();
+    const rows = [row("plain"), other];
+    const subagents = [{ id: "plain" }] as never;
+    expect(filter(rows, subagents)).toBe(rows);
+    const withMember = [row("member"), other];
+    const members = [{ id: "member", completionWake: "never" }] as never;
+    const first = filter(withMember, members);
+    expect(filter(withMember, members)).toBe(first);
+  });
+});
 
 describe("projectedSubagentsToRuntime workflow expansion", () => {
   it("uses a settled member's wall-clock completion separately from its execution duration", () => {

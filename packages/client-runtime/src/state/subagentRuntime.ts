@@ -159,6 +159,51 @@ export function excludeWorkflowMemberSubagents<T extends WorkflowMemberCandidate
   return subagents.filter((subagent) => !isWorkflowMemberSubagent(subagent, workflowIds));
 }
 
+/**
+ * Drops the parent timeline's turn items of workflow members: they belong to the workflow card,
+ * not to whichever tool call the parent was on when they appeared. Memoized on its inputs.
+ */
+export function createWorkflowMemberRowFilter<
+  Row extends { readonly item: { readonly type: string; readonly subagentId?: string } },
+>() {
+  let previousRows: ReadonlyArray<Row> | undefined;
+  let previousSubagents: ReadonlyArray<WorkflowMemberFilterSubagent> | undefined;
+  let previousResult: ReadonlyArray<Row> = [];
+  return (
+    rows: ReadonlyArray<Row>,
+    subagents: ReadonlyArray<WorkflowMemberFilterSubagent>,
+  ): ReadonlyArray<Row> => {
+    if (rows === previousRows && subagents === previousSubagents) return previousResult;
+    const workflowIds = new Set<string>();
+    for (const subagent of subagents) {
+      if (subagent.workflow !== undefined) workflowIds.add(subagent.id);
+    }
+    const memberIds = new Set<string>();
+    for (const subagent of subagents) {
+      if (subagent.completionWake === "never" || isWorkflowMemberSubagent(subagent, workflowIds)) {
+        memberIds.add(subagent.id);
+      }
+    }
+    const kept =
+      memberIds.size === 0
+        ? rows
+        : rows.filter(
+            (row) =>
+              row.item.type !== "subagent" ||
+              row.item.subagentId === undefined ||
+              !memberIds.has(row.item.subagentId),
+          );
+    previousRows = rows;
+    previousSubagents = subagents;
+    previousResult = kept.length === rows.length ? rows : kept;
+    return previousResult;
+  };
+}
+
+type WorkflowMemberFilterSubagent = WorkflowMemberCandidate & {
+  readonly completionWake?: OrchestrationV2Subagent["completionWake"] | undefined;
+};
+
 export function waitingOnSubagentsLabel(count: number, resolve: MFunctionType = mFallback): string {
   return resolve(
     msg("{count, plural, =1 {Waiting on a subagent} other {Waiting on {count} subagents}}", {

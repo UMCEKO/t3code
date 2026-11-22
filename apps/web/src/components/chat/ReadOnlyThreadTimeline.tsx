@@ -4,6 +4,7 @@ import {
   deriveThreadActivityRun,
   deriveThreadStructureRuntime,
 } from "@t3tools/client-runtime/state/thread-execution";
+import { createWorkflowMemberRowFilter } from "@t3tools/client-runtime/state/subagentRuntime";
 import { createQuestionHistoryProjector } from "@t3tools/client-runtime/state/thread-requests";
 import {
   EnvironmentId,
@@ -60,7 +61,10 @@ export function ReadOnlyThreadTimeline(props: {
   const { resolvedTheme } = useTheme();
   // The rest is what ChatView derives from the same projection.
   const [projectQuestionHistory] = useState(() => createQuestionHistoryProjector());
-  const items = projectQuestionHistory(projection);
+  const [withoutWorkflowMembers] = useState(() =>
+    createWorkflowMemberRowFilter<OrchestrationV2ProjectedTurnItem>(),
+  );
+  const items = withoutWorkflowMembers(projectQuestionHistory(projection), projection.subagents);
   const entries = useIncrementalTimelineEntries(threadKey, {
     visibleTurnItems: items,
     optimisticMessages: NO_OPTIMISTIC_MESSAGES,
