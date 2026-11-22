@@ -249,14 +249,12 @@ describe("workflow stop predicate", () => {
     status: "running" as const,
     origin: "app_owned" as const,
     driver: ProviderDriverKind.make("codex"),
-    childThreadId: ThreadId.make("coord") as ThreadId | null,
     nativeTaskRef: null as OrchestrationV2Subagent["nativeTaskRef"],
     workflow,
   };
 
   it("gates workflow Stop across app-owned and Claude native workflows", () => {
     expect(isStoppableWorkflow(base)).toBe(true);
-    expect(isStoppableWorkflow({ ...base, childThreadId: null })).toBe(true);
     expect(isStoppableWorkflow({ ...base, status: "waiting" })).toBe(false);
     expect(isStoppableWorkflow({ ...base, status: "completed" })).toBe(false);
     expect(isStoppableWorkflow({ ...base, workflow: undefined })).toBe(false);
