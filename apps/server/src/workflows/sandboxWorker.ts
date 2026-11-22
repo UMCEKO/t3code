@@ -1,3 +1,5 @@
+import * as NodeModule from "node:module";
+
 // Linux enforces RLIMIT_DATA (brk + private mmap); macOS and Windows enforce only V8 heap flags and deadline kill.
 export const WORKFLOW_SANDBOX_PROCESS_LIMITS = {
   maxOldSpaceSizeMb: 256,
@@ -5,6 +7,8 @@ export const WORKFLOW_SANDBOX_PROCESS_LIMITS = {
   rlimitDataKiB: 1024 * 1024,
   nodeFlags: ["--max-old-space-size=256", "--max-semi-space-size=16"],
 } as const;
+
+export const WORKFLOW_SANDBOX_WORKER_ARG = "__workflow-sandbox-worker" as const;
 
 export const WORKFLOW_MESSAGE_LIMITS = {
   maxPromptBytes: 1024 * 1024,
@@ -19,9 +23,20 @@ export const WORKFLOW_PROGRESS_LIMITS = {
   maxPhaseTitleBytes: 1024,
   maxPhaseTitleTotalBytes: 64 * 1024,
   maxPhaseSwitches: 100_000,
+  maxPhaseEventBytes: 4 * 1024 * 1024,
 } as const;
 
-export const MAX_PHASE_MESSAGE_BYTES = WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes + 256;
+// JSON.stringify expands ASCII control characters (1 UTF-8 byte) to \uXXXX (6 UTF-8 bytes).
+export const JSON_STRING_MAX_EXPANSION = 6;
+export const MAX_PHASE_MESSAGE_BYTES =
+  WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes * JSON_STRING_MAX_EXPANSION + 256;
+export const MAX_VALUE_MESSAGE_BYTES = WORKFLOW_MESSAGE_LIMITS.maxValueBytes + 4_096;
+export const MAX_SCRIPT_MESSAGE_BYTES =
+  WORKFLOW_MESSAGE_LIMITS.maxValueBytes * JSON_STRING_MAX_EXPANSION + 16_384;
+export const MAX_START_MESSAGE_BYTES =
+  WORKFLOW_MESSAGE_LIMITS.maxValueBytes * (JSON_STRING_MAX_EXPANSION + 1) + 16_384;
+export const MAX_WORKER_STDOUT_BUFFERED_BYTES = 4 * 1024 * 1024;
+export const MAX_ERROR_MESSAGE_CHARS = 16_384;
 
 export type WorkflowProgressLimits = {
   readonly [K in keyof typeof WORKFLOW_PROGRESS_LIMITS]: number;
@@ -29,7 +44,7 @@ export type WorkflowProgressLimits = {
 
 export interface WorkflowProgressBudget {
   /** Returns a cap-failure message once a per-run progress budget is exceeded. */
-  readonly phase: (title: string) => string | undefined;
+  readonly phase: (title: string, frameBytes?: number) => string | undefined;
   readonly phaseTitle: (title: string) => string | undefined;
   readonly log: (message: string) => string | undefined;
 }
@@ -39,6 +54,7 @@ export function makeWorkflowProgressBudget(
 ): WorkflowProgressBudget {
   const titles = new Set<string>();
   let phaseTitleBytes = 0;
+  let phaseEventBytes = 0;
   let switches = 0;
   let logs = 0;
   let logBytes = 0;
@@ -61,12 +77,20 @@ export function makeWorkflowProgressBudget(
   };
 
   return {
-    phase: (title) => {
+    phase: (title, frameBytes) => {
       switches += 1;
       if (switches > limits.maxPhaseSwitches) {
         return `A workflow switches phase at most ${limits.maxPhaseSwitches} times.`;
       }
-      return phaseTitle(title);
+      const titleOver = phaseTitle(title);
+      if (titleOver !== undefined) return titleOver;
+      const emittedBytes =
+        frameBytes ?? Buffer.byteLength(JSON.stringify({ type: "phase", title }), "utf8") + 1;
+      if (phaseEventBytes + emittedBytes > limits.maxPhaseEventBytes) {
+        return "Workflow phase() output exceeds the 4 MiB limit.";
+      }
+      phaseEventBytes += emittedBytes;
+      return undefined;
     },
     phaseTitle,
     log: (message) => {
@@ -79,16 +103,9 @@ export function makeWorkflowProgressBudget(
   };
 }
 
-export const MAX_START_MESSAGE_BYTES = WORKFLOW_MESSAGE_LIMITS.maxValueBytes * 2 + 16_384;
-export const MAX_ERROR_MESSAGE_CHARS = 16_384;
-
 export type RealmErrorKind = "Error" | "TypeError" | "WorkflowScriptError";
 
-// Tiny -e bootstrap so Windows command-line limits never cap the worker source length.
-export const WORKFLOW_SANDBOX_BOOTSTRAP =
-  '(() => { const chunks = []; const onData = (chunk) => { const nl = chunk.indexOf(10); if (nl === -1) { chunks.push(chunk); return; } process.stdin.off("data", onData); chunks.push(chunk.subarray(0, nl)); const rest = chunk.subarray(nl + 1); const src = JSON.parse(Buffer.concat(chunks).toString("utf8")); chunks.length = 0; new Function("require", src)(require); if (rest.length > 0) process.stdin.emit("data", rest); }; process.stdin.on("data", onData); })();';
-
-// Self-contained CommonJS source fed over stdin to the sandbox child so tsdown/SEA bundles keep it intact.
+// Self-contained CommonJS source executed by the internal __workflow-sandbox-worker subcommand.
 export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
 "use strict";
 (() => {
@@ -98,7 +115,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
   const utf8Decoder = new TextDecoder("utf-8", { fatal: true });
   stdin.on("error", () => {});
   stdout.on("error", () => {});
-  const writeMessage = (msg) => {
+  const writeRawMessage = (msg) => {
     stdout.write(msg + "\n");
   };
   const byteLength = Buffer.byteLength;
@@ -134,7 +151,10 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     }
   }
 
+  const JSON_STRING_MAX_EXPANSION = ${JSON_STRING_MAX_EXPANSION};
   const MAX_START_BYTES = ${MAX_START_MESSAGE_BYTES};
+  const MAX_SCRIPT_BYTES = ${MAX_SCRIPT_MESSAGE_BYTES};
+  const DEFAULT_MAX_STDOUT_BUFFERED_BYTES = ${MAX_WORKER_STDOUT_BUFFERED_BYTES};
   const MAX_ERROR_CHARS = ${MAX_ERROR_MESSAGE_CHARS};
   const MAX_META_DEPTH = 64;
   const ALLOWED_AGENT_OPT_KEYS = new Set([
@@ -815,6 +835,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
   function makeProgressBudget(limits) {
     const titles = new Set();
     let phaseTitleBytes = 0;
+    let phaseEventBytes = 0;
     let switches = 0;
     let logs = 0;
     let logBytes = 0;
@@ -835,12 +856,19 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
       return undefined;
     };
     return {
-      phase(title) {
+      phase(title, frameBytes) {
         switches += 1;
         if (switches > limits.maxPhaseSwitches) {
           return "A workflow switches phase at most " + limits.maxPhaseSwitches + " times.";
         }
-        return phaseTitle(title);
+        const titleOver = phaseTitle(title);
+        if (titleOver !== undefined) return titleOver;
+        const emitted = frameBytes ?? byteLength(JSON.stringify({ type: "phase", title }), "utf8") + 1;
+        if (phaseEventBytes + emitted > limits.maxPhaseEventBytes) {
+          return "Workflow phase() output exceeds the 4 MiB limit.";
+        }
+        phaseEventBytes += emitted;
+        return undefined;
       },
       phaseTitle,
       log(message) {
@@ -1246,6 +1274,32 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
   const pendingLoads = new Map();
   const activeContexts = new Set();
 
+  const maxStdoutBufferedBytes = () =>
+    config && typeof config.maxStdoutBufferedBytes === "number"
+      ? config.maxStdoutBufferedBytes
+      : DEFAULT_MAX_STDOUT_BUFFERED_BYTES;
+
+  const checkStdoutBacklog = (frameBytes) => {
+    const queued = typeof stdout.writableLength === "number" ? stdout.writableLength : 0;
+    const cap = maxStdoutBufferedBytes();
+    if (queued > 0 && queued + frameBytes > cap) {
+      return "Workflow sandbox output backlog exceeded the limit.";
+    }
+    return undefined;
+  };
+
+  function writeMessage(msg, frameBytes) {
+    if (runClosed) return false;
+    const bytes = frameBytes ?? byteLength(msg, "utf8") + 1;
+    const backlogOver = checkStdoutBacklog(bytes);
+    if (backlogOver !== undefined) {
+      failCap(backlogOver);
+      return false;
+    }
+    writeRawMessage(msg);
+    return true;
+  }
+
   function postErrorAndClose(kind, message) {
     if (runClosed) return;
     runClosed = true;
@@ -1256,7 +1310,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     activeContexts.clear();
     pendingAgents.clear();
     pendingLoads.clear();
-    writeMessage(JSON.stringify({ type: "error", kind, message: safeMsg }));
+    writeRawMessage(JSON.stringify({ type: "error", kind, message: safeMsg }));
   }
 
   function failCap(message) {
@@ -1272,28 +1326,35 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
       postErrorAndClose("WorkflowScriptError", stickyCapFailure);
       return;
     }
-    const msg = '{"type":"done","value":' + valueJson + "}";
-    if (byteLength(msg, "utf8") > config.maxValueBytes) {
+    if (byteLength(valueJson, "utf8") > config.maxValueBytes) {
       failCap("Workflow return value exceeds the 4 MiB limit.");
       return;
     }
+    const msg = '{"type":"done","value":' + valueJson + "}";
     runClosed = true;
     for (const closeContext of activeContexts) {
       closeContext();
     }
     activeContexts.clear();
-    writeMessage(msg);
+    writeRawMessage(msg);
   }
 
   function postSmallMessage(payload, capLabel) {
-    if (runClosed) return false;
+    if (runClosed) return undefined;
     const msg = JSON.stringify(payload);
-    if (byteLength(msg, "utf8") > config.maxPromptBytes) {
-      failCap(capLabel + " exceeds the 1 MiB limit.");
-      return false;
+    const bytes = byteLength(msg, "utf8");
+    if (bytes > config.maxPromptBytes) {
+      const capMessage = capLabel + " exceeds the 1 MiB limit.";
+      failCap(capMessage);
+      return capMessage;
     }
-    writeMessage(msg);
-    return true;
+    const backlogOver = checkStdoutBacklog(bytes + 1);
+    if (backlogOver !== undefined) {
+      failCap(backlogOver);
+      return backlogOver;
+    }
+    writeRawMessage(msg);
+    return undefined;
   }
 
   function scheduleIdle() {
@@ -1521,7 +1582,15 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
               onResolveJson: (json) => settleDeferredWithJson(deferred, json),
               onRejectSpec: (kind, message) => settleDeferredWithSpec(deferred, kind, message),
             });
-            writeMessage(agentMsg);
+            if (!writeMessage(agentMsg)) {
+              const capMessage = stickyCapFailure ?? "Workflow sandbox output backlog exceeded the limit.";
+              runtime.setCapError(capMessage);
+              if (inSlice) {
+                deferred.rejectSpecSync("WorkflowScriptError", capMessage);
+              } else {
+                settleDeferredWithSpec(deferred, "WorkflowScriptError", capMessage);
+              }
+            }
           };
 
           if (semaphore.tryAcquire()) {
@@ -1612,7 +1681,11 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
             },
             onRejectSpec: (kind, message) => settleDeferredWithSpec(deferred, kind, message),
           });
-          writeMessage(loadMsg);
+          if (!writeMessage(loadMsg)) {
+            const capMessage = stickyCapFailure ?? "Workflow sandbox output backlog exceeded the limit.";
+            runtime.setCapError(capMessage);
+            deferred.rejectSpecSync("WorkflowScriptError", capMessage);
+          }
         } catch (err) {
           const spec = toErrorSpec(err, runtime.isContextTypeError);
           deferred.rejectSpecSync(spec.kind, spec.message);
@@ -1630,23 +1703,31 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
             if (runClosed) {
               throw new WorkerScriptError(stickyCapFailure ?? "Workflow run closed");
             }
-            const over = progressBudget.phase(title);
+            const msg = JSON.stringify({ type: "phase", title });
+            const msgBytes = byteLength(msg, "utf8");
+            const over = progressBudget.phase(title, msgBytes + 1);
             if (over !== undefined) {
               runtime.setCapError(over);
               failCap(over);
               throw new WorkerScriptError(over);
             }
-            const msg = JSON.stringify({ type: "phase", title });
-            const maxPhaseBytes = config.progressLimits.maxPhaseTitleBytes + 256;
-            if (byteLength(msg, "utf8") > maxPhaseBytes) {
+            const maxPhaseBytes =
+              config.progressLimits.maxPhaseTitleBytes * JSON_STRING_MAX_EXPANSION + 256;
+            if (msgBytes > maxPhaseBytes) {
               const capMessage =
                 "Workflow phase() message exceeds the " + maxPhaseBytes + "-byte limit.";
               runtime.setCapError(capMessage);
               failCap(capMessage);
               throw new WorkerScriptError(capMessage);
             }
+            const backlogOver = checkStdoutBacklog(msgBytes + 1);
+            if (backlogOver !== undefined) {
+              runtime.setCapError(backlogOver);
+              failCap(backlogOver);
+              throw new WorkerScriptError(backlogOver);
+            }
             currentPhase = title;
-            writeMessage(msg);
+            writeRawMessage(msg);
           }),
         onLog: (message) =>
           runBridgeSync(() => {
@@ -1661,7 +1742,11 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
               failCap(over);
               throw new WorkerScriptError(over);
             }
-            postSmallMessage({ type: "log", message: trimmed }, "Workflow log() message");
+            const sendOver = postSmallMessage({ type: "log", message: trimmed }, "Workflow log() message");
+            if (sendOver !== undefined) {
+              runtime.setCapError(sendOver);
+              throw new WorkerScriptError(sendOver);
+            }
           }),
         budgetSpent: () => runBridgeSync(() => budgetSpent),
         budgetRemaining: () =>
@@ -1724,9 +1809,9 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
 
   function handleHostLine(raw, bytes) {
     if (runClosed) return;
-    const maxIncoming = started ? config.maxValueBytes : MAX_START_BYTES;
+    const maxIncoming = started ? MAX_SCRIPT_BYTES : MAX_START_BYTES;
     if (bytes > maxIncoming) {
-      failCap("Workflow host message exceeded the 4 MiB limit.");
+      failCap("Workflow host message exceeded the size limit.");
       return;
     }
 
@@ -1759,6 +1844,10 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
           maxValueBytes: msg.maxValueBytes,
           maxLogChars: msg.maxLogChars,
           progressLimits: msg.progressLimits,
+          maxStdoutBufferedBytes:
+            typeof msg.maxStdoutBufferedBytes === "number"
+              ? msg.maxStdoutBufferedBytes
+              : DEFAULT_MAX_STDOUT_BUFFERED_BYTES,
         };
         budgetSpent = msg.budgetSpent;
         progressBudget = makeProgressBudget(config.progressLimits);
@@ -1813,6 +1902,10 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
         semaphore.release();
         if (msg.ok) {
           const valueJson = msg.hasValue ? JSON.stringify(msg.value) : undefined;
+          if (valueJson !== undefined && byteLength(valueJson, "utf8") > config.maxValueBytes) {
+            failCap("Workflow agent() result exceeds the 4 MiB limit.");
+            return;
+          }
           pending.onResolveJson(valueJson);
         } else {
           pending.onRejectSpec(msg.errorKind || "Error", String(msg.errorMessage ?? "Agent failed"));
@@ -1850,14 +1943,14 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     if (runClosed) return;
     let offset = 0;
     while (offset < chunk.length && !runClosed) {
-      const maxIncoming = started ? config.maxValueBytes : MAX_START_BYTES;
+      const maxIncoming = started ? MAX_SCRIPT_BYTES : MAX_START_BYTES;
       const nl = chunk.indexOf(10, offset);
       if (nl === -1) {
         const remaining = chunk.length - offset;
         if (stdinBytes + remaining > maxIncoming) {
           stdinChunks = [];
           stdinBytes = 0;
-          failCap("Workflow host message exceeded the 4 MiB limit.");
+          failCap("Workflow host message exceeded the size limit.");
           return;
         }
         stdinChunks.push(offset === 0 ? chunk : Buffer.from(chunk.subarray(offset)));
@@ -1869,7 +1962,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
       if (lineBytes > maxIncoming) {
         stdinChunks = [];
         stdinBytes = 0;
-        failCap("Workflow host message exceeded the 4 MiB limit.");
+        failCap("Workflow host message exceeded the size limit.");
         return;
       }
       const lineBuf =
@@ -1895,6 +1988,11 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     stdinBytes = 0;
   });
 
-  writeMessage('{"type":"ready"}');
+  writeRawMessage('{"type":"ready"}');
 })();
 `;
+
+export function runWorkflowSandboxWorker(): void {
+  const require = NodeModule.createRequire(import.meta.url);
+  new Function("require", WORKFLOW_SANDBOX_WORKER_SOURCE)(require);
+}

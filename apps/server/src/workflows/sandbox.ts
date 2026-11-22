@@ -1,25 +1,30 @@
 // @effect-diagnostics globalTimers:off -- The sandbox host owns its syncTimeoutMs deadline timer outside Effect.
-// @effect-diagnostics-next-line nodeBuiltinImport:off -- The sandbox runs outside Effect and spawns its isolated child process directly.
+// @effect-diagnostics nodeBuiltinImport:off -- The sandbox runs outside Effect and spawns its isolated child process directly.
 import * as NodeChildProcess from "node:child_process";
+import * as NodeURL from "node:url";
 
 import * as HostProcess from "@t3tools/shared/HostProcess";
 
 import {
+  JSON_STRING_MAX_EXPANSION,
   MAX_ERROR_MESSAGE_CHARS,
   MAX_PHASE_MESSAGE_BYTES,
+  MAX_SCRIPT_MESSAGE_BYTES,
   MAX_START_MESSAGE_BYTES,
+  MAX_VALUE_MESSAGE_BYTES,
+  MAX_WORKER_STDOUT_BUFFERED_BYTES,
   makeWorkflowProgressBudget,
   WORKFLOW_MESSAGE_LIMITS,
   WORKFLOW_PROGRESS_LIMITS,
-  WORKFLOW_SANDBOX_BOOTSTRAP,
   WORKFLOW_SANDBOX_PROCESS_LIMITS,
-  WORKFLOW_SANDBOX_WORKER_SOURCE,
+  WORKFLOW_SANDBOX_WORKER_ARG,
   type RealmErrorKind,
   type WorkflowProgressLimits,
 } from "./sandboxWorker.ts";
 
 export {
   MAX_PHASE_MESSAGE_BYTES,
+  MAX_VALUE_MESSAGE_BYTES,
   WORKFLOW_MESSAGE_LIMITS,
   WORKFLOW_PROGRESS_LIMITS,
   WORKFLOW_SANDBOX_PROCESS_LIMITS,
@@ -89,6 +94,7 @@ export function workflowConcurrency(cpus: number): number {
 }
 
 const DEFAULT_SYNC_TIMEOUT_MS = 5_000;
+const DEFAULT_HANDSHAKE_TIMEOUT_MS = 10_000;
 const MAX_META_DEPTH = 64;
 
 const IDENT_START = /[\p{ID_Start}_$]/uy;
@@ -683,24 +689,50 @@ function readBudgetSpent(host: WorkflowHost): number {
   return Number.isFinite(spent) ? spent : 0;
 }
 
-const WORKFLOW_SANDBOX_WORKER_BOOTSTRAP_LINE = `${JSON.stringify(WORKFLOW_SANDBOX_WORKER_SOURCE)}\n`;
-const WORKFLOW_SANDBOX_WORKER_BOOTSTRAP_LINE_BYTES = Buffer.byteLength(
-  WORKFLOW_SANDBOX_WORKER_BOOTSTRAP_LINE,
-  "utf8",
-);
 const MAX_STDIN_BUFFERED_BYTES = MAX_START_MESSAGE_BYTES * 2;
+
+export function resolveWorkflowSandboxEntryPath(
+  moduleUrl: string = import.meta.url,
+  options?: { readonly windows?: boolean },
+): string {
+  // In a bundle import.meta.url is bin.mjs (including inside app.asar / server.asar); development and tests use this source module.
+  return NodeURL.fileURLToPath(
+    new URL(moduleUrl.endsWith(".ts") ? "../bin.ts" : "./bin.mjs", moduleUrl),
+    options,
+  );
+}
+
+export interface WorkflowSandboxCommand {
+  readonly command: string;
+  readonly args: ReadonlyArray<string>;
+  readonly env: Readonly<Record<string, string>>;
+}
 
 export function buildWorkflowSandboxCommand(options?: {
   readonly platform?: NodeJS.Platform;
   readonly execPath?: string;
-  readonly bootstrap?: string;
-}): { readonly command: string; readonly args: ReadonlyArray<string> } {
+  readonly isExecutable?: boolean;
+  readonly entryPath?: string;
+  readonly moduleUrl?: string;
+}): WorkflowSandboxCommand {
   const platform = options?.platform ?? HostProcess.Platform.defaultValue();
-  const execPath = options?.execPath ?? process.execPath;
-  const bootstrap = options?.bootstrap ?? WORKFLOW_SANDBOX_BOOTSTRAP;
-  const nodeArgs = [...WORKFLOW_SANDBOX_PROCESS_LIMITS.nodeFlags, "-e", bootstrap];
+  const execPath = options?.execPath ?? HostProcess.ExecutablePath.defaultValue();
+  const isExecutable = options?.isExecutable ?? HostProcess.IsExecutable.defaultValue();
+  const entryPath =
+    options?.entryPath ??
+    (isExecutable ? undefined : resolveWorkflowSandboxEntryPath(options?.moduleUrl));
+  // Packaged SEA binaries pass CLI arguments to process.argv, so V8 heap flags travel via NODE_OPTIONS.
+  const childArgs = isExecutable
+    ? [WORKFLOW_SANDBOX_WORKER_ARG]
+    : [...WORKFLOW_SANDBOX_PROCESS_LIMITS.nodeFlags, entryPath!, WORKFLOW_SANDBOX_WORKER_ARG];
+  const env: Record<string, string> = isExecutable
+    ? {
+        ELECTRON_RUN_AS_NODE: "1",
+        NODE_OPTIONS: WORKFLOW_SANDBOX_PROCESS_LIMITS.nodeFlags.join(" "),
+      }
+    : { ELECTRON_RUN_AS_NODE: "1" };
   if (platform === "win32") {
-    return { command: execPath, args: nodeArgs };
+    return { command: execPath, args: childArgs, env };
   }
   return {
     command: "/bin/sh",
@@ -708,9 +740,59 @@ export function buildWorkflowSandboxCommand(options?: {
       "-c",
       `ulimit -d ${WORKFLOW_SANDBOX_PROCESS_LIMITS.rlimitDataKiB} && exec "$0" "$@"`,
       execPath,
-      ...nodeArgs,
+      ...childArgs,
     ],
+    env,
   };
+}
+
+export interface TerminableSandboxChild {
+  readonly pid?: number | undefined;
+  readonly exitCode: number | null;
+  readonly signalCode: NodeJS.Signals | null;
+  readonly stdin: { readonly destroy: () => void };
+  readonly stdout: { readonly destroy: () => void };
+  readonly stderr: { readonly destroy: () => void };
+  readonly kill: (signal: NodeJS.Signals) => boolean;
+}
+
+export async function terminateSandboxChild(input: {
+  readonly child: TerminableSandboxChild;
+  readonly isExited: () => boolean;
+  readonly markExited: () => void;
+  readonly waitForExit: () => Promise<void>;
+  readonly onReset?: () => void;
+}): Promise<"exited" | "not_started" | "kill_failed"> {
+  input.onReset?.();
+  input.child.stdin.destroy();
+  input.child.stdout.destroy();
+  input.child.stderr.destroy();
+  if (input.isExited() || input.child.exitCode !== null || input.child.signalCode !== null) {
+    input.markExited();
+    return "exited";
+  }
+  if (input.child.pid === undefined) {
+    return "not_started";
+  }
+  let signaled = false;
+  try {
+    signaled = input.child.kill("SIGKILL");
+  } catch (err) {
+    if (extractErrorCode(err) === "ESRCH") {
+      input.markExited();
+      return "exited";
+    }
+    return "kill_failed";
+  }
+  if (!signaled) {
+    if (input.isExited() || input.child.exitCode !== null || input.child.signalCode !== null) {
+      input.markExited();
+      return "exited";
+    }
+    return "kill_failed";
+  }
+  await input.waitForExit();
+  return "exited";
 }
 
 export interface BoundedLineSplitter {
@@ -793,18 +875,20 @@ export interface WorkflowHostMessageReceiverOptions {
   readonly syncTimeoutMs: number;
   readonly initialSpent: number;
   readonly postToChild: (message: string, maxBytes: number, capMessage: string) => boolean;
+  readonly onReady?: () => void;
   readonly onIdleSettled: (allIdle: boolean) => void;
   readonly onSucceed: (value: unknown) => void;
   readonly onFail: (err: unknown) => void;
   readonly isSettled: () => boolean;
   readonly progressLimits?: WorkflowProgressLimits;
+  readonly maxStdoutBufferedBytes?: number;
 }
 
 export function createWorkflowHostMessageReceiver(
   options: WorkflowHostMessageReceiverOptions,
 ): BoundedLineSplitter {
   const progressLimits = options.progressLimits ?? WORKFLOW_PROGRESS_LIMITS;
-  const maxPhaseMessageBytes = progressLimits.maxPhaseTitleBytes + 256;
+  const maxPhaseMessageBytes = progressLimits.maxPhaseTitleBytes * JSON_STRING_MAX_EXPANSION + 256;
   const progressBudget = makeWorkflowProgressBudget(progressLimits);
   let started = false;
   let lastSentSeq = 0;
@@ -813,7 +897,7 @@ export function createWorkflowHostMessageReceiver(
 
   const handleLine = (raw: string, bytes: number): void => {
     if (options.isSettled()) return;
-    if (bytes > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
+    if (bytes > MAX_VALUE_MESSAGE_BYTES) {
       options.onFail(new WorkflowScriptError("Workflow message exceeded the 4 MiB limit."));
       return;
     }
@@ -835,6 +919,7 @@ export function createWorkflowHostMessageReceiver(
     if (msgType === "ready") {
       if (started) return;
       started = true;
+      options.onReady?.();
       lastSentSeq += 1;
       const base = JSON.stringify({
         type: "start",
@@ -851,6 +936,7 @@ export function createWorkflowHostMessageReceiver(
         maxValueBytes: WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
         maxLogChars: WORKFLOW_MESSAGE_LIMITS.maxLogChars,
         progressLimits,
+        maxStdoutBufferedBytes: options.maxStdoutBufferedBytes ?? MAX_WORKER_STDOUT_BUFFERED_BYTES,
       });
       const startMsg =
         options.argsJson === undefined ? base : `${base.slice(0, -1)},"args":${options.argsJson}}`;
@@ -894,7 +980,7 @@ export function createWorkflowHostMessageReceiver(
         options.onFail(new WorkflowScriptError("Workflow sandbox sent an invalid phase title."));
         return;
       }
-      const overPhase = progressBudget.phase(msg.title);
+      const overPhase = progressBudget.phase(msg.title, bytes + 1);
       if (overPhase !== undefined) {
         options.onFail(new WorkflowScriptError(overPhase));
         return;
@@ -1036,10 +1122,16 @@ export function createWorkflowHostMessageReceiver(
               );
               return;
             }
+            if (Buffer.byteLength(valueJson, "utf8") > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
+              options.onFail(
+                new WorkflowScriptError("Workflow agent() result exceeds the 4 MiB limit."),
+              );
+              return;
+            }
             const resultMsg = `{"type":"agentResult","seq":${seq},"id":${id},"ok":true,"spent":${spent},"hasValue":true,"value":${valueJson}}`;
             options.postToChild(
               resultMsg,
-              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+              MAX_VALUE_MESSAGE_BYTES,
               "Workflow agent() result exceeds the 4 MiB limit.",
             );
           },
@@ -1112,6 +1204,12 @@ export function createWorkflowHostMessageReceiver(
               );
               return;
             }
+            if (Buffer.byteLength(childScript, "utf8") > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
+              options.onFail(
+                new WorkflowScriptError("Nested workflow script exceeds the 4 MiB limit."),
+              );
+              return;
+            }
             options.postToChild(
               JSON.stringify({
                 type: "loadScriptResult",
@@ -1120,7 +1218,7 @@ export function createWorkflowHostMessageReceiver(
                 ok: true,
                 script: childScript,
               }),
-              WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+              MAX_SCRIPT_MESSAGE_BYTES,
               "Nested workflow script exceeds the 4 MiB limit.",
             );
           },
@@ -1146,6 +1244,11 @@ export function createWorkflowHostMessageReceiver(
     }
 
     if (msgType === "done") {
+      const valueJson = JSON.stringify(msg.value) ?? "null";
+      if (Buffer.byteLength(valueJson, "utf8") > WORKFLOW_MESSAGE_LIMITS.maxValueBytes) {
+        options.onFail(new WorkflowScriptError("Workflow return value exceeds the 4 MiB limit."));
+        return;
+      }
       options.onSucceed(msg.value);
       return;
     }
@@ -1165,7 +1268,7 @@ export function createWorkflowHostMessageReceiver(
   };
 
   return makeBoundedLineSplitter({
-    maxLineBytes: WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+    maxLineBytes: MAX_VALUE_MESSAGE_BYTES,
     onLine: handleLine,
     onOverflow: () => {
       options.onFail(new WorkflowScriptError("Workflow message exceeded the 4 MiB limit."));
@@ -1182,6 +1285,9 @@ export async function runWorkflowScript(input: {
   readonly host: WorkflowHost;
   readonly concurrency: number;
   readonly syncTimeoutMs?: number;
+  readonly handshakeTimeoutMs?: number;
+  readonly maxStdoutBufferedBytes?: number;
+  readonly spawnCommand?: WorkflowSandboxCommand;
 }): Promise<unknown> {
   if (input.host.signal.aborted) {
     throw getAbortReason(input.host.signal);
@@ -1206,16 +1312,18 @@ export async function runWorkflowScript(input: {
     input.syncTimeoutMs !== undefined && Number.isFinite(input.syncTimeoutMs)
       ? Math.max(1, Math.trunc(input.syncTimeoutMs))
       : DEFAULT_SYNC_TIMEOUT_MS;
+  const handshakeTimeoutMs =
+    input.handshakeTimeoutMs !== undefined && Number.isFinite(input.handshakeTimeoutMs)
+      ? Math.max(1, Math.trunc(input.handshakeTimeoutMs))
+      : DEFAULT_HANDSHAKE_TIMEOUT_MS;
   const initialSpent = readBudgetSpent(input.host);
 
-  const { command, args } = buildWorkflowSandboxCommand();
+  const { command, args, env } = input.spawnCommand ?? buildWorkflowSandboxCommand();
   const child = NodeChildProcess.spawn(command, args, {
     stdio: ["pipe", "pipe", "pipe"],
-    env: { ELECTRON_RUN_AS_NODE: "1" },
+    env,
     windowsHide: true,
   });
-  child.stdin.on("error", () => {});
-  child.stdout.on("error", () => {});
   child.stderr.on("error", () => {});
   child.stderr.resume();
 
@@ -1223,6 +1331,7 @@ export async function runWorkflowScript(input: {
   const exitDeferred = Promise.withResolvers<void>();
   let exited = false;
   let settled = false;
+  let readyReceived = false;
   let deadlineTimer: ReturnType<typeof setTimeout> | null = null;
   let terminatePromise: Promise<void> | null = null;
 
@@ -1252,6 +1361,16 @@ export async function runWorkflowScript(input: {
     settled = true;
     clearDeadline();
     runDeferred.resolve(value);
+  };
+
+  const onHandshakeExpired = (): void => {
+    deadlineTimer = null;
+    if (settled || readyReceived) return;
+    failRun(
+      new WorkflowScriptError(
+        `Workflow sandbox timed out after ${handshakeTimeoutMs} ms before completing startup handshake.`,
+      ),
+    );
   };
 
   const onDeadlineExpired = (): void => {
@@ -1311,6 +1430,10 @@ export async function runWorkflowScript(input: {
     syncTimeoutMs,
     initialSpent,
     postToChild,
+    onReady: () => {
+      readyReceived = true;
+      clearDeadline();
+    },
     onIdleSettled: (allIdle) => {
       if (allIdle) {
         clearDeadline();
@@ -1321,33 +1444,34 @@ export async function runWorkflowScript(input: {
     onSucceed: succeedRun,
     onFail: failRun,
     isSettled: () => settled,
+    ...(input.maxStdoutBufferedBytes === undefined
+      ? {}
+      : { maxStdoutBufferedBytes: input.maxStdoutBufferedBytes }),
   });
 
   const terminateChild = (): Promise<void> => {
-    terminatePromise ??= (async () => {
-      receiver.reset();
-      child.stdin.destroy();
-      child.stdout.destroy();
-      child.stderr.destroy();
-      if (
-        exited ||
-        child.exitCode !== null ||
-        child.signalCode !== null ||
-        child.pid === undefined
-      ) {
-        markExited();
-        return;
-      }
-      try {
-        child.kill("SIGKILL");
-      } catch {
-        markExited();
-        return;
-      }
-      await exitDeferred.promise;
-    })();
+    terminatePromise ??= terminateSandboxChild({
+      child,
+      isExited: () => exited,
+      markExited,
+      waitForExit: () => exitDeferred.promise,
+      onReset: () => receiver.reset(),
+    }).then(() => undefined);
     return terminatePromise;
   };
+
+  const onStreamError =
+    (streamName: "stdin" | "stdout") =>
+    (err: unknown): void => {
+      if (settled) return;
+      failRun(
+        new WorkflowScriptError(
+          `Workflow sandbox ${streamName} error: ${extractErrorMessage(err)}`,
+        ),
+      );
+    };
+  child.stdin.on("error", onStreamError("stdin"));
+  child.stdout.on("error", onStreamError("stdout"));
 
   const onAbort = (): void => {
     failRun(getAbortReason(input.host.signal));
@@ -1396,12 +1520,8 @@ export async function runWorkflowScript(input: {
     receiver.push(chunk);
   });
 
-  if (child.pid !== undefined) {
-    writeToChildStdin(
-      WORKFLOW_SANDBOX_WORKER_BOOTSTRAP_LINE,
-      WORKFLOW_SANDBOX_WORKER_BOOTSTRAP_LINE_BYTES,
-    );
-  }
+  // Start the handshake deadline immediately at spawn so a stalled binary cannot hang the run.
+  deadlineTimer = setTimeout(onHandshakeExpired, handshakeTimeoutMs);
 
   try {
     return await runDeferred.promise;

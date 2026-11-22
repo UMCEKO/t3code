@@ -35,6 +35,7 @@ it.live("loads the CLI with its cache settings only when the command needs it", 
             ...args,
           ],
           {
+            stdin: "ignore",
             env: {
               XDG_CACHE_HOME: `${root}/cache`,
               T3CODE_HOME: `${root}/home`,
@@ -65,6 +66,10 @@ it.live("loads the CLI with its cache settings only when the command needs it", 
     expect(launcher.exitCode).toBe(1);
     expect(launcher.stderr).toContain("[service-launcher] T3CODE_HOME is required");
     expect(launcher.stderr).not.toMatch(/LOADED_CLI_MAIN|CACHE=/);
+    const sandboxWorker = yield* run({}, ["__workflow-sandbox-worker"]);
+    expect(sandboxWorker.exitCode).toBe(0);
+    expect(sandboxWorker.stdout.trim()).toBe('{"type":"ready"}');
+    expect(sandboxWorker.stderr).not.toMatch(/LOADED_CLI_MAIN|CACHE=/);
     const launcherHelp = yield* run({ T3CODE_HOME: "" }, ["__service-launcher", "--help"]);
     expect(launcherHelp.exitCode).toBe(0);
     expect(launcherHelp.stderr).toContain("LOADED_CLI_MAIN");

@@ -1,11 +1,13 @@
-// @effect-diagnostics-next-line nodeBuiltinImport:off -- Probes the real child process ulimit on Linux.
+// @effect-diagnostics nodeBuiltinImport:off -- Probes the real child process ulimit and handshake on Linux.
 import * as NodeChildProcess from "node:child_process";
+import * as NodeFS from "node:fs";
 
 import * as HostProcess from "@t3tools/shared/HostProcess";
 import { describe, expect, it } from "vite-plus/test";
 
 import {
   MAX_PHASE_MESSAGE_BYTES,
+  MAX_VALUE_MESSAGE_BYTES,
   WORKFLOW_LIMITS,
   WORKFLOW_MESSAGE_LIMITS,
   WORKFLOW_PROGRESS_LIMITS,
@@ -15,12 +17,18 @@ import {
   createWorkflowHostMessageReceiver,
   makeBoundedLineSplitter,
   parseWorkflowMeta,
+  resolveWorkflowSandboxEntryPath,
   runWorkflowScript,
+  terminateSandboxChild,
   workflowConcurrency,
   type WorkflowAgentCall,
   type WorkflowHost,
 } from "./sandbox.ts";
-import { makeWorkflowProgressBudget, type WorkflowProgressLimits } from "./sandboxWorker.ts";
+import {
+  WORKFLOW_SANDBOX_WORKER_ARG,
+  makeWorkflowProgressBudget,
+  type WorkflowProgressLimits,
+} from "./sandboxWorker.ts";
 
 function makeScript(body: string, meta = `{ name: "test", description: "test workflow" }`): string {
   return `export const meta = ${meta};\n${body}`;
@@ -1028,11 +1036,35 @@ describe("sandbox", () => {
       ).resolves.toBe("still-alive");
     });
 
-    it("builds OS-appropriate sandbox commands with heap flags and non-Windows ulimit", () => {
+    it("resolves sandbox entry paths across dev, bundled dist, app.asar, server.asar, and SEA builds", () => {
+      expect(
+        resolveWorkflowSandboxEntryPath("file:///repo/apps/server/src/workflows/sandbox.ts", {
+          windows: false,
+        }),
+      ).toBe("/repo/apps/server/src/bin.ts");
+      expect(
+        resolveWorkflowSandboxEntryPath(
+          "file:///Applications/T3%20Code.app/Contents/Resources/app.asar/apps/server/dist/bin.mjs",
+          { windows: false },
+        ),
+      ).toBe("/Applications/T3 Code.app/Contents/Resources/app.asar/apps/server/dist/bin.mjs");
+      expect(
+        resolveWorkflowSandboxEntryPath(
+          "file:///C:/Program%20Files/T3%20Code/resources/server.asar/apps/server/dist/bin.mjs",
+          { windows: true },
+        ),
+      ).toBe("C:\\Program Files\\T3 Code\\resources\\server.asar\\apps\\server\\dist\\bin.mjs");
+      expect(
+        resolveWorkflowSandboxEntryPath("file:///usr/lib/node_modules/t3/dist/sandbox-chunk.mjs", {
+          windows: false,
+        }),
+      ).toBe("/usr/lib/node_modules/t3/dist/bin.mjs");
+
       const linuxCmd = buildWorkflowSandboxCommand({
         platform: "linux",
         execPath: "/usr/bin/node",
-        bootstrap: "boot()",
+        isExecutable: false,
+        entryPath: "/app/resources/app.asar/apps/server/dist/bin.mjs",
       });
       expect(linuxCmd).toEqual({
         command: "/bin/sh",
@@ -1042,67 +1074,219 @@ describe("sandbox", () => {
           "/usr/bin/node",
           "--max-old-space-size=256",
           "--max-semi-space-size=16",
-          "-e",
-          "boot()",
+          "/app/resources/app.asar/apps/server/dist/bin.mjs",
+          WORKFLOW_SANDBOX_WORKER_ARG,
         ],
+        env: { ELECTRON_RUN_AS_NODE: "1" },
       });
 
-      const darwinCmd = buildWorkflowSandboxCommand({
+      const darwinAsarCmd = buildWorkflowSandboxCommand({
         platform: "darwin",
-        execPath: "/opt/node",
-        bootstrap: "boot()",
+        execPath: "/Applications/T3 Code.app/Contents/MacOS/T3 Code",
+        isExecutable: false,
+        entryPath: "/Applications/T3 Code.app/Contents/Resources/app.asar/apps/server/dist/bin.mjs",
       });
-      expect(darwinCmd.command).toBe("/bin/sh");
-      expect(darwinCmd.args[1]).toBe('ulimit -d 1048576 && exec "$0" "$@"');
+      expect(darwinAsarCmd).toEqual({
+        command: "/bin/sh",
+        args: [
+          "-c",
+          'ulimit -d 1048576 && exec "$0" "$@"',
+          "/Applications/T3 Code.app/Contents/MacOS/T3 Code",
+          "--max-old-space-size=256",
+          "--max-semi-space-size=16",
+          "/Applications/T3 Code.app/Contents/Resources/app.asar/apps/server/dist/bin.mjs",
+          WORKFLOW_SANDBOX_WORKER_ARG,
+        ],
+        env: { ELECTRON_RUN_AS_NODE: "1" },
+      });
 
-      const winCmd = buildWorkflowSandboxCommand({
+      const winAsarCmd = buildWorkflowSandboxCommand({
         platform: "win32",
-        execPath: "C:\\Program Files\\nodejs\\node.exe",
-        bootstrap: "boot()",
+        execPath: "C:\\Program Files\\T3 Code\\T3 Code.exe",
+        isExecutable: false,
+        entryPath:
+          "C:\\Program Files\\T3 Code\\resources\\server.asar\\apps\\server\\dist\\bin.mjs",
       });
-      expect(winCmd).toEqual({
-        command: "C:\\Program Files\\nodejs\\node.exe",
-        args: ["--max-old-space-size=256", "--max-semi-space-size=16", "-e", "boot()"],
+      expect(winAsarCmd).toEqual({
+        command: "C:\\Program Files\\T3 Code\\T3 Code.exe",
+        args: [
+          "--max-old-space-size=256",
+          "--max-semi-space-size=16",
+          "C:\\Program Files\\T3 Code\\resources\\server.asar\\apps\\server\\dist\\bin.mjs",
+          WORKFLOW_SANDBOX_WORKER_ARG,
+        ],
+        env: { ELECTRON_RUN_AS_NODE: "1" },
       });
+
+      // Packaged SEA binaries receive CLI flags in process.argv, so heap limits move to NODE_OPTIONS.
+      const linuxSeaCmd = buildWorkflowSandboxCommand({
+        platform: "linux",
+        execPath: "/usr/local/bin/t3",
+        isExecutable: true,
+      });
+      expect(linuxSeaCmd).toEqual({
+        command: "/bin/sh",
+        args: [
+          "-c",
+          'ulimit -d 1048576 && exec "$0" "$@"',
+          "/usr/local/bin/t3",
+          WORKFLOW_SANDBOX_WORKER_ARG,
+        ],
+        env: {
+          ELECTRON_RUN_AS_NODE: "1",
+          NODE_OPTIONS: "--max-old-space-size=256 --max-semi-space-size=16",
+        },
+      });
+
+      const winSeaCmd = buildWorkflowSandboxCommand({
+        platform: "win32",
+        execPath: "C:\\t3\\t3.exe",
+        isExecutable: true,
+      });
+      expect(winSeaCmd).toEqual({
+        command: "C:\\t3\\t3.exe",
+        args: [WORKFLOW_SANDBOX_WORKER_ARG],
+        env: {
+          ELECTRON_RUN_AS_NODE: "1",
+          NODE_OPTIONS: "--max-old-space-size=256 --max-semi-space-size=16",
+        },
+      });
+    });
+
+    it("completes the worker handshake when V8 heap flags arrive through NODE_OPTIONS as in SEA builds", async () => {
+      const entryPath = resolveWorkflowSandboxEntryPath();
+      const result = await runWorkflowScript({
+        script: makeScript(`return { greeting: "hello " + args.name };`),
+        args: { name: "sea" },
+        host: makeHost(),
+        concurrency: 1,
+        spawnCommand: {
+          command: process.execPath,
+          args: [entryPath, WORKFLOW_SANDBOX_WORKER_ARG],
+          env: {
+            ELECTRON_RUN_AS_NODE: "1",
+            NODE_OPTIONS: WORKFLOW_SANDBOX_PROCESS_LIMITS.nodeFlags.join(" "),
+          },
+        },
+      });
+      expect(result).toEqual({ greeting: "hello sea" });
+    });
+
+    it("fails promptly when a spawned child stalls before sending ready and distinguishes kill errors from confirmed exit", async () => {
+      await expect(
+        runWorkflowScript({
+          script: makeScript("return 1;"),
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+          handshakeTimeoutMs: 120,
+          spawnCommand: {
+            command: process.execPath,
+            args: ["-e", "setInterval(() => {}, 60_000);"],
+            env: { ELECTRON_RUN_AS_NODE: "1" },
+          },
+        }),
+      ).rejects.toThrow(/startup handshake/i);
+
+      // A kill failure other than ESRCH must not claim the child exited.
+      let destroyed = 0;
+      let confirmedExit = false;
+      const epermOutcome = await terminateSandboxChild({
+        child: {
+          pid: 999_999,
+          exitCode: null,
+          signalCode: null,
+          stdin: {
+            destroy: () => {
+              destroyed += 1;
+            },
+          },
+          stdout: {
+            destroy: () => {
+              destroyed += 1;
+            },
+          },
+          stderr: {
+            destroy: () => {
+              destroyed += 1;
+            },
+          },
+          kill: () => {
+            const err = new Error("Operation not permitted") as Error & { code: string };
+            err.code = "EPERM";
+            throw err;
+          },
+        },
+        isExited: () => confirmedExit,
+        markExited: () => {
+          confirmedExit = true;
+        },
+        waitForExit: () => new Promise<void>(() => {}),
+      });
+      expect(destroyed).toBe(3);
+      expect(confirmedExit).toBe(false);
+      expect(epermOutcome).toBe("kill_failed");
+
+      // ESRCH means the process is already gone and confirms exit.
+      let esrchConfirmed = false;
+      const esrchOutcome = await terminateSandboxChild({
+        child: {
+          pid: 999_999,
+          exitCode: null,
+          signalCode: null,
+          stdin: { destroy: () => {} },
+          stdout: { destroy: () => {} },
+          stderr: { destroy: () => {} },
+          kill: () => {
+            const err = new Error("No such process") as Error & { code: string };
+            err.code = "ESRCH";
+            throw err;
+          },
+        },
+        isExited: () => esrchConfirmed,
+        markExited: () => {
+          esrchConfirmed = true;
+        },
+        waitForExit: () => new Promise<void>(() => {}),
+      });
+      expect(esrchConfirmed).toBe(true);
+      expect(esrchOutcome).toBe("exited");
     });
 
     it.skipIf(HostProcess.Platform.defaultValue() !== "linux")(
       "runs the sandbox child under the 1 GiB data rlimit on Linux",
       async () => {
-        const { command, args } = buildWorkflowSandboxCommand();
+        const { command, args, env } = buildWorkflowSandboxCommand();
         const child = NodeChildProcess.spawn(command, args, {
           stdio: ["pipe", "pipe", "pipe"],
-          env: { ELECTRON_RUN_AS_NODE: "1" },
+          env,
           windowsHide: true,
         });
-        const stdoutChunks: Array<Buffer> = [];
-        child.stdout.on("data", (chunk: Buffer) => stdoutChunks.push(chunk));
         child.stderr.resume();
 
-        const exitPromise = new Promise<{ code: number | null; signal: NodeJS.Signals | null }>(
-          (resolve, reject) => {
-            child.once("error", reject);
-            child.once("close", (code, signal) => resolve({ code, signal }));
-          },
-        );
+        const readyPromise = new Promise<void>((resolve, reject) => {
+          let buf = "";
+          child.once("error", reject);
+          child.once("close", (code, signal) =>
+            reject(new Error(`Worker exited before ready (${String(code)}/${String(signal)})`)),
+          );
+          child.stdout.on("data", (chunk: Buffer) => {
+            buf += chunk.toString("utf8");
+            if (buf.includes('{"type":"ready"}\n')) resolve();
+          });
+        });
 
-        const probeSource = `
-          const fs = require("node:fs");
-          const line = fs
-            .readFileSync("/proc/self/limits", "utf8")
-            .split("\\n")
+        try {
+          await readyPromise;
+          expect(child.pid).toBeDefined();
+          const line = NodeFS.readFileSync(`/proc/${child.pid}/limits`, "utf8")
+            .split("\n")
             .find((entry) => entry.startsWith("Max data size"));
-          process.stdout.write((line ?? "") + "\\n");
-          process.exit(0);
-        `;
-        child.stdin.end(`${JSON.stringify(probeSource)}\n`);
-
-        const { code, signal } = await exitPromise;
-        expect(signal).toBeNull();
-        expect(code).toBe(0);
-        const expectedBytes = String(WORKFLOW_SANDBOX_PROCESS_LIMITS.rlimitDataKiB * 1024);
-        const limitsLine = Buffer.concat(stdoutChunks).toString("utf8").trim();
-        expect(limitsLine).toContain(expectedBytes);
+          const expectedBytes = String(WORKFLOW_SANDBOX_PROCESS_LIMITS.rlimitDataKiB * 1024);
+          expect(line ?? "").toContain(expectedBytes);
+        } finally {
+          child.kill("SIGKILL");
+        }
       },
     );
 
@@ -1349,13 +1533,14 @@ describe("sandbox", () => {
       splitter.push(encoded.subarray(splitAt));
       expect(lines).toEqual([{ line: '{"a":"é"}', bytes: encoded.byteLength - 1 }]);
 
-      const half = Buffer.alloc(WORKFLOW_MESSAGE_LIMITS.maxValueBytes / 2, 0x61);
-      splitter.push(half);
-      splitter.push(half);
+      const splitterHalf = Buffer.alloc(WORKFLOW_MESSAGE_LIMITS.maxValueBytes / 2, 0x61);
+      splitter.push(splitterHalf);
+      splitter.push(splitterHalf);
       expect(overflowed).toBe(0);
       splitter.push(Buffer.from("x"));
       expect(overflowed).toBe(1);
 
+      const receiverHalf = Buffer.alloc(MAX_VALUE_MESSAGE_BYTES / 2, 0x61);
       let hostError: unknown;
       const receiver = createWorkflowHostMessageReceiver({
         script: makeScript("return 1;"),
@@ -1372,11 +1557,128 @@ describe("sandbox", () => {
         },
         isSettled: () => hostError !== undefined,
       });
-      receiver.push(half);
-      receiver.push(half);
+      receiver.push(receiverHalf);
+      receiver.push(receiverHalf);
       receiver.push(Buffer.from("z"));
       expect(hostError).toBeInstanceOf(WorkflowScriptError);
       expect((hostError as Error).message).toBe("Workflow message exceeded the 4 MiB limit.");
+    });
+
+    it("accepts scripts, args, nested scripts, and phase titles within decoded limits even with heavy JSON escaping", async () => {
+      // 1024-byte phase title of quotes and control chars expands past old maxPhaseTitleBytes + 256.
+      const escapedPhaseTitle = `a${"\u0000".repeat(511)}${'"'.repeat(512)}`;
+      expect(Buffer.byteLength(escapedPhaseTitle, "utf8")).toBe(
+        WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes,
+      );
+      const seenPhases: Array<string> = [];
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`phase(${JSON.stringify(escapedPhaseTitle)}); return "ok";`),
+          args: undefined,
+          host: makeHost({ onPhase: (title) => seenPhases.push(title) }),
+          concurrency: 1,
+        }),
+      ).resolves.toBe("ok");
+      expect(seenPhases).toEqual([escapedPhaseTitle]);
+
+      // Script (~3 MiB of quotes -> ~6 MiB JSON-escaped) + args (~3.5 MiB) exceed old 8 MiB start cap.
+      const heavyScript = makeScript(`// ${'"'.repeat(3 * 1024 * 1024)}\nreturn args.data.length;`);
+      expect(Buffer.byteLength(heavyScript, "utf8")).toBeLessThan(
+        WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+      );
+      const heavyArgs = { data: "a".repeat(3.5 * 1024 * 1024) };
+      expect(Buffer.byteLength(JSON.stringify(heavyArgs), "utf8")).toBeLessThan(
+        WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+      );
+      await expect(
+        runWorkflowScript({
+          script: heavyScript,
+          args: heavyArgs,
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).resolves.toBe(3.5 * 1024 * 1024);
+
+      // Nested script (~3 MiB of quotes -> ~6 MiB JSON-escaped) passes 4 MiB decoded cap.
+      const heavyNestedScript = makeScript(
+        `// ${'"'.repeat(3 * 1024 * 1024)}\nreturn "nested-ok";`,
+        `{ name: "nested", description: "nested heavy" }`,
+      );
+      expect(Buffer.byteLength(heavyNestedScript, "utf8")).toBeLessThan(
+        WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+      );
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`return await workflow({ scriptPath: "/heavy-nested.js" });`),
+          args: undefined,
+          host: makeHost({
+            loadScript: async () => heavyNestedScript,
+          }),
+          concurrency: 1,
+        }),
+      ).resolves.toBe("nested-ok");
+    });
+
+    it("caps aggregate serialized phase output across repeated titles and caps worker stdout backlog", async () => {
+      // Repeating two 1024-byte titles stays within distinct-title budget but exceeds 4 MiB emitted phase bytes.
+      const repeatedFlood = makeScript(`
+        const a = "a".repeat(${WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes});
+        const b = "b".repeat(${WORKFLOW_PROGRESS_LIMITS.maxPhaseTitleBytes});
+        for (let i = 0; i < 4500; i += 1) {
+          try { phase(i % 2 === 0 ? a : b); } catch {}
+        }
+        return "done";
+      `);
+      await expect(
+        runWorkflowScript({
+          script: repeatedFlood,
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+        }),
+      ).rejects.toThrow(/phase\(\) output exceeds/i);
+
+      // When stdout buffers past maxStdoutBufferedBytes, the worker rejects with a sticky cap failure.
+      const workerModuleUrl = new URL("./sandboxWorker.ts", import.meta.url).href;
+      const corkedWorkerScript = `
+        const origWrite = process.stdout.write.bind(process.stdout);
+        let readySent = false;
+        process.stdout.write = (chunk, ...rest) => {
+          const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+          if (text.includes('"type":"error"') || text.includes('"type":"done"')) {
+            process.stdout.uncork();
+            return origWrite(chunk, ...rest);
+          }
+          const ok = origWrite(chunk, ...rest);
+          if (!readySent && text.includes('"type":"ready"')) {
+            readySent = true;
+            process.stdout.cork();
+          }
+          return ok;
+        };
+        import(${JSON.stringify(workerModuleUrl)}).then((m) => m.runWorkflowSandboxWorker());
+      `;
+      const backlogFlood = makeScript(`
+        const msg = "x".repeat(600);
+        for (let i = 0; i < 10; i += 1) {
+          try { log(msg); } catch {}
+        }
+        return "done";
+      `);
+      await expect(
+        runWorkflowScript({
+          script: backlogFlood,
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+          maxStdoutBufferedBytes: 1024,
+          spawnCommand: {
+            command: process.execPath,
+            args: ["-e", corkedWorkerScript],
+            env: { ELECTRON_RUN_AS_NODE: "1" },
+          },
+        }),
+      ).rejects.toThrow(/output backlog exceeded/i);
     });
 
     it("fails the run once the log budget is spent, even when the script catches", async () => {
@@ -1493,6 +1795,7 @@ describe("sandbox", () => {
         maxPhaseTitleBytes: 8,
         maxPhaseTitleTotalBytes: 12,
         maxPhaseSwitches: 4,
+        maxPhaseEventBytes: 120,
       };
       const logs = makeWorkflowProgressBudget(limits);
       expect(logs.log("a")).toBeUndefined();
@@ -1557,7 +1860,7 @@ describe("sandbox", () => {
         return { send, getFailed: () => failed, phasesSeen, agentsSeen };
       };
 
-      // Forged phase message exceeding the lowered per-message cap (maxPhaseTitleBytes + 256).
+      // Forged phase message exceeding the per-message frame ceiling.
       const overPhaseFrame = makeReceiver();
       overPhaseFrame.send({
         type: "phase",
@@ -1565,8 +1868,23 @@ describe("sandbox", () => {
         pad: "p".repeat(MAX_PHASE_MESSAGE_BYTES),
       });
       expect(overPhaseFrame.getFailed()).toBeInstanceOf(WorkflowScriptError);
-      expect((overPhaseFrame.getFailed() as Error).message).toMatch(/1280-byte limit/);
+      expect((overPhaseFrame.getFailed() as Error).message).toContain(
+        `${MAX_PHASE_MESSAGE_BYTES}-byte limit`,
+      );
       expect(overPhaseFrame.phasesSeen).toEqual([]);
+
+      // Forged repeated phase messages exceeding aggregate serialized phase output budget.
+      const overPhaseEventBytes = makeReceiver({
+        ...WORKFLOW_PROGRESS_LIMITS,
+        maxPhaseEventBytes: 60,
+      });
+      overPhaseEventBytes.send({ type: "phase", title: "RepeatMe" });
+      overPhaseEventBytes.send({ type: "phase", title: "RepeatMe" });
+      overPhaseEventBytes.send({ type: "phase", title: "RepeatMe" });
+      expect(overPhaseEventBytes.getFailed()).toBeInstanceOf(WorkflowScriptError);
+      expect((overPhaseEventBytes.getFailed() as Error).message).toMatch(
+        /phase\(\) output exceeds/i,
+      );
 
       // Forged phase message under the frame cap with a title over 1024 bytes.
       const overPhaseTitle = makeReceiver();
