@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off -- Workflow script reads use O_NONBLOCK + fstat to reject special files without blocking.
+import * as NodeFS from "node:fs";
+import * as NodeFSP from "node:fs/promises";
 import * as NodeOS from "node:os";
 import {
   CommandId,
@@ -41,7 +44,7 @@ import {
 } from "@t3tools/provider-core/server/subagentProjection";
 import { derivePendingBackgroundWork } from "@t3tools/shared/orchestrationV2PendingBackgroundWork";
 import { latestRootProviderFailure } from "@t3tools/shared/orchestrationV2ThreadError";
-import * as ByteSize from "effect/ByteSize";
+import * as Cause from "effect/Cause";
 import * as Clock from "effect/Clock";
 import * as Context from "effect/Context";
 import * as Deferred from "effect/Deferred";
@@ -58,6 +61,7 @@ import * as Queue from "effect/Queue";
 import * as Random from "effect/Random";
 import * as Result from "effect/Result";
 import * as Schema from "effect/Schema";
+import * as Scope from "effect/Scope";
 import * as Stream from "effect/Stream";
 
 import * as ServerConfig from "../config.ts";
@@ -89,6 +93,7 @@ import {
 import {
   WORKFLOW_MESSAGE_LIMITS,
   parseWorkflowMeta,
+  reapUnconfirmedSandboxChildren,
   runWorkflowScript,
   workflowConcurrency,
   WorkflowScriptError,
@@ -183,6 +188,94 @@ class WorkflowScriptTooLargeError extends Schema.TaggedError<WorkflowScriptTooLa
     return `Workflow script at ${this.scriptPath} exceeds the 4 MiB limit.`;
   }
 }
+
+class WorkflowScriptNotRegularFileError extends Schema.TaggedError<WorkflowScriptNotRegularFileError>()(
+  "WorkflowScriptNotRegularFileError",
+  {
+    scriptPath: Schema.String,
+  },
+) {
+  override get message(): string {
+    return `Workflow script at ${this.scriptPath} must be a regular file.`;
+  }
+}
+
+class WorkflowScriptReadError extends Schema.TaggedError<WorkflowScriptReadError>()(
+  "WorkflowScriptReadError",
+  {
+    scriptPath: Schema.String,
+    cause: Schema.Defect(),
+  },
+) {
+  override get message(): string {
+    return `Unable to read workflow script at ${this.scriptPath}.`;
+  }
+}
+
+export type WorkflowScriptFileError = WorkflowScriptNotRegularFileError | WorkflowScriptReadError;
+
+export interface OpenWorkflowScriptFile {
+  readonly stat: Effect.Effect<
+    { readonly isRegularFile: boolean; readonly size: number },
+    WorkflowScriptFileError
+  >;
+  readonly readChunk: (
+    maxBytes: number,
+  ) => Effect.Effect<Option.Option<Uint8Array>, WorkflowScriptFileError>;
+}
+
+export type WorkflowScriptFileOpener = (
+  scriptPath: string,
+) => Effect.Effect<OpenWorkflowScriptFile, WorkflowScriptFileError, Scope.Scope>;
+
+const errorCodeOf = (cause: unknown): string | undefined => {
+  if (typeof cause === "object" && cause !== null && "code" in cause) {
+    const code = (cause as { readonly code?: unknown }).code;
+    if (typeof code === "string") return code;
+  }
+  return undefined;
+};
+
+const defaultOpenWorkflowScriptFile: WorkflowScriptFileOpener = (scriptPath) =>
+  Effect.acquireRelease(
+    Effect.tryPromise({
+      try: () =>
+        NodeFSP.open(scriptPath, NodeFS.constants.O_RDONLY | (NodeFS.constants.O_NONBLOCK ?? 0)),
+      catch: (cause): WorkflowScriptFileError =>
+        errorCodeOf(cause) === "EISDIR"
+          ? new WorkflowScriptNotRegularFileError({ scriptPath })
+          : new WorkflowScriptReadError({ scriptPath, cause }),
+    }),
+    (handle) => Effect.promise(() => handle.close()).pipe(Effect.ignore),
+  ).pipe(
+    Effect.map((handle) => ({
+      stat: Effect.tryPromise({
+        try: async () => {
+          const info = await handle.stat();
+          return { isRegularFile: info.isFile(), size: info.size };
+        },
+        catch: (cause): WorkflowScriptFileError =>
+          new WorkflowScriptReadError({ scriptPath, cause }),
+      }),
+      readChunk: (maxBytes) =>
+        Effect.tryPromise({
+          try: async () => {
+            const buffer = Buffer.allocUnsafe(maxBytes);
+            const { bytesRead } = await handle.read(buffer, 0, maxBytes, null);
+            return bytesRead === 0
+              ? Option.none<Uint8Array>()
+              : Option.some(buffer.subarray(0, bytesRead));
+          },
+          catch: (cause): WorkflowScriptFileError =>
+            new WorkflowScriptReadError({ scriptPath, cause }),
+        }),
+    })),
+  );
+
+export const WorkflowScriptFileOpener = Context.Reference<WorkflowScriptFileOpener>(
+  "t3/workflows/WorkflowScriptFileOpener",
+  { defaultValue: () => defaultOpenWorkflowScriptFile },
+);
 
 function createHostAbortController(): AbortController {
   return new AbortController();
@@ -744,6 +837,15 @@ const readPersistedRunWith = Effect.fn("WorkflowService.readPersistedRun")(funct
   runId: string,
 ) {
   if (!isSafeRunId(runId)) return Option.none<PersistedWorkflowRun>();
+  const dirPath = runDirIn(deps.path, deps.workflowsDir, runId);
+  const dirStat = yield* deps.fileSystem.stat(dirPath).pipe(
+    Effect.asSome,
+    Effect.catchIf(isPlatformNotFound, () => Effect.succeed(Option.none<FileSystem.File.Info>())),
+    Effect.mapError(() => failure("orchestration_error", `Unable to inspect ${dirPath}.`)),
+  );
+  if (Option.isNone(dirStat) || dirStat.value.type !== "Directory") {
+    return Option.none<PersistedWorkflowRun>();
+  }
   const metaPath = runMetaPathIn(deps.path, deps.workflowsDir, runId);
   const contentOption = yield* deps.fileSystem.readFileString(metaPath).pipe(
     Effect.asSome,
@@ -751,7 +853,11 @@ const readPersistedRunWith = Effect.fn("WorkflowService.readPersistedRun")(funct
     Effect.mapError(() => failure("orchestration_error", `Unable to read ${metaPath}.`)),
   );
   if (Option.isNone(contentOption)) return Option.none<PersistedWorkflowRun>();
-  return yield* decodePersistedWorkflowRun(contentOption.value).pipe(Effect.option);
+  const decoded = yield* decodePersistedWorkflowRun(contentOption.value).pipe(Effect.option);
+  if (Option.isNone(decoded) || decoded.value.runId !== runId) {
+    return Option.none<PersistedWorkflowRun>();
+  }
+  return decoded;
 });
 
 const writePersistedRunStrictWith = Effect.fn("WorkflowService.writePersistedRunStrict")(function* (
@@ -835,23 +941,25 @@ interface OwnedChildTarget {
 const READ_SCRIPT_CHUNK_BYTES = 64 * 1024;
 
 const readBoundedWorkflowScript = Effect.fn("WorkflowService.readBoundedWorkflowScript")(function* (
-  fileSystem: FileSystem.FileSystem,
   scriptPath: string,
 ) {
+  const openScriptFile = yield* WorkflowScriptFileOpener;
   const maxBytes = WORKFLOW_MESSAGE_LIMITS.maxValueBytes;
-  const maxByteSize = ByteSize.bytes(maxBytes);
   return yield* Effect.scoped(
     Effect.gen(function* () {
-      const file = yield* fileSystem.open(scriptPath, { flag: "r" });
+      const file = yield* openScriptFile(scriptPath);
       const info = yield* file.stat;
-      if (ByteSize.isGreaterThan(info.size, maxByteSize)) {
+      if (!info.isRegularFile) {
+        return yield* new WorkflowScriptNotRegularFileError({ scriptPath });
+      }
+      if (info.size > maxBytes) {
         return yield* new WorkflowScriptTooLargeError({ scriptPath });
       }
       const chunks: Array<Uint8Array> = [];
       let total = 0;
       const limit = maxBytes + 1;
       while (total < limit) {
-        const chunk = yield* file.readAlloc(Math.min(limit - total, READ_SCRIPT_CHUNK_BYTES));
+        const chunk = yield* file.readChunk(Math.min(limit - total, READ_SCRIPT_CHUNK_BYTES));
         if (Option.isNone(chunk) || chunk.value.byteLength === 0) break;
         total += chunk.value.byteLength;
         if (total > maxBytes) {
@@ -1069,9 +1177,14 @@ const stopOwnedChildThreadOnce = Effect.fn("WorkflowService.stopOwnedChildThread
       });
     }
 
+    let firstDescendantError:
+      | Orchestrator.OrchestratorV2Error
+      | ThreadManagementService.ThreadManagementProviderInstanceDisabledError
+      | WorkflowStopNotConfirmedError
+      | undefined;
     for (const grandchild of afterStop.subagents) {
       if (grandchild.origin !== "app_owned" || grandchild.childThreadId === null) continue;
-      yield* stopOwnedChildThreadOnce({
+      const grandchildOutcome = yield* stopOwnedChildThreadOnce({
         threadManagement,
         parentThreadId: childThreadId,
         runId,
@@ -1080,7 +1193,10 @@ const stopOwnedChildThreadOnce = Effect.fn("WorkflowService.stopOwnedChildThread
         reason,
         attempt,
         visited,
-      });
+      }).pipe(Effect.result);
+      if (Result.isFailure(grandchildOutcome) && firstDescendantError === undefined) {
+        firstDescendantError = grandchildOutcome.failure;
+      }
     }
 
     let confirmed = yield* readChildState();
@@ -1121,7 +1237,12 @@ const stopOwnedChildThreadOnce = Effect.fn("WorkflowService.stopOwnedChildThread
       confirmed = yield* readChildState();
     }
 
-    if (confirmed.thread.deletedAt !== null) return;
+    if (confirmed.thread.deletedAt !== null) {
+      if (firstDescendantError !== undefined) {
+        return yield* firstDescendantError;
+      }
+      return;
+    }
     const liveRuns = confirmed.runs.filter(isLiveChildRun);
     if (liveRuns.length > 0) {
       return yield* new WorkflowStopNotConfirmedError({
@@ -1132,6 +1253,9 @@ const stopOwnedChildThreadOnce = Effect.fn("WorkflowService.stopOwnedChildThread
       return yield* new WorkflowStopNotConfirmedError({
         messageText: `Child thread ${childThreadId} still has pending background work.`,
       });
+    }
+    if (firstDescendantError !== undefined) {
+      return yield* firstDescendantError;
     }
   },
 );
@@ -1190,8 +1314,13 @@ const stopAllWorkflowChildren = Effect.fn("WorkflowService.stopAllWorkflowChildr
             input.workflowTaskId,
             input.extraChildren,
           );
+          let firstError:
+            | Orchestrator.OrchestratorV2Error
+            | ThreadManagementService.ThreadManagementProviderInstanceDisabledError
+            | WorkflowStopNotConfirmedError
+            | undefined;
           for (const child of owned) {
-            yield* stopOwnedChildThreadOnce({
+            const outcome = yield* stopOwnedChildThreadOnce({
               threadManagement: input.threadManagement,
               parentThreadId: input.parentThreadId,
               runId: input.runId,
@@ -1200,7 +1329,13 @@ const stopAllWorkflowChildren = Effect.fn("WorkflowService.stopAllWorkflowChildr
               reason: input.reason,
               attempt: attemptOffset + attempt,
               visited: new Set<ThreadId>(),
-            });
+            }).pipe(Effect.result);
+            if (Result.isFailure(outcome) && firstError === undefined) {
+              firstError = outcome.failure;
+            }
+          }
+          if (firstError !== undefined) {
+            return yield* firstError;
           }
         }),
       {
@@ -1346,6 +1481,7 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
   const storeDeps = { fileSystem, path, workflowsDir: serverConfig.workflowsDir };
 
   const candidatesByKey = new Map<string, RecoveryCandidate>();
+  const activeSqlRunIds = new Set<string>();
   const keyFor = (parentThreadId: ThreadId, taskId: NodeId | null, runId: string | undefined) =>
     taskId !== null ? `task:${parentThreadId}:${taskId}` : `run:${runId ?? ""}`;
 
@@ -1373,6 +1509,7 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
     for (const subagent of records.value.subagents) {
       if (!isAppOwnedWorkflowTask(subagent) || isTerminalSubagentStatus(subagent.status)) continue;
       const runId = subagent.workflow?.runHandles?.runId;
+      if (runId !== undefined) activeSqlRunIds.add(runId);
       const persisted =
         runId === undefined
           ? undefined
@@ -1403,8 +1540,29 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
       ),
     );
     for (const entry of entries) {
-      if (!isSafeRunId(entry)) continue;
-      const persisted = yield* readPersistedRunWith(storeDeps, entry);
+      if (!isSafeRunId(entry) || activeSqlRunIds.has(entry)) continue;
+      const entryDir = runDirIn(path, serverConfig.workflowsDir, entry);
+      const entryStat = yield* fileSystem.stat(entryDir).pipe(
+        Effect.asSome,
+        Effect.catchIf(isPlatformNotFound, () =>
+          Effect.succeed(Option.none<FileSystem.File.Info>()),
+        ),
+        Effect.catch((error) =>
+          Effect.logWarning("workflow.startup-sweep.entry-stat-failed", {
+            entry,
+            error,
+          }).pipe(Effect.as(Option.none<FileSystem.File.Info>())),
+        ),
+      );
+      if (Option.isNone(entryStat) || entryStat.value.type !== "Directory") continue;
+      const persisted = yield* readPersistedRunWith(storeDeps, entry).pipe(
+        Effect.catch((error) =>
+          Effect.logWarning("workflow.startup-sweep.orphan-meta-read-failed", {
+            entry,
+            error,
+          }).pipe(Effect.as(Option.none<PersistedWorkflowRun>())),
+        ),
+      );
       if (Option.isNone(persisted)) continue;
       const record = persisted.value;
       const candidateKey = keyFor(record.threadId, record.taskId, record.runId);
@@ -1730,6 +1888,10 @@ const make = Effect.gen(function* () {
   const orchestratorMcp = yield* OrchestratorMcpService.OrchestratorMcpService;
   const storeDeps = { fileSystem, path, workflowsDir: serverConfig.workflowsDir };
 
+  yield* Effect.addFinalizer(() =>
+    Effect.promise(() => reapUnconfirmedSandboxChildren()).pipe(Effect.ignore),
+  );
+
   const liveRuns = new Map<string, LiveWorkflowRun>();
   const concurrency = workflowConcurrency(NodeOS.cpus().length);
 
@@ -1807,6 +1969,17 @@ const make = Effect.gen(function* () {
 
     yield* Effect.scoped(
       Effect.gen(function* () {
+        const scriptReadsScope = yield* Scope.make();
+        yield* Effect.addFinalizer(() =>
+          Scope.close(scriptReadsScope, Exit.void).pipe(Effect.ignore),
+        );
+        let scriptReadsClosed = false;
+        const closeScriptReads = (): void => {
+          if (scriptReadsClosed) return;
+          scriptReadsClosed = true;
+          void runPromise(Scope.close(scriptReadsScope, Exit.void).pipe(Effect.ignore));
+        };
+
         const journalWriter = yield* makeJournalWriter({
           writeLine: (line) => fileSystem.writeFileString(journalPath, line, { flag: "a" }),
           onWriteError: (error) =>
@@ -1878,6 +2051,7 @@ const make = Effect.gen(function* () {
 
         const failRunFromHostLimit = (message: string): never => {
           workerClosed = true;
+          closeScriptReads();
           if (hostLimitError === undefined) {
             hostLimitError = message;
           }
@@ -1975,6 +2149,7 @@ const make = Effect.gen(function* () {
           if (endedByEngine || stopRequested) return;
           stopRequested = true;
           workerClosed = true;
+          closeScriptReads();
           Deferred.doneUnsafe(agentsAbortDeferred, Exit.void);
           if (!abortController.signal.aborted) {
             abortController.abort(new WorkflowAbortedError());
@@ -2978,16 +3153,35 @@ const make = Effect.gen(function* () {
             pushLogInMemory(message);
             signalProgressSync();
           },
-          loadScript: ({ scriptPath: nestedPath }) =>
-            runPromise(readBoundedWorkflowScript(fileSystem, nestedPath).pipe(Effect.result)).then(
-              (outcome) => {
-                if (Result.isSuccess(outcome)) return outcome.success;
-                if (outcome.failure._tag === "WorkflowScriptTooLargeError") {
-                  throw new WorkflowScriptError(outcome.failure.message);
-                }
-                throw new WorkflowScriptError(`Unable to read workflow script at ${nestedPath}`);
-              },
-            ),
+          loadScript: ({ scriptPath: nestedPath }) => {
+            if (workerClosed || scriptReadsClosed || abortController.signal.aborted) {
+              return Promise.reject(new WorkflowAbortedError());
+            }
+            return runPromise(
+              readBoundedWorkflowScript(nestedPath).pipe(
+                Effect.forkIn(scriptReadsScope),
+                Effect.flatMap(Fiber.await),
+              ),
+            ).then((exit) => {
+              if (Exit.isSuccess(exit)) return exit.value;
+              if (Cause.hasInterruptsOnly(exit.cause)) {
+                throw new WorkflowAbortedError();
+              }
+              const err = Cause.squash(exit.cause);
+              if (
+                typeof err === "object" &&
+                err !== null &&
+                "_tag" in err &&
+                (err._tag === "WorkflowScriptTooLargeError" ||
+                  err._tag === "WorkflowScriptNotRegularFileError") &&
+                "message" in err &&
+                typeof err.message === "string"
+              ) {
+                throw new WorkflowScriptError(err.message);
+              }
+              throw new WorkflowScriptError(`Unable to read workflow script at ${nestedPath}`);
+            });
+          },
           budget: {
             total: tokenBudget ?? null,
             spent: () => usage.tokens,
@@ -3113,6 +3307,7 @@ const make = Effect.gen(function* () {
               () => {
                 // Layer shutdown interrupts this fiber; leave the task and run.json running for startup sweep.
                 workerClosed = true;
+                closeScriptReads();
                 Deferred.doneUnsafe(agentsAbortDeferred, Exit.void);
                 if (!abortController.signal.aborted) {
                   abortController.abort(new WorkflowAbortedError());
@@ -3125,13 +3320,27 @@ const make = Effect.gen(function* () {
               args,
               host,
               concurrency,
+              onCleanupFailure: (cleanupFailure) => {
+                void runPromise(
+                  Effect.logError("workflow.sandbox.cleanup-failed", {
+                    runId,
+                    taskId,
+                    pid: cleanupFailure.pid,
+                    attempts: cleanupFailure.attempts,
+                    cause: cleanupFailure.cause,
+                  }),
+                );
+              },
             }).finally(() => {
               workerClosed = true;
+              closeScriptReads();
             });
           },
           catch: (err) => new WorkflowExecutionError({ messageText: errorMessage(err) }),
         }).pipe(Effect.result);
         workerClosed = true;
+        scriptReadsClosed = true;
+        yield* Scope.close(scriptReadsScope, Exit.void);
 
         if (!stopRequested) {
           scriptSettled = true;
@@ -3366,9 +3575,10 @@ const make = Effect.gen(function* () {
 
     let scriptSource: string;
     if (input.scriptPath !== undefined) {
-      scriptSource = yield* readBoundedWorkflowScript(fileSystem, input.scriptPath).pipe(
+      scriptSource = yield* readBoundedWorkflowScript(input.scriptPath).pipe(
         Effect.mapError((error) =>
-          error._tag === "WorkflowScriptTooLargeError"
+          error._tag === "WorkflowScriptTooLargeError" ||
+          error._tag === "WorkflowScriptNotRegularFileError"
             ? failure("invalid_request", error.message)
             : failure("invalid_request", `Unable to read workflow script at ${input.scriptPath}.`),
         ),

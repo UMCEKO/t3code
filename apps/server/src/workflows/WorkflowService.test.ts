@@ -1,3 +1,6 @@
+// @effect-diagnostics nodeBuiltinImport:off -- Uses mkfifo on POSIX to verify non-blocking FIFO rejection.
+import * as NodeChildProcess from "node:child_process";
+
 import * as NodeCrypto from "@effect/platform-node/NodeCrypto";
 import * as NodeServices from "@effect/platform-node/NodeServices";
 import { describe, expect, it } from "@effect/vitest";
@@ -27,7 +30,7 @@ import {
 } from "@t3tools/contracts";
 import type * as ProviderAdapter from "@t3tools/provider-core/server/ProviderAdapter";
 import { checkpointWorkspace } from "@t3tools/provider-testing/replayWorkspace";
-import * as ByteSize from "effect/ByteSize";
+import * as HostProcess from "@t3tools/shared/HostProcess";
 import * as DateTime from "effect/DateTime";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
@@ -166,10 +169,14 @@ interface HarnessOptions {
   readonly runContinuationWorker?: boolean;
   readonly runEffectWorker?: boolean;
   readonly recoverOnStartup?: boolean;
+  readonly continueThreadsAfterServerUpdate?: boolean;
   readonly wrapThreadManagement?: (
     service: ThreadManagementService.ThreadManagementService["Service"],
   ) => ThreadManagementService.ThreadManagementService["Service"];
   readonly wrapFileSystem?: (service: FileSystem.FileSystem) => FileSystem.FileSystem;
+  readonly wrapScriptFileOpener?: (
+    opener: WorkflowService.WorkflowScriptFileOpener,
+  ) => WorkflowService.WorkflowScriptFileOpener;
 }
 
 const makeWorkflowHarness = (options: HarnessOptions) =>
@@ -437,6 +444,11 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
 
     const layerAdapters = ProviderAdapterRegistry.layerSingle(adapter);
     const layerDatabase = options.databaseLayer ?? SqlitePersistence.layerMemory;
+    const layerServerSettings = ServerSettings.layerTest(
+      options.continueThreadsAfterServerUpdate === undefined
+        ? {}
+        : { continueThreadsAfterServerUpdate: options.continueThreadsAfterServerUpdate },
+    );
     const layerOrchestrator = ProviderReplayHarness.layerWithRegistry(
       { name: `workflow-${options.name}`, runtimePolicyOverride: { cwd } },
       layerAdapters,
@@ -445,6 +457,9 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
         runEffectWorker: options.runEffectWorker ?? true,
         ...(options.recoverOnStartup === true ? { recoverOnStartup: true } : {}),
         ...(options.runContinuationWorker === true ? { runContinuationWorker: true } : {}),
+        ...(options.continueThreadsAfterServerUpdate === undefined
+          ? {}
+          : { continueThreadsAfterServerUpdate: options.continueThreadsAfterServerUpdate }),
       },
     ).pipe(
       options.runContinuationWorker === true
@@ -458,7 +473,7 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
     );
     const baseThreadManagementLayer = ThreadManagementService.layer.pipe(
       Layer.provide(layerOrchestrator),
-      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(layerServerSettings),
       Layer.provide(CommandReceiptStore.layer.pipe(Layer.provide(layerDatabase))),
     );
     const threadManagementLayer =
@@ -483,6 +498,13 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
             FileSystem.FileSystem,
             Effect.map(FileSystem.FileSystem, options.wrapFileSystem),
           ).pipe(Layer.provideMerge(NodeServices.layer));
+    const layerScriptFileOpener =
+      options.wrapScriptFileOpener === undefined
+        ? Layer.empty
+        : Layer.succeed(
+            WorkflowService.WorkflowScriptFileOpener,
+            options.wrapScriptFileOpener(WorkflowService.WorkflowScriptFileOpener.defaultValue()),
+          );
     const layerToolkit = Layer.merge(
       McpHttpServer.layerOrchestratorToolkit,
       OrchestratorMcpService.layer,
@@ -494,7 +516,7 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
       Layer.provideMerge(layerServerConfig),
       Layer.provide(layerAdapters),
       Layer.provide(ProviderRegistryMock.layer([providerSnapshot])),
-      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(layerServerSettings),
       Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
       Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
       Layer.provide(Layer.mock(PeerLinkRequests.PeerLinkRequests)({})),
@@ -504,7 +526,9 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
       ),
       Layer.provide(Layer.mock(SecretRequests.SecretRequests)({})),
       Layer.provide(Layer.mock(RemoteDelegation.RemoteDelegation)({})),
-      Layer.provideMerge(Layer.mergeAll(layerNodeServices, NodeCrypto.layer)),
+      Layer.provideMerge(
+        Layer.mergeAll(layerNodeServices, NodeCrypto.layer, layerScriptFileOpener),
+      ),
     );
 
     return {
@@ -3885,47 +3909,37 @@ return { out };`,
         let growingBytesRead = 0;
         const harness = yield* makeWorkflowHarness({
           name: "oversized-script-path",
-          wrapFileSystem: (fsService) => ({
-            ...fsService,
-            open: (filePath, options) =>
-              fsService.open(filePath, options).pipe(
-                Effect.map((file) => {
-                  if (filePath === oversizedPath) {
-                    return {
-                      ...file,
-                      stat: file.stat,
-                      read: (buffer, readOptions) => {
-                        oversizedReadCalls += 1;
-                        return file.read(buffer, readOptions);
-                      },
-                      readAlloc: (size, readOptions) => {
-                        oversizedReadCalls += 1;
-                        return file.readAlloc(size, readOptions);
-                      },
-                    };
-                  }
-                  if (filePath === growingPath) {
-                    return {
-                      ...file,
-                      stat: file.stat.pipe(
-                        Effect.map((info) => ({ ...info, size: ByteSize.bytes(16) })),
-                      ),
-                      readAlloc: (size, readOptions) =>
-                        file.readAlloc(size, readOptions).pipe(
-                          Effect.tap((chunk) =>
-                            Effect.sync(() => {
-                              if (Option.isSome(chunk)) {
-                                growingBytesRead += chunk.value.byteLength;
-                              }
-                            }),
-                          ),
+          wrapScriptFileOpener: (openScriptFile) => (filePath) =>
+            openScriptFile(filePath).pipe(
+              Effect.map((file) => {
+                if (filePath === oversizedPath) {
+                  return {
+                    ...file,
+                    readChunk: (maxBytes) => {
+                      oversizedReadCalls += 1;
+                      return file.readChunk(maxBytes);
+                    },
+                  };
+                }
+                if (filePath === growingPath) {
+                  return {
+                    ...file,
+                    stat: file.stat.pipe(Effect.map((info) => ({ ...info, size: 16 }))),
+                    readChunk: (maxBytes) =>
+                      file.readChunk(maxBytes).pipe(
+                        Effect.tap((chunk) =>
+                          Effect.sync(() => {
+                            if (Option.isSome(chunk)) {
+                              growingBytesRead += chunk.value.byteLength;
+                            }
+                          }),
                         ),
-                    };
-                  }
-                  return file;
-                }),
-              ),
-          }),
+                      ),
+                  };
+                }
+                return file;
+              }),
+            ),
         });
 
         yield* Effect.gen(function* () {
@@ -4253,5 +4267,542 @@ return { out };`,
           ).toBe(true);
         }).pipe(Effect.provide(harness.layerToolkit));
       }),
+  );
+
+  it.effect(
+    "startup sweep ignores stray files and mismatched orphan directories while staying strict for SQL-active runs",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedBaseDir = yield* fs.realPath(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-stray-files-" }),
+        );
+        const sharedDbContext = yield* Layer.build(SqlitePersistence.layerMemory);
+        const databaseLayer = Layer.succeedContext(sharedDbContext);
+
+        const harness1 = yield* makeWorkflowHarness({
+          name: "stray-files-seed",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+        });
+
+        const workflowsDir = yield* Effect.gen(function* () {
+          const config = yield* ServerConfig.ServerConfig;
+          yield* fs.makeDirectory(config.workflowsDir, { recursive: true });
+          // Stray regular files (like Finder's .DS_Store) must not cause ENOTDIR during startup discovery.
+          yield* fs.writeFileString(path.join(config.workflowsDir, ".DS_Store"), "finder-meta");
+          yield* fs.writeFileString(path.join(config.workflowsDir, "README.txt"), "notes");
+          // Unrelated subdirectory without run.json.
+          yield* fs.makeDirectory(path.join(config.workflowsDir, "unrelated-dir"), {
+            recursive: true,
+          });
+          // Directory whose run.json has a mismatched runId.
+          const mismatchedDir = path.join(config.workflowsDir, "wf_wrongdir0001");
+          yield* fs.makeDirectory(mismatchedDir, { recursive: true });
+          yield* fs.writeFileString(
+            path.join(mismatchedDir, "run.json"),
+            JSON.stringify({
+              runId: "wf_otherid00001",
+              threadId: parentThreadId,
+              taskId: null,
+              name: "Mismatched",
+              scriptPath: path.join(mismatchedDir, "script.js"),
+              journalPath: path.join(mismatchedDir, "journal.jsonl"),
+              startedAt: 0,
+              status: "running",
+              usage: {
+                agents: 0,
+                done: 0,
+                errors: 0,
+                empty: 0,
+                cached: 0,
+                tokens: 0,
+                durationMs: 0,
+              },
+            }),
+          );
+          // Orphan directory whose run.json is itself a directory (unreadable orphan history).
+          yield* fs.makeDirectory(path.join(config.workflowsDir, "wf_orphanbad001", "run.json"), {
+            recursive: true,
+          });
+          return config.workflowsDir;
+        }).pipe(Effect.provide(harness1.layerToolkit));
+
+        const exit = yield* WorkflowService.recoverInterruptedWorkflows.pipe(
+          Effect.exit,
+          Effect.provide(harness1.layerToolkit),
+        );
+        expect(Exit.isSuccess(exit)).toBe(true);
+        // Mismatched orphan was ignored (not rewritten to failed).
+        const mismatchedRecord = JSON.parse(
+          yield* fs.readFileString(path.join(workflowsDir, "wf_wrongdir0001", "run.json")),
+        ) as { status: string };
+        expect(mismatchedRecord.status).toBe("running");
+
+        // SQL-active workflows stay strict: an unreadable run.json for an active SQL run must fail closed.
+        const activeRunId = "wf_sqlactive001";
+        const activeMetaPath = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const parentTurn = yield* startParentThreadAndRun(
+            harness1.turnQueue,
+            harness1.cwd,
+            "stray-active-strict",
+          );
+          const parentRun = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
+            (r) => r.id === parentTurn.turn.runId,
+          )!;
+          const activeDir = path.join(workflowsDir, activeRunId);
+          const scriptPath = path.join(activeDir, "script.js");
+          const metaPath = path.join(activeDir, "run.json");
+          yield* fs.makeDirectory(activeDir, { recursive: true });
+          yield* fs.writeFileString(
+            scriptPath,
+            `export const meta = { name: "StrictActive", description: "Active SQL run." }; return 1;`,
+          );
+          yield* fs.writeFileString(metaPath, "{}");
+          yield* orchestrator.dispatch({
+            type: "workflow.start",
+            commandId: CommandId.make("command:stray-active-strict:workflow-start"),
+            parentThreadId,
+            parentRunId: parentRun.id,
+            parentNodeId: parentRun.rootNodeId!,
+            title: "StrictActive",
+            description: "Active SQL run.",
+            modelSelection,
+            workflow: {
+              name: "StrictActive",
+              runHandles: { runId: activeRunId, scriptPath, transcriptDir: activeDir },
+              phases: [],
+              agents: [],
+            },
+          });
+          return metaPath;
+        }).pipe(Effect.provide(harness1.layerToolkit));
+
+        const strictHarness = yield* makeWorkflowHarness({
+          name: "stray-active-strict-recover",
+          databaseLayer,
+          baseDir: sharedBaseDir,
+          wrapFileSystem: (fsService) => ({
+            ...fsService,
+            readFileString: (filePath, encoding) =>
+              filePath === activeMetaPath
+                ? Effect.fail(
+                    PlatformError.systemError({
+                      _tag: "PermissionDenied",
+                      module: "FileSystem",
+                      method: "readFileString",
+                      description: "active run.json unreadable",
+                      pathOrDescriptor: filePath,
+                    }),
+                  )
+                : fsService.readFileString(filePath, encoding),
+          }),
+        });
+        const strictExit = yield* WorkflowService.recoverInterruptedWorkflows.pipe(
+          Effect.exit,
+          Effect.provide(strictHarness.layerToolkit),
+        );
+        expect(Exit.isFailure(strictExit)).toBe(true);
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "rejects non-regular scriptPath files (directories and FIFOs) without blocking and cancels in-flight nested script reads on stop",
+    () =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const tempDir = yield* fs.realPath(
+          yield* fs.makeTempDirectoryScoped({ prefix: "t3-workflow-special-script-" }),
+        );
+        const dirScriptPath = path.join(tempDir, "not-a-file");
+        yield* fs.makeDirectory(dirScriptPath, { recursive: true });
+
+        const isPosix = HostProcess.Platform.defaultValue() !== "win32";
+        const fifoPath = path.join(tempDir, "script.fifo");
+        if (isPosix) {
+          NodeChildProcess.execFileSync("mkfifo", [fifoPath]);
+        }
+
+        const slowNestedPath = path.join(tempDir, "slow-nested.js");
+        const readOpened = yield* Deferred.make<void>();
+        const readClosed = yield* Deferred.make<void>();
+
+        const harness = yield* makeWorkflowHarness({
+          name: "special-and-cancel-script-reads",
+          wrapScriptFileOpener: (openScriptFile) => (filePath) =>
+            filePath === slowNestedPath
+              ? Effect.acquireRelease(
+                  Deferred.succeed(readOpened, undefined).pipe(Effect.as("slow-handle")),
+                  () => Deferred.succeed(readClosed, undefined).pipe(Effect.asVoid),
+                ).pipe(
+                  Effect.as({
+                    stat: Effect.succeed({ isRegularFile: true, size: 128 }),
+                    readChunk: () => Effect.never,
+                  }),
+                )
+              : openScriptFile(filePath),
+        });
+
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* startParentThreadAndRun(
+            harness.turnQueue,
+            harness.cwd,
+            "special-and-cancel-script-reads",
+          );
+
+          // 1. Directory rejected immediately as non-regular in both top-level and nested workflow().
+          const dirTop = yield* callTool("t3_workflow_run", { scriptPath: dirScriptPath });
+          expect(declaredFailure(dirTop).code).toBe("invalid_request");
+          expect(declaredFailure(dirTop).message).toBe(
+            `Workflow script at ${dirScriptPath} must be a regular file.`,
+          );
+
+          const beforeDirNestedSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+          const dirNestedCall = yield* callTool("t3_workflow_run", {
+            script: `
+              export const meta = { name: "NestedDir", description: "Loads a directory." };
+              await workflow({ scriptPath: ${JSON.stringify(dirScriptPath)} });
+              return "unexpected";
+            `,
+          });
+          expect(dirNestedCall.isError).not.toBe(true);
+          const dirNestedStarted = yield* decodeRunResult(dirNestedCall.structuredContent);
+          const dirNestedTerminal = yield* awaitWorkflowTerminal(
+            dirNestedStarted.taskId,
+            beforeDirNestedSeq,
+          );
+          expect(dirNestedTerminal.status).toBe("failed");
+          expect(dirNestedTerminal.result).toContain(
+            `Workflow script at ${dirScriptPath} must be a regular file.`,
+          );
+
+          // 2. FIFO (named pipe) with no writer rejects immediately without blocking on POSIX.
+          if (isPosix) {
+            const fifoTop = yield* callTool("t3_workflow_run", { scriptPath: fifoPath });
+            expect(declaredFailure(fifoTop).code).toBe("invalid_request");
+            expect(declaredFailure(fifoTop).message).toBe(
+              `Workflow script at ${fifoPath} must be a regular file.`,
+            );
+
+            const beforeFifoNestedSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+            const fifoNestedCall = yield* callTool("t3_workflow_run", {
+              script: `
+                export const meta = { name: "NestedFifo", description: "Loads a FIFO." };
+                await workflow({ scriptPath: ${JSON.stringify(fifoPath)} });
+                return "unexpected";
+              `,
+            });
+            expect(fifoNestedCall.isError).not.toBe(true);
+            const fifoNestedStarted = yield* decodeRunResult(fifoNestedCall.structuredContent);
+            const fifoNestedTerminal = yield* awaitWorkflowTerminal(
+              fifoNestedStarted.taskId,
+              beforeFifoNestedSeq,
+            );
+            expect(fifoNestedTerminal.status).toBe("failed");
+            expect(fifoNestedTerminal.result).toContain(
+              `Workflow script at ${fifoPath} must be a regular file.`,
+            );
+          }
+
+          // 3. Stopping a workflow interrupts an in-flight nested script read and runs its release finalizer.
+          const beforeCancelSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+          const slowCall = yield* callTool("t3_workflow_run", {
+            script: `
+              export const meta = { name: "SlowNestedRead", description: "Cancels in-flight read." };
+              return await workflow({ scriptPath: ${JSON.stringify(slowNestedPath)} });
+            `,
+          });
+          expect(slowCall.isError).not.toBe(true);
+          const slowStarted = yield* decodeRunResult(slowCall.structuredContent);
+
+          yield* Deferred.await(readOpened);
+          expect(yield* Deferred.isDone(readClosed)).toBe(false);
+
+          const stopped = yield* callTool("t3_workflow_stop", { runId: slowStarted.runId });
+          expect(stopped.isError).not.toBe(true);
+
+          yield* Deferred.await(readClosed);
+          const cancelTerminal = yield* awaitWorkflowTerminal(slowStarted.taskId, beforeCancelSeq);
+          expect(cancelTerminal.status).toBe("cancelled");
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect.each(["first-child-fails", "both-children-fail"] as const)(
+    "deferred startup cleanup never lets a second child's unaccepted grandchild run resend (%s)",
+    (failureMode) =>
+      Effect.gen(function* () {
+        const fs = yield* FileSystem.FileSystem;
+        const path = yield* Path.Path;
+        const sharedBaseDir = yield* fs.realPath(
+          yield* fs.makeTempDirectoryScoped({ prefix: `t3-workflow-grandchild-${failureMode}-` }),
+        );
+        const sharedDbContext = yield* Layer.build(SqlitePersistence.layerMemory);
+        const databaseLayer = Layer.succeedContext(sharedDbContext);
+
+        const harness1 = yield* makeWorkflowHarness({
+          name: `grandchild-seed-${failureMode}`,
+          databaseLayer,
+          baseDir: sharedBaseDir,
+        });
+
+        const seededChildren = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const mcpService = yield* OrchestratorMcpService.OrchestratorMcpService;
+          const config = yield* ServerConfig.ServerConfig;
+          const parentTurn = yield* startParentThreadAndRun(
+            harness1.turnQueue,
+            harness1.cwd,
+            `grandchild-${failureMode}`,
+          );
+          const parentRun = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
+            (r) => r.id === parentTurn.turn.runId,
+          )!;
+
+          const runId = `wf_gc_${failureMode.replaceAll("-", "_")}`;
+          const dir = path.join(config.workflowsDir, runId);
+          const scriptPath = path.join(dir, "script.js");
+          const journalPath = path.join(dir, "journal.jsonl");
+          yield* fs.makeDirectory(dir, { recursive: true });
+          yield* fs.writeFileString(
+            scriptPath,
+            `export const meta = { name: "GrandchildGate", description: "Two children with grandchild." }; return 1;`,
+          );
+          yield* fs.writeFileString(journalPath, "");
+
+          const started = yield* orchestrator.dispatch({
+            type: "workflow.start",
+            commandId: CommandId.make(`command:gc-start:${runId}`),
+            parentThreadId,
+            parentRunId: parentRun.id,
+            parentNodeId: parentRun.rootNodeId!,
+            title: "GrandchildGate",
+            description: "Two children with grandchild.",
+            modelSelection,
+            workflow: {
+              name: "GrandchildGate",
+              runHandles: { runId, scriptPath, transcriptDir: dir },
+              phases: [],
+              agents: [],
+            },
+          });
+          const taskEvent = started.storedEvents.find(
+            (s) => s.event.type === "subagent.updated" && s.event.payload.origin === "app_owned",
+          );
+          if (taskEvent?.event.type !== "subagent.updated") {
+            throw new Error("missing workflow task");
+          }
+          const taskId = taskEvent.event.payload.id;
+
+          const child1 = yield* mcpService.delegateWorkflowAgent(parentScope, {
+            parentRunId: parentRun.id,
+            workflowNodeId: taskId,
+            requestKey: `${runId}:0`,
+            task: { task: "First child (cleanup fails)", title: "Child 1" },
+          });
+          yield* Queue.take(harness1.turnQueue);
+
+          const child2 = yield* mcpService.delegateWorkflowAgent(parentScope, {
+            parentRunId: parentRun.id,
+            workflowNodeId: taskId,
+            requestKey: `${runId}:1`,
+            task: { task: "Second child (delegates grandchild)", title: "Child 2" },
+          });
+          yield* Queue.take(harness1.turnQueue);
+
+          yield* fs.writeFileString(
+            path.join(dir, "run.json"),
+            JSON.stringify({
+              runId,
+              threadId: parentThreadId,
+              taskId,
+              name: "GrandchildGate",
+              scriptPath,
+              journalPath,
+              startedAt: 0,
+              status: "running",
+              usage: {
+                agents: 2,
+                done: 0,
+                errors: 0,
+                empty: 0,
+                cached: 0,
+                tokens: 0,
+                durationMs: 0,
+              },
+            }),
+          );
+          return {
+            runId,
+            taskId,
+            child1ThreadId: child1.childThreadId,
+            child1TaskId: child1.taskId,
+            child2ThreadId: child2.childThreadId,
+            child2TaskId: child2.taskId,
+          };
+        }).pipe(Effect.provide(harness1.layerToolkit));
+
+        // Seed child2's grandchild with runEffectWorker: false so its delegated run stays unaccepted (starting, startedAt: null).
+        const unacceptedGrandchildHarness = yield* makeWorkflowHarness({
+          name: `grandchild-unaccepted-${failureMode}`,
+          databaseLayer,
+          baseDir: sharedBaseDir,
+          runEffectWorker: false,
+        });
+        const grandchildThreadId = yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const child2Scope: McpInvocationContext.McpThreadInvocationScope = {
+            environmentId: EnvironmentId.make("environment:workflow-test"),
+            requestNamespace: `provider-session:${seededChildren.child2ThreadId}`,
+            thread: {
+              threadId: seededChildren.child2ThreadId,
+              providerSessionId: `provider-session:${seededChildren.child2ThreadId}`,
+              providerInstanceId: instanceId,
+            },
+            client: undefined,
+            capabilities: new Set(["orchestration"]),
+            issuedAt: 1,
+          };
+          const delegated = yield* callTool(
+            "delegate_task",
+            { task: "Unaccepted grandchild task", title: "Grandchild" },
+            child2Scope,
+          );
+          expect(delegated.isError).not.toBe(true);
+          const child2Projection = yield* orchestrator.getThreadProjection(
+            seededChildren.child2ThreadId,
+          );
+          const gcTask = child2Projection.subagents.find(
+            (s) => s.origin === "app_owned" && s.childThreadId !== null,
+          );
+          if (gcTask?.childThreadId == null) {
+            throw new Error("missing grandchild task");
+          }
+          const gcProjection = yield* orchestrator.getThreadProjection(gcTask.childThreadId);
+          expect(gcProjection.runs).toHaveLength(1);
+          expect(gcProjection.runs[0]?.status).toBe("starting");
+          expect(gcProjection.runs[0]?.startedAt).toBeNull();
+          return gcTask.childThreadId;
+        }).pipe(Effect.provide(unacceptedGrandchildHarness.layerToolkit));
+
+        // Restart phase 1: workflow sweep runs; child1 fails cleanup (and optionally child2 too), forcing deferred cleanup.
+        const attemptFinished = yield* Queue.unbounded<void>();
+        let waitingChild2Confirm = false;
+        const preRecoveryHarness = yield* makeWorkflowHarness({
+          name: `grandchild-pre-${failureMode}`,
+          databaseLayer,
+          baseDir: sharedBaseDir,
+          runEffectWorker: false,
+          continueThreadsAfterServerUpdate: true,
+          wrapThreadManagement: (tm) => ({
+            ...tm,
+            getThreadRecords: ((threadId, fields, filter) =>
+              tm.getThreadRecords(threadId, fields, filter).pipe(
+                Effect.tap(() => {
+                  if (
+                    failureMode === "first-child-fails" &&
+                    waitingChild2Confirm &&
+                    threadId === seededChildren.child2ThreadId
+                  ) {
+                    waitingChild2Confirm = false;
+                    return Queue.offer(attemptFinished, undefined);
+                  }
+                  return Effect.void;
+                }),
+              )) as typeof tm.getThreadRecords,
+            cancelDelegatedTask: (input) => {
+              const shouldFail =
+                input.taskId === seededChildren.child1TaskId ||
+                (failureMode === "both-children-fail" &&
+                  input.taskId === seededChildren.child2TaskId);
+              if (shouldFail) {
+                const notify =
+                  failureMode === "both-children-fail" &&
+                  input.taskId === seededChildren.child2TaskId
+                    ? Queue.offer(attemptFinished, undefined)
+                    : Effect.void;
+                return notify.pipe(
+                  Effect.andThen(
+                    Effect.fail(
+                      new Orchestrator.OrchestratorDispatchError({
+                        commandId: input.command.commandId,
+                        commandType: input.command.type,
+                        cause: "child stop temporarily unavailable",
+                      }),
+                    ),
+                  ),
+                );
+              }
+              return tm.cancelDelegatedTask(input).pipe(
+                Effect.tap(() =>
+                  Effect.sync(() => {
+                    if (
+                      failureMode === "first-child-fails" &&
+                      input.parentThreadId === seededChildren.child2ThreadId
+                    ) {
+                      waitingChild2Confirm = true;
+                    }
+                  }),
+                ),
+              );
+            },
+          }),
+        });
+
+        yield* Effect.gen(function* () {
+          const sweepFiber = yield* WorkflowService.recoverInterruptedWorkflows.pipe(
+            Effect.forkScoped,
+          );
+          for (const delay of [50, 100, 200, 400, 800]) {
+            yield* Queue.take(attemptFinished);
+            yield* TestClock.adjust(`${delay} millis`);
+          }
+          yield* Queue.take(attemptFinished);
+          yield* Fiber.join(sweepFiber);
+
+          // When only child1 failed, child2 and grandchild must already have been attempted/stopped.
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          if (failureMode === "first-child-fails") {
+            const gcAfterSweep = yield* orchestrator.getThreadProjection(grandchildThreadId);
+            expect(
+              gcAfterSweep.runs.every(
+                (run) => run.status === "cancelled" || run.status === "interrupted",
+              ),
+            ).toBe(true);
+          }
+        }).pipe(Effect.provide(preRecoveryHarness.layerToolkit));
+
+        // Restart phase 2: provider recovery runs with continueThreadsAfterServerUpdate enabled.
+        // The unaccepted grandchild run must NEVER be resent.
+        const postRecoveryHarness = yield* makeWorkflowHarness({
+          name: `grandchild-post-${failureMode}`,
+          databaseLayer,
+          baseDir: sharedBaseDir,
+          recoverOnStartup: true,
+          continueThreadsAfterServerUpdate: true,
+          runEffectWorker: true,
+          runContinuationWorker: true,
+        });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const gcAfterRecovery = yield* orchestrator.getThreadProjection(grandchildThreadId);
+          expect(
+            gcAfterRecovery.runs.every(
+              (run) => run.status === "cancelled" || run.status === "interrupted",
+            ),
+          ).toBe(true);
+          expect(
+            gcAfterRecovery.runs.some((run) => run.restartContinuationOfRunId !== undefined),
+          ).toBe(false);
+          const gcTurns = (yield* Ref.get(postRecoveryHarness.startedTurns)).filter(
+            (t) => t.turn.threadId === grandchildThreadId,
+          );
+          expect(gcTurns).toHaveLength(0);
+        }).pipe(Effect.provide(postRecoveryHarness.layerToolkit));
+      }).pipe(Effect.provide(NodeServices.layer)),
   );
 });
