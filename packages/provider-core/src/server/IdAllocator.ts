@@ -137,6 +137,16 @@ export interface IdAllocatorV2Derive {
   readonly delegatedTaskThread: (input: { readonly commandId: CommandId }) => ThreadId;
   readonly delegatedTaskMessage: (input: { readonly commandId: CommandId }) => MessageId;
   readonly delegatedTaskTurnItem: (input: { readonly commandId: CommandId }) => TurnItemId;
+  readonly workflowCoordinatorThread: (input: { readonly commandId: CommandId }) => ThreadId;
+  readonly workflowCoordinatorRootNode: (input: {
+    readonly coordinatorThreadId: ThreadId;
+  }) => NodeId;
+  readonly workflowCoordinatorScriptMessage: (input: {
+    readonly coordinatorThreadId: ThreadId;
+  }) => MessageId;
+  readonly workflowCoordinatorScriptTurnItem: (input: {
+    readonly coordinatorThreadId: ThreadId;
+  }) => TurnItemId;
   readonly createdThreadTurnItem: (input: { readonly commandId: CommandId }) => TurnItemId;
   readonly threadFromProviderThread: (input: {
     readonly driver: ProviderDriverKind;
@@ -288,6 +298,16 @@ export const derive: IdAllocatorV2Derive = {
     MessageId.make(joinId("message", "delegated-task", input.commandId)),
   delegatedTaskTurnItem: (input) =>
     TurnItemId.make(joinId("turn-item", "delegated-task", input.commandId)),
+  workflowCoordinatorThread: (input) =>
+    ThreadId.make(joinId("thread", "workflow-coordinator", input.commandId)),
+  workflowCoordinatorRootNode: (input) =>
+    NodeId.make(joinId("node", "workflow-coordinator", input.coordinatorThreadId, "root")),
+  workflowCoordinatorScriptMessage: (input) =>
+    MessageId.make(joinId("message", "workflow-coordinator", input.coordinatorThreadId, "script")),
+  workflowCoordinatorScriptTurnItem: (input) =>
+    TurnItemId.make(
+      joinId("turn-item", "workflow-coordinator", input.coordinatorThreadId, "script"),
+    ),
   createdThreadTurnItem: (input) =>
     TurnItemId.make(joinId("turn-item", "created-thread", input.commandId)),
   threadFromProviderThread: deriveThreadFromProviderThread,
