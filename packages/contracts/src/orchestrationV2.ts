@@ -613,11 +613,14 @@ export const isDelegatedAppThread = (
   // MCP-launched threads store `delegatedFrom: null` at runtime, so check both absent shapes.
   thread.lineage.relationshipToParent === "subagent" || thread.delegatedFrom != null;
 
-/** Provider-native children cannot receive messages; T3 delegate_task children can. */
+/** Provider-native and server-workflow coordinator children cannot receive messages; T3 delegate_task children can. */
 export function isProviderNativeSubagentThread(
   thread: Pick<OrchestrationV2AppThread, "lineage" | "creationSource">,
 ): boolean {
-  return thread.lineage.relationshipToParent === "subagent" && thread.creationSource === "provider";
+  return (
+    thread.lineage.relationshipToParent === "subagent" &&
+    (thread.creationSource === "provider" || thread.creationSource === "server")
+  );
 }
 
 export const IDLE_COMPACTION_TEXT = "/compact";
@@ -971,6 +974,10 @@ export const OrchestrationV2WorkflowAgent = Schema.Struct({
   completedAt: Schema.optional(NonNegativeInt),
   prompt: Schema.optional(Schema.NonEmptyString),
   result: Schema.optional(Schema.NonEmptyString),
+  /** Why a failed member failed. */
+  error: Schema.optional(Schema.NonEmptyString),
+  /** Replayed from a prior run's journal rather than executed fresh. */
+  cached: Schema.optional(Schema.Literal(true)),
 });
 export type OrchestrationV2WorkflowAgent = typeof OrchestrationV2WorkflowAgent.Type;
 
@@ -978,14 +985,26 @@ export const OrchestrationV2WorkflowRunHandles = Schema.Struct({
   runId: Schema.optional(TrimmedNonEmptyString),
   transcriptDir: Schema.optional(TrimmedNonEmptyString),
   scriptPath: Schema.optional(TrimmedNonEmptyString),
+  journalPath: Schema.optional(TrimmedNonEmptyString),
 });
 export type OrchestrationV2WorkflowRunHandles = typeof OrchestrationV2WorkflowRunHandles.Type;
+
+export const OrchestrationV2WorkflowLimits = Schema.Struct({
+  tokenBudget: Schema.optional(PositiveInt),
+  concurrency: Schema.optional(PositiveInt),
+  maxAgents: Schema.optional(PositiveInt),
+});
+export type OrchestrationV2WorkflowLimits = typeof OrchestrationV2WorkflowLimits.Type;
 
 export const OrchestrationV2SubagentWorkflow = Schema.Struct({
   name: Schema.optional(TrimmedNonEmptyString),
   runHandles: Schema.optional(OrchestrationV2WorkflowRunHandles),
   phases: Schema.Array(OrchestrationV2WorkflowPhase),
   agents: Schema.Array(OrchestrationV2WorkflowAgent),
+  /** Newest narrator/log lines, oldest first (bounded on the wire). */
+  logs: Schema.optional(Schema.Array(Schema.String)),
+  /** Display-only limits effective for this run. */
+  limits: Schema.optional(OrchestrationV2WorkflowLimits),
   totalTokens: Schema.optional(NonNegativeInt),
   toolCalls: Schema.optional(NonNegativeInt),
   durationMs: Schema.optional(NonNegativeInt),
@@ -3928,9 +3947,8 @@ const OrchestrationV2InternalCommand = Schema.Union([
     ),
   }),
   /**
-   * Records a server workflow run on its parent: an app-owned task with no child thread,
-   * its node and its turn item. Its agents are delegated tasks under its node, and the
-   * workflow engine reports its progress and result. The ids derive from `commandId`.
+   * Records a server workflow run on its parent and creates its read-only coordinator thread C
+   * (with its runless root node and script opening message). The ids derive from `commandId`.
    */
   Schema.Struct({
     type: Schema.Literal("workflow.start"),
@@ -3940,8 +3958,46 @@ const OrchestrationV2InternalCommand = Schema.Union([
     parentNodeId: NodeId,
     title: TrimmedNonEmptyString,
     description: Schema.String,
+    /** Workflow script stored on coordinator thread C as its opening script message. */
+    scriptText: Schema.optional(Schema.String),
     modelSelection: ModelSelection,
     workflow: OrchestrationV2SubagentWorkflow,
+  }),
+  /**
+   * Creates a server workflow's member agent under coordinator thread C (no turn item on C).
+   * Liveness is gated on P's workflow row. With `deferStart`, creates the member thread and
+   * pending row without starting a run yet; `workflow.agent.start` starts it once admitted.
+   */
+  Schema.Struct({
+    type: Schema.Literal("workflow.agent.request"),
+    ...OrchestrationV2CreationFields,
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    task: TrimmedNonEmptyString,
+    title: Schema.optional(TrimmedNonEmptyString),
+    modelSelection: ModelSelection,
+    runtimeMode: RuntimeMode,
+    interactionMode: ProviderInteractionMode,
+    workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
+    /** Asks the child's first run for a result as data matching this JSON Schema. */
+    outputSchema: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
+    deferStart: Schema.optional(Schema.Boolean),
+    createdAt: Schema.optional(Schema.DateTimeUtc),
+  }),
+  /**
+   * Admits a queued workflow member created with `deferStart` and starts its first run under P's
+   * liveness gate.
+   */
+  Schema.Struct({
+    type: Schema.Literal("workflow.agent.start"),
+    ...OrchestrationV2CreationFields,
+    commandId: CommandId,
+    parentThreadId: ThreadId,
+    taskId: NodeId,
+    childThreadId: ThreadId,
+    workspaceStrategy: Schema.optional(OrchestrationV2ThreadLaunchWorkspaceStrategy),
+    outputSchema: Schema.optional(Schema.Record(Schema.String, Schema.Json)),
+    createdAt: Schema.optional(Schema.DateTimeUtc),
   }),
   /** Replaces a running workflow's progress; `progress` is its newest narrator line. */
   Schema.Struct({

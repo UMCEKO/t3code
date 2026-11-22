@@ -12,6 +12,7 @@ import {
   TrimmedNonEmptyString,
 } from "./index.ts";
 import {
+  isProviderNativeSubagentThread,
   latestProviderTurnForAttempt,
   OrchestrationV2CheckpointFileSummary,
   repositoryRewindCheckpoint,
@@ -743,5 +744,113 @@ describe("withMessageSenderNote", () => {
     [{ createdBy: "agent", creationSource: "server" }, "Hi", "Hi"],
   ] as const)("labels %j's message %j for the provider", (message, text, expected) => {
     expect(withMessageSenderNote(message, text)).toBe(expected);
+  });
+});
+
+describe("isProviderNativeSubagentThread", () => {
+  const lineage = (relationshipToParent: "fork" | "subagent" | null) => ({
+    parentThreadId: relationshipToParent === null ? null : ThreadId.make("parent-1"),
+    relationshipToParent,
+    rootThreadId: ThreadId.make("parent-1"),
+  });
+
+  it("matches provider- and server-created subagents but not MCP delegated children or root threads", () => {
+    expect(
+      isProviderNativeSubagentThread({
+        lineage: lineage("subagent"),
+        creationSource: "provider",
+      }),
+    ).toBe(true);
+    expect(
+      isProviderNativeSubagentThread({
+        lineage: lineage("subagent"),
+        creationSource: "server",
+      }),
+    ).toBe(true);
+    expect(
+      isProviderNativeSubagentThread({
+        lineage: lineage("subagent"),
+        creationSource: "mcp",
+      }),
+    ).toBe(false);
+    expect(
+      isProviderNativeSubagentThread({
+        lineage: lineage(null),
+        creationSource: "server",
+      }),
+    ).toBe(false);
+  });
+});
+
+describe("workflow subagent additive fields", () => {
+  it("decodes error, cached, logs, limits, and journalPath on OrchestrationV2Subagent", () => {
+    const decoded = decodeOrchestrationV2Subagent({
+      id: "node-wf-1",
+      threadId: "thread-p",
+      runId: "run-1",
+      parentNodeId: "node-root",
+      origin: "app_owned",
+      createdBy: "agent",
+      driver: "claudeAgent",
+      providerInstanceId: "claudeAgent",
+      providerThreadId: null,
+      childThreadId: "thread-c",
+      nativeTaskRef: null,
+      prompt: 'export const meta = { name: "Audit", description: "Audit code" };',
+      title: "Audit code",
+      model: "claude-sonnet-4-6",
+      status: "running",
+      workflow: {
+        name: "Audit",
+        runHandles: {
+          runId: "wf_1234",
+          transcriptDir: "/tmp/wf_1234",
+          scriptPath: "/tmp/wf_1234/script.js",
+          journalPath: "/tmp/wf_1234/journal.jsonl",
+        },
+        phases: [{ index: 0, title: "Scan" }],
+        agents: [
+          {
+            index: 0,
+            label: "Scanner",
+            state: "queued",
+            phaseIndex: 0,
+          },
+          {
+            index: 1,
+            label: "Reviewer",
+            state: "completed",
+            cached: true,
+          },
+          {
+            index: 2,
+            label: "Broken",
+            state: "failed",
+            error: "Provider is not authenticated",
+          },
+        ],
+        logs: ["Starting scan", "Queued 3 agents"],
+        limits: {
+          tokenBudget: 50_000,
+          concurrency: 4,
+          maxAgents: 1000,
+        },
+      },
+      result: null,
+      startedAt: now,
+      completedAt: null,
+      updatedAt: now,
+    });
+
+    expect(decoded.workflow?.runHandles?.journalPath).toBe("/tmp/wf_1234/journal.jsonl");
+    expect(decoded.workflow?.logs).toEqual(["Starting scan", "Queued 3 agents"]);
+    expect(decoded.workflow?.limits).toEqual({
+      tokenBudget: 50_000,
+      concurrency: 4,
+      maxAgents: 1000,
+    });
+    expect(decoded.workflow?.agents[0]?.state).toBe("queued");
+    expect(decoded.workflow?.agents[1]?.cached).toBe(true);
+    expect(decoded.workflow?.agents[2]?.error).toBe("Provider is not authenticated");
   });
 });
