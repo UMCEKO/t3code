@@ -328,6 +328,7 @@ export const meta = {
   name: "audit-modules",
   description: "Review modules in parallel and summarize findings",
   phases: [{ title: "Review" }, { title: "Summarize" }],
+  concurrency: 4,
 };
 
 phase("Review");
@@ -352,7 +353,8 @@ return await agent(`Combine these findings:\n${JSON.stringify(findings)}`, {
 });
 ```
 
-Scripts start with a literal `export const meta = { name, description, phases? }` header
+Scripts start with a literal
+`export const meta = { name, description, phases?, concurrency? }` header
 followed by plain JavaScript with top-level `await` and `return`. Available hooks are
 `agent(prompt, opts?)`, `parallel(thunks)`, `pipeline(items, ...stages)`, `phase(title)`,
 `log(message)`, `args`, `budget`, and `workflow({ scriptPath }, args?)` (one level deep).
@@ -364,19 +366,30 @@ thread's provider by default or overriding it with `target`, `model`, or `effort
 supports structured output via `schema` on every provider. Because the server owns the
 workflow, its agents keep running after the calling turn ends.
 
-Track progress and open individual agent threads from **Lineage** on web and desktop or
-**Agents** on mobile. Stop a running workflow from its stop control, by stopping the
-thread, or by asking an agent to call `t3_workflow_stop`; stopping a workflow cancels its
-active agents without stopping the thread. To resume a stopped or failed run, edit the
+A server workflow opens like a Claude Code workflow. The parent thread shows one
+workflow card in the timeline and one workflow row in **Lineage** (web and desktop) or
+**Agents** (mobile). Clicking the card or row opens the workflow's read-only coordinator
+thread beside your thread, showing the headline, phases, every member with its own
+provider icon, `Cached` replay badges, failure reasons, the final result, collapsible
+logs, token budget and concurrency limits, script and journal paths, the script itself,
+and a **Stop** control. Clicking any member opens that agent's own thread (where you can
+also send follow-up messages after it finishes). Stop a running workflow from the
+coordinator opening, from **Lineage** / **Agents**, by stopping the parent thread, or by
+asking an agent to call `t3_workflow_stop`; stopping a workflow cancels its active
+agents without stopping the parent thread. To resume a stopped or failed run, edit the
 saved script file and ask the agent to resume from the previous run ID (`resumeFromRunId`
 with `scriptPath`): the longest unchanged prefix of `agent()` calls replays from the
 run's journal (calls stopped by a usage limit rerun without breaking replay), and later
 calls run live.
 
-Limits per run: at most 1,000 `agent()` calls, at most 4,096 items per `parallel()` or
-`pipeline()` call, and at most `min(16, cpus - 2)` concurrent agents (excess calls queue).
-Exceeding a total cap fails the run explicitly. If the server restarts while a workflow is
-running, that run ends as failed on startup so you can resume it from its run ID.
+Admission and limits: scripts never declare an agent count—just call `agent()` as often
+as needed (up to the safety cap of 1,000 `agent()` calls per run and 4,096 items per
+`parallel()` or `pipeline()` call). Every `agent()` call creates its member immediately
+as `queued`, and the server admits queued members in strict FIFO call order up to the
+concurrency limit set by `t3_workflow_run`'s `concurrency` argument, `meta.concurrency`,
+or the default `min(16, cpus - 2)`. Exceeding a total cap or `tokenBudget` fails the run
+explicitly. If the server restarts while a workflow is running, that run ends as failed
+on startup so you can resume it from its run ID.
 
 ## Open a thread beside the one you are in
 
