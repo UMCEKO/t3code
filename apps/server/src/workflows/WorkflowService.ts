@@ -1143,6 +1143,16 @@ function countAgentStates(agents: Iterable<OrchestrationV2WorkflowAgent>): {
   return { queued, running, completed, failed };
 }
 
+function liveFailures(agents: Iterable<OrchestrationV2WorkflowAgent>): {
+  readonly failures?: NonNullable<OrchestratorMcpWorkflowStatusResult["failures"]>;
+} {
+  const failures = [...agents]
+    .filter((agent) => agent.state === "failed" && agent.result !== undefined)
+    .toSorted((a, b) => a.index - b.index)
+    .map((agent) => ({ index: agent.index, label: agent.label, error: agent.result! }));
+  return failures.length === 0 ? {} : { failures };
+}
+
 function createJournalStatusAccumulator(persisted: PersistedWorkflowRun) {
   const phases: Array<OrchestrationV2WorkflowPhase> = [...(persisted.phases ?? [])];
   const phaseIndexByTitle = new Map<string, number>(phases.map((p) => [p.title, p.index] as const));
@@ -1159,6 +1169,8 @@ function createJournalStatusAccumulator(persisted: PersistedWorkflowRun) {
   const logs: Array<string> = [];
   const startedIndices = new Set<number>();
   const resultOutcomeByIndex = new Map<number, "ok" | "null" | "usage_limited" | "cancelled">();
+  const labelByIndex = new Map<number, string>();
+  const errorByIndex = new Map<number, string>();
 
   return {
     push: (entry: JournalEntry): void => {
@@ -1173,10 +1185,13 @@ function createJournalStatusAccumulator(persisted: PersistedWorkflowRun) {
           break;
         case "started":
           startedIndices.add(entry.index);
+          labelByIndex.set(entry.index, entry.label);
           if (entry.phase !== null) ensurePhase(entry.phase);
           break;
         case "result":
           resultOutcomeByIndex.set(entry.index, entry.outcome);
+          if (entry.error === undefined) errorByIndex.delete(entry.index);
+          else errorByIndex.set(entry.index, entry.error);
           break;
         case "end":
           break;
@@ -1208,6 +1223,17 @@ function createJournalStatusAccumulator(persisted: PersistedWorkflowRun) {
         phases,
         ...(currentPhase === undefined ? {} : { currentPhase }),
         agents: { queued: 0, running, completed, failed },
+        ...(errorByIndex.size === 0
+          ? {}
+          : {
+              failures: [...errorByIndex]
+                .toSorted(([a], [b]) => a - b)
+                .map(([index, error]) => ({
+                  index,
+                  ...(labelByIndex.has(index) ? { label: labelByIndex.get(index)! } : {}),
+                  error,
+                })),
+            }),
         logs,
         usage: persisted.usage,
         ...(persisted.result === undefined ? {} : { result: persisted.result }),
@@ -3465,6 +3491,7 @@ const make = Effect.gen(function* () {
                 phases: [...phases],
                 ...(currentPhase === undefined ? {} : { currentPhase }),
                 agents: countAgentStates(agentsByIndex.values()),
+                ...liveFailures(agentsByIndex.values()),
                 logs: [...logs],
                 usage: buildUsage(nowMs),
                 ...(finalResult === undefined ? {} : { result: finalResult }),
@@ -3853,11 +3880,17 @@ const make = Effect.gen(function* () {
               liveRecord.resultJournaled = true;
               const failedAt = yield* Clock.currentTimeMillis;
               usage.errors += 1;
+              const reason = previewText(
+                Result.isFailure(resolvedTarget)
+                  ? resolvedTarget.failure.message
+                  : resolvedModelSelection.failure.message,
+              );
               agentsByIndex.set(call.index, {
                 ...agentsByIndex.get(call.index)!,
                 state: "failed",
                 completedAt: failedAt,
                 durationMs: Math.max(0, failedAt - queuedAt),
+                ...(reason === undefined ? {} : { result: reason }),
               });
               yield* appendJournal({
                 type: "started",
@@ -3874,6 +3907,7 @@ const make = Effect.gen(function* () {
                 key,
                 outcome: "null",
                 value: null,
+                ...(reason === undefined ? {} : { error: reason }),
               });
               signalProgressSync();
               yield* flushJournal;
@@ -3935,11 +3969,13 @@ const make = Effect.gen(function* () {
               liveRecord.resultJournaled = true;
               const failedAt = yield* Clock.currentTimeMillis;
               usage.errors += 1;
+              const reason = previewText(delegated.failure.message);
               agentsByIndex.set(call.index, {
                 ...agentsByIndex.get(call.index)!,
                 state: "failed",
                 completedAt: failedAt,
                 durationMs: Math.max(0, failedAt - queuedAt),
+                ...(reason === undefined ? {} : { result: reason }),
               });
               yield* appendJournal({
                 type: "started",
@@ -3956,6 +3992,7 @@ const make = Effect.gen(function* () {
                 key,
                 outcome: "null",
                 value: null,
+                ...(reason === undefined ? {} : { error: reason }),
               });
               signalProgressSync();
               yield* flushJournal;
@@ -4006,6 +4043,7 @@ const make = Effect.gen(function* () {
               readonly countAs: "done" | "error" | "empty";
               readonly model?: string | undefined;
               readonly tokens: number;
+              readonly error?: string | undefined;
             }) {
               liveRecord.resultJournaled = true;
               const completedAt = yield* Clock.currentTimeMillis;
@@ -4014,7 +4052,9 @@ const make = Effect.gen(function* () {
               else if (finish.countAs === "error") usage.errors += 1;
               else usage.empty += 1;
 
-              const resultPreview = previewValue(finish.value);
+              const errorPreview =
+                finish.state === "failed" ? previewText(finish.error) : undefined;
+              const resultPreview = previewValue(finish.value) ?? errorPreview;
               const currentAgent = agentsByIndex.get(call.index)!;
               const resolvedModel = finish.model?.trim() || currentAgent.model;
               agentsByIndex.set(call.index, {
@@ -4038,6 +4078,7 @@ const make = Effect.gen(function* () {
                   key,
                   outcome: finish.outcome,
                   value: finish.value,
+                  ...(errorPreview === undefined ? {} : { error: errorPreview }),
                 });
               }
               signalProgressSync();
@@ -4108,6 +4149,10 @@ const make = Effect.gen(function* () {
                 countAs: "error",
                 model: initialSnapshot.model,
                 tokens: initialTokens,
+                error:
+                  rootFailure?.message ??
+                  settledTask?.result ??
+                  `Agent ended ${initialRun?.status ?? settledTask?.status ?? "without a result"}.`,
               });
             }
 
@@ -4180,6 +4225,7 @@ const make = Effect.gen(function* () {
                   countAs: "error",
                   model: currentSnapshot.model,
                   tokens: sumThreadTokens(currentSnapshot.providerTurns),
+                  error: `Result did not match the schema after ${MAX_SCHEMA_REPROMPTS} re-prompts: ${formatOutputRejection(checked.failure)}`,
                 });
               }
 
@@ -4258,6 +4304,7 @@ const make = Effect.gen(function* () {
                   countAs: "error",
                   model: currentSnapshot.model,
                   tokens: sumThreadTokens(currentSnapshot.providerTurns),
+                  error: `Could not re-prompt the agent: ${errorMessage(sent.failure)}`,
                 });
               }
 
@@ -4340,6 +4387,9 @@ const make = Effect.gen(function* () {
                   countAs: "error",
                   model: currentSnapshot.model,
                   tokens: sumThreadTokens(currentSnapshot.providerTurns),
+                  error:
+                    rootFailure?.message ??
+                    `Re-prompt run ended ${currentRun?.status ?? "without a result"}.`,
                 });
               }
             }

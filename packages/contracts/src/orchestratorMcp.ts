@@ -1070,6 +1070,16 @@ export const OrchestratorMcpWorkflowStatusResult = Schema.Struct({
     completed: NonNegativeInt,
     failed: NonNegativeInt,
   }),
+  /** Why each failed agent failed, when the run recorded a reason. */
+  failures: Schema.optional(
+    Schema.Array(
+      Schema.Struct({
+        index: NonNegativeInt,
+        label: Schema.optional(Schema.String),
+        error: Schema.String,
+      }),
+    ),
+  ),
   /** The newest narrator lines from `log()`, oldest first. */
   logs: Schema.Array(Schema.String),
   usage: OrchestratorMcpWorkflowUsage,

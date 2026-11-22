@@ -53,6 +53,8 @@ export type JournalEntry =
       readonly outcome: "ok" | "null" | "usage_limited" | "cancelled";
       readonly value: unknown;
       readonly cached?: true;
+      /** Why the agent failed, when it did. */
+      readonly error?: string;
     }
   | { readonly type: "phase"; readonly title: string }
   | { readonly type: "log"; readonly message: string }
@@ -219,7 +221,8 @@ function isJournalEntry(value: unknown): value is JournalEntry {
           record.outcome === "null" ||
           record.outcome === "usage_limited" ||
           record.outcome === "cancelled") &&
-        (record.cached === undefined || record.cached === true)
+        (record.cached === undefined || record.cached === true) &&
+        (record.error === undefined || typeof record.error === "string")
       );
     case "phase":
       return typeof record.title === "string";
