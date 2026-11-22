@@ -255,14 +255,23 @@ describe("workflow member rows", () => {
     ).toMatchObject({ model: "Opus 5.5", effort: "Extra High" });
   });
 
-  it("shows a failed agent's error under its prompt", () => {
-    const [failed] = workflowRailOf([
+  it("shows a failed agent's error under its prompt, preferring explicit error over result", () => {
+    const [fromResult, fromError] = workflowRailOf([
       agent(1, 0, "failed", { prompt: "Update session store", result: "Type error" }),
+      agent(2, 0, "failed", {
+        prompt: "Run checks",
+        result: "Partial output",
+        error: "Provider is not authenticated",
+      }),
     ])[0]!.members;
 
-    expect(workflowMemberDetail(failed!)).toEqual({
+    expect(workflowMemberDetail(fromResult!)).toEqual({
       detail: "Update session store",
       error: "Type error",
+    });
+    expect(workflowMemberDetail(fromError!)).toEqual({
+      detail: "Run checks",
+      error: "Provider is not authenticated",
     });
   });
 });
@@ -351,7 +360,10 @@ describe("resolveSubagentStopTarget", () => {
     expect(
       resolveSubagentStopTarget({ ...stopAgent, childThreadId: null, workflow, status: "waiting" }),
     ).toBeNull();
-    expect(resolveSubagentStopTarget({ ...stopAgent, workflow })).toBeNull();
+    expect(resolveSubagentStopTarget({ ...stopAgent, workflow })).toEqual({
+      kind: "workflow",
+      input: { threadId: stopAgent.threadId, subagentId: stopAgent.id },
+    });
     expect(resolveSubagentStopTarget({ ...native, workflow, nativeTaskRef: null })).toBeNull();
     expect(
       resolveSubagentStopTarget({
