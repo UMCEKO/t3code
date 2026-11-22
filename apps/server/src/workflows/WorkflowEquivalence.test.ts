@@ -576,7 +576,7 @@ const runClaudeWorkflowFixture = Effect.gen(function* () {
           listPermissionRules: Effect.die("unexpected permission rules read"),
           stopTask: () => Effect.void,
           interrupt: Effect.void,
-          close: Queue.end(sdkMessages).pipe(Effect.asVoid),
+          close: Effect.void,
         }),
       forkSession: () => Effect.die("unused"),
       subagentLaunchToolUseId: () => Effect.succeed(null),

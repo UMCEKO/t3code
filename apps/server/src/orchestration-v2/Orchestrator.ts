@@ -10858,7 +10858,7 @@ const makeOrchestrator = Effect.fn("orchestrationV2.Orchestrator.layer")(functio
   });
 
   const mirrorWorkflowCoordinatorRootNode = Effect.fnUntraced(function* (input: {
-    readonly command: Pick<OrchestrationV2ServerCommand, "commandId" | "type">;
+    readonly command: OrchestrationV2ServerCommand;
     readonly events: Ref.Ref<Array<OrchestrationV2DomainEvent>>;
     readonly task: OrchestrationV2Subagent;
     readonly status: OrchestrationV2ExecutionNode["status"];

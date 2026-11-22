@@ -47,7 +47,12 @@ export const readContainedWorkflowFile = Effect.fn("orchestration.readContainedW
     for (const candidate of candidateRoots) {
       const resolvedRoot = yield* Effect.tryPromise({
         try: () => NodeFSP.realpath(candidate),
-        catch: (cause) => cause,
+        catch: (cause) =>
+          new OrchestrationWorkflowFileError({
+            reason: "root-unavailable",
+            path: candidate,
+            cause,
+          }),
       }).pipe(Effect.result);
       if (resolvedRoot._tag === "Success") {
         resolvedRoots.push(resolvedRoot.success);
