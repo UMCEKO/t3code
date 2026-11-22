@@ -236,7 +236,11 @@ describe("ThreadWorkflowOpening", () => {
         providerThreadId: null,
         childThreadId: COORDINATOR_THREAD_ID,
         nativeTaskRef: isNative
-          ? { driver: "claudeAgent", nativeId: "native-task", strength: "strong" }
+          ? {
+              driver: ProviderDriverKind.make("claudeAgent"),
+              nativeId: "native-task",
+              strength: "strong",
+            }
           : null,
         prompt: script,
         title: "Checks all packages",
