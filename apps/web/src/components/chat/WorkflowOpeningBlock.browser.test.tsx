@@ -123,7 +123,11 @@ function buildOpening(origin: OrchestrationV2Subagent["origin"]) {
     providerThreadId: null,
     childThreadId: COORDINATOR_THREAD_ID,
     nativeTaskRef: isNative
-      ? { driver: "claudeAgent", nativeId: "native-wf-task", strength: "strong" }
+      ? {
+          driver: ProviderDriverKind.make("claudeAgent"),
+          nativeId: "native-wf-task",
+          strength: "strong",
+        }
       : null,
     prompt: LONG_SCRIPT,
     title: "Checks modules across providers.",

@@ -45,7 +45,11 @@ function makeWorkflowCard(origin: OrchestrationV2Subagent["origin"]) {
     childThreadId: COORDINATOR_THREAD_ID,
     nativeTaskRef:
       origin === "provider_native"
-        ? { driver: "claudeAgent", nativeId: "task-native", strength: "strong" }
+        ? {
+            driver: ProviderDriverKind.make("claudeAgent"),
+            nativeId: "task-native",
+            strength: "strong",
+          }
         : null,
     prompt: 'export const meta = { name: "Audit" };',
     title: "Audits repository modules",

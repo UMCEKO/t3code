@@ -17,6 +17,7 @@ import {
   type ProviderInstanceId,
   type ScopedThreadRef,
   type ServerProvider,
+  type ThreadId,
 } from "@t3tools/contracts";
 import {
   ChevronDownIcon,
@@ -313,6 +314,7 @@ export function WorkflowOpeningBlock(props: {
       <WorkflowScript
         script={opening.script}
         scriptPath={scriptPath}
+        threadId={props.threadRef?.threadId ?? null}
         environmentId={props.environmentId}
       />
     </section>
@@ -508,18 +510,20 @@ function WorkflowMemberRow(props: {
 function WorkflowScript(props: {
   readonly script: string;
   readonly scriptPath: string | undefined;
+  readonly threadId: ThreadId | null;
   readonly environmentId: EnvironmentId;
 }) {
   const gt = useGT();
   const [expanded, setExpanded] = useState(false);
   const revealRef = findRevealRef(() => setExpanded(true));
   const { ref: contentRef, tallEnough: canFold } = useTallEnoughToFold();
-  const needsRemoteScript = props.script.trim().length === 0 && props.scriptPath !== undefined;
+  const needsRemoteScript =
+    props.script.trim().length === 0 && props.scriptPath !== undefined && props.threadId !== null;
   const loadedScript = useEnvironmentQuery(
     needsRemoteScript
       ? orchestrationEnvironment.workflowScript({
           environmentId: props.environmentId,
-          input: { scriptPath: props.scriptPath! },
+          input: { threadId: props.threadId!, scriptPath: props.scriptPath! },
         })
       : null,
   );
