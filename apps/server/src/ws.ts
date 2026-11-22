@@ -51,6 +51,8 @@ import {
   type GitActionProgressEvent,
   type GitManagerServiceError,
   type MessageId,
+  type NodeId,
+  type OrchestrationV2Subagent,
   type AcpRegistryDeleteSessionInput,
   type AcpRegistryDisableProviderInput,
   type AcpRegistryListProvidersInput,
@@ -156,7 +158,10 @@ import {
   toShellApplicationEvent,
   type ShellApplicationEvent,
 } from "./orchestration-v2/ShellStream.ts";
-import { ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION } from "./orchestration-v2/ProjectionStore.ts";
+import {
+  ORCHESTRATION_V2_PROJECTION_SCHEMA_VERSION,
+  ProjectionStoreThreadNotFoundError,
+} from "./orchestration-v2/ProjectionStore.ts";
 import {
   coalesceLiveUpdatedEvents,
   coalesceThreadLiveStream,
@@ -920,6 +925,9 @@ const enrichProjectShells = Effect.fn("ws.orchestrationV2.enrichProjectShells")(
     ),
 );
 
+const isOrchestratorProjectionError = Schema.is(Orchestrator.OrchestratorProjectionError);
+const isProjectionStoreThreadNotFoundError = Schema.is(ProjectionStoreThreadNotFoundError);
+
 export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subscribeThread")(
   function* (input: {
     readonly threadId: ThreadId;
@@ -934,10 +942,17 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
     const threadManagement = yield* ThreadManagementService.ThreadManagementService;
     const dedupeBodies = input.acceptDedupedBodies === true;
     // Replay, snapshot, and live tail share one deduper: it must see every delivered record.
-    const withLiveDedupe = <E, R>(stream: Stream.Stream<OrchestrationV2ThreadStreamItem, E, R>) =>
-      Stream.suspend(() =>
-        Stream.map(stream, dedupeBodies ? makeLiveBodyDeduper() : makeWorkflowMemberBounder()),
-      );
+    const withLiveDedupe =
+      (knownWorkflowMembers: Iterable<NodeId> = []) =>
+      <E, R>(stream: Stream.Stream<OrchestrationV2ThreadStreamItem, E, R>) =>
+        Stream.suspend(() =>
+          Stream.map(
+            stream,
+            dedupeBodies
+              ? makeLiveBodyDeduper(knownWorkflowMembers)
+              : makeWorkflowMemberBounder(knownWorkflowMembers),
+          ),
+        );
     const applicationEvents = yield* OrchestrationEventStore.OrchestrationEventStore;
 
     yield* Effect.annotateCurrentSpan({
@@ -1046,7 +1061,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
       return rpcInitialItems([snapshotItem]).pipe(
         Stream.concat(completionMarker),
         Stream.concat(eventStreamFrom(snapshotSequence)),
-        withLiveDedupe,
+        withLiveDedupe(),
       );
     });
 
@@ -1136,34 +1151,39 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         return yield* snapshotThenLive();
       }
       const coalescedReplay = coalesceLiveUpdatedEvents(replayed);
-      // Cursor-only replays never see a snapshot, so workflow membership comes from SQL before sizing.
-      const replaysSubagentItems = coalescedReplay.some(
-        (item) =>
-          item.kind === "event" &&
-          item.event.type === "turn-item.updated" &&
-          item.event.payload.type === "subagent",
+      // Cursor-only subscriptions never send a snapshot, so seed SQL workflow membership once for replay and live tail.
+      const sqlSubagents = yield* threadManagement
+        .getThreadRecords(input.threadId, ["subagents"])
+        .pipe(
+          Effect.map((records) => records.subagents),
+          Effect.catchIf(
+            (cause) =>
+              isOrchestratorProjectionError(cause) &&
+              isProjectionStoreThreadNotFoundError(cause.cause),
+            () => Effect.succeed([] as ReadonlyArray<OrchestrationV2Subagent>),
+          ),
+          Effect.mapError(
+            (cause) =>
+              new OrchestrationV2GetThreadProjectionError({
+                threadId: input.threadId,
+                message: `Failed to prepare orchestration V2 thread ${input.threadId} replay`,
+                cause,
+              }),
+          ),
+        );
+      const knownWorkflowMemberIds = sqlSubagents.flatMap((subagent) =>
+        subagent.completionWake === "never" ? [subagent.id] : [],
       );
-      const replaySubagents = replaysSubagentItems
-        ? (yield* threadManagement.getThreadRecords(input.threadId, ["subagents"]).pipe(
-            Effect.mapError(
-              (cause) =>
-                new OrchestrationV2GetThreadProjectionError({
-                  threadId: input.threadId,
-                  message: `Failed to prepare orchestration V2 thread ${input.threadId} replay`,
-                  cause,
-                }),
-            ),
-          )).subagents
-        : [];
-      const replay = replaysSubagentItems
-        ? coalescedReplay.map(
-            makeWorkflowMemberBounder(
-              replaySubagents.flatMap((subagent) =>
-                subagent.completionWake === "never" ? [subagent.id] : [],
-              ),
-            ),
-          )
-        : coalescedReplay;
+      const replay =
+        knownWorkflowMemberIds.length > 0 ||
+        coalescedReplay.some(
+          (item) =>
+            item.kind === "event" &&
+            item.event.type === "turn-item.updated" &&
+            item.event.payload.type === "subagent",
+        )
+          ? coalescedReplay.map(makeWorkflowMemberBounder(knownWorkflowMemberIds))
+          : coalescedReplay;
       const plan = decideThreadResume({
         afterSequence: input.afterSequence,
         highWater,
@@ -1176,7 +1196,7 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
       return rpcInitialItems(replay).pipe(
         Stream.concat(completionMarker),
         Stream.concat(eventStreamFrom(highWater)),
-        withLiveDedupe,
+        withLiveDedupe(knownWorkflowMemberIds),
       );
     }
 

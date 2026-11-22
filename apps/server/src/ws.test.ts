@@ -22,6 +22,7 @@ import {
   GitManagerError,
   VcsProcessSpawnError,
   MessageId,
+  NodeId,
   ProjectId,
   ThreadId,
   TurnItemId,
@@ -381,6 +382,7 @@ const resumeSkipsUnknownTypes = (scope: "thread" | "shell") =>
     const items = yield* subscription.pipe(
       Effect.provideService(ThreadManagement.ThreadManagementService, {
         ensureLegacyTranscript: () => Effect.void,
+        getThreadRecords: () => Effect.succeed({ subagents: [] }),
         getShellSnapshot: () => Effect.die("shell resume must not load a full snapshot"),
         listActiveSubagentThreadIds: () => Effect.succeed([]),
         streamStoredEventsFrom: (
@@ -467,6 +469,7 @@ it.effect("coalesces streaming replay before synchronization and the live tail",
       Effect.flatMap(Stream.runCollect),
       Effect.provideService(ThreadManagement.ThreadManagementService, {
         ensureLegacyTranscript: () => Effect.void,
+        getThreadRecords: () => Effect.succeed({ subagents: [] }),
         streamStoredEventsFrom: () =>
           Stream.unwrap(
             insert(4, "Next", false).pipe(
@@ -692,6 +695,7 @@ it.effect("shares each live event item across subscribers and dedupes bodies per
         Effect.map((items) => Array.from(items)),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
+          getThreadRecords: () => Effect.succeed({ subagents: [] }),
           streamStoredEventsFrom: () => Stream.fromIterable(live),
         } as unknown as ThreadManagement.ThreadManagementService["Service"]),
       );
@@ -714,6 +718,111 @@ it.effect("shares each live event item across subscribers and dedupes bodies per
       live.length,
     );
   }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
+);
+
+it.effect.each([
+  { acceptDedupedBodies: false, emptyReplay: true },
+  { acceptDedupedBodies: true, emptyReplay: true },
+  { acceptDedupedBodies: false, emptyReplay: false },
+  { acceptDedupedBodies: true, emptyReplay: false },
+] as const)(
+  "cursor-only subscription bounds live-tail workflow-member turn items (dedupe=$acceptDedupedBodies, emptyReplay=$emptyReplay)",
+  ({ acceptDedupedBodies, emptyReplay }) =>
+    Effect.gen(function* () {
+      const sql = yield* SqlClient.SqlClient;
+      const threadId = ThreadId.make("thread:wf-member-live-tail");
+      const memberId = NodeId.make("node:wf-member-preexisting");
+      const at = DateTime.makeUnsafe("2026-10-27T00:00:00.000Z");
+      const now = "2026-10-27T00:00:00.000Z";
+      const longPrompt = "p".repeat(10_000);
+      const longResult = "r".repeat(10_000);
+      const expectedPrompt = `${"p".repeat(499)}…`;
+      const expectedResult = `${"r".repeat(499)}…`;
+
+      const [first] = yield* sql<{ sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          'wf-tail:0', 'thread', ${threadId}, 0, 'provider-session.detached',
+          ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:wf-tail", detachedAt: now })},
+          '{}', 2
+        ) RETURNING sequence
+      `;
+      const [second] = yield* sql<{ sequence: number }>`
+        INSERT INTO orchestration_events (
+          event_id, aggregate_kind, stream_id, stream_version, event_type,
+          occurred_at, actor_kind, payload_json, metadata_json, application_event_version
+        ) VALUES (
+          'wf-tail:1', 'thread', ${threadId}, 1, 'provider-session.detached',
+          ${now}, 'server', ${JSON.stringify({ providerSessionId: "session:wf-tail-2", detachedAt: now })},
+          '{}', 2
+        ) RETURNING sequence
+      `;
+      const afterSequence = emptyReplay ? second!.sequence : first!.sequence;
+      const liveEvent: OrchestrationV2StoredEvent = {
+        sequence: second!.sequence + 1,
+        commandId: null,
+        event: {
+          id: EventId.make("wf-tail:live-item"),
+          type: "turn-item.updated",
+          threadId,
+          occurredAt: at,
+          payload: {
+            id: TurnItemId.make("item:wf-tail-live"),
+            threadId,
+            runId: null,
+            nodeId: memberId,
+            providerThreadId: null,
+            providerTurnId: null,
+            nativeItemRef: null,
+            parentItemId: null,
+            ordinal: 1,
+            type: "subagent",
+            subagentId: memberId,
+            origin: "app_owned",
+            driver: ProviderDriverKind.make("codex"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            childThreadId: ThreadId.make("thread:wf-tail-child"),
+            status: "completed",
+            title: "Worker",
+            prompt: longPrompt,
+            result: longResult,
+            startedAt: at,
+            completedAt: at,
+            updatedAt: at,
+          },
+        },
+      };
+      const items = yield* subscribeOrchestrationV2Thread({
+        threadId,
+        afterSequence,
+        acceptDedupedBodies,
+      }).pipe(
+        Effect.flatMap(Stream.runCollect),
+        Effect.map((collected) => Array.from(collected)),
+        Effect.provideService(ThreadManagement.ThreadManagementService, {
+          ensureLegacyTranscript: () => Effect.void,
+          getThreadRecords: () =>
+            Effect.succeed({
+              subagents: [{ id: memberId, completionWake: "never" }],
+            }),
+          streamStoredEventsFrom: () => Stream.fromIterable([liveEvent]),
+        } as unknown as ThreadManagement.ThreadManagementService["Service"]),
+      );
+      const turnItemEvent = items.find(
+        (item) => item.kind === "event" && item.event.type === "turn-item.updated",
+      );
+      if (
+        turnItemEvent?.kind !== "event" ||
+        turnItemEvent.event.type !== "turn-item.updated" ||
+        turnItemEvent.event.payload.type !== "subagent"
+      ) {
+        assert.fail("Expected a subagent turn-item.updated event on the live tail.");
+      }
+      assert.strictEqual(turnItemEvent.event.payload.prompt, expectedPrompt);
+      assert.strictEqual(turnItemEvent.event.payload.result, expectedResult);
+    }).pipe(Effect.scoped, Effect.provide(ReplayTestLayer)),
 );
 
 it.effect("shell snapshots omit idle children and older settled threads only on request", () =>
@@ -2333,6 +2442,7 @@ it.effect.each([
       const exit = yield* subscription.pipe(
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
+          getThreadRecords: () => Effect.succeed({ subagents: [] }),
           getThreadSnapshot: () => Effect.die("snapshot"),
           listActiveShellIndex: () => Effect.die("snapshot"),
           readShellSnapshot: () => Effect.die("snapshot"),

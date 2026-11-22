@@ -670,26 +670,30 @@ export function makeWorkflowMemberBounder(
  * subagent record) ships blank and marked. The other order, or a forgotten record, only costs
  * bytes: the repeat ships whole.
  */
-export function makeLiveBodyDeduper(): (
-  item: OrchestrationV2ThreadStreamItem,
-) => OrchestrationV2ThreadStreamItem {
+export function makeLiveBodyDeduper(
+  knownWorkflowMembers: Iterable<NodeId> = [],
+): (item: OrchestrationV2ThreadStreamItem) => OrchestrationV2ThreadStreamItem {
   const messageText = new Map<MessageId, string>();
   const checkpointFiles = new Map<CheckpointId, OrchestrationV2Checkpoint["files"]>();
   const subagents = new Map<
     NodeId,
     Pick<OrchestrationV2Subagent, "prompt" | "result" | "completionWake">
   >();
+  // Track workflow membership outside the bounded body-dedupe LRU so old members stay previewed.
+  const workflowMembers = new Set<NodeId>(knownWorkflowMembers);
   const source = {
     messageText: (id: MessageId) => messageText.get(id),
     checkpointFiles: (id: CheckpointId) => checkpointFiles.get(id),
     subagent: (id: NodeId) => subagents.get(id),
   };
-  const rememberSubagent = ({ id, prompt, result, completionWake }: OrchestrationV2Subagent) =>
+  const rememberSubagent = ({ id, prompt, result, completionWake }: OrchestrationV2Subagent) => {
+    if (completionWake === "never") workflowMembers.add(id);
     remember(subagents, id, {
       prompt,
       result,
       ...(completionWake === undefined ? {} : { completionWake }),
     });
+  };
   return (item) => {
     if (item.kind === "snapshot") {
       // The client now holds exactly these records; their bodies are never blanked.
@@ -716,8 +720,7 @@ export function makeLiveBodyDeduper(): (
       }
       case "turn-item.updated": {
         const bounded =
-          event.payload.type === "subagent" &&
-          subagents.get(event.payload.subagentId)?.completionWake === "never"
+          event.payload.type === "subagent" && workflowMembers.has(event.payload.subagentId)
             ? projectWorkflowMemberSubagentTurnItemForWire(event.payload)
             : event.payload;
         const payload = dedupeTurnItemBodies(bounded, source);

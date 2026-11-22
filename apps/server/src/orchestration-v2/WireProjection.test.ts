@@ -1243,5 +1243,31 @@ describe("live body deduper", () => {
       subagent: (id) => (id === subagentId ? restoredSubagent : undefined),
     });
     expect(restoredCard).toMatchObject({ prompt: previewPrompt, result: previewResult });
+
+    // Cursor-only subscriptions seed known workflow members so a live-tail turn item
+    // without a preceding subagent.updated still ships bounded, even after > 32 LRU entries.
+    const seededDedupe = makeLiveBodyDeduper([subagentId]);
+    for (let i = 0; i < 40; i += 1) {
+      seededDedupe(
+        event(10 + i, {
+          type: "subagent.updated",
+          payload: {
+            ...subagentRecord("completed", "ok"),
+            id: NodeId.make(`other-subagent-${i}`),
+            completionWake: "always",
+          },
+        }),
+      );
+    }
+    const tailCard = seededDedupe(
+      event(60, {
+        type: "turn-item.updated",
+        payload: subagentItem("completed", longResult),
+      }),
+    );
+    expect(payloadOf(tailCard)).toMatchObject({
+      prompt: previewPrompt,
+      result: previewResult,
+    });
   });
 });
