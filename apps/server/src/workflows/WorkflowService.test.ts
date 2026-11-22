@@ -1393,7 +1393,7 @@ describe("WorkflowService and workflow MCP tools", () => {
 
           // 2. Workflow already completed in SQL whose run.json still says "running" (crash between complete and write).
           const completedRunId = "wf_c0ffee123456";
-          const completedDir = path.join(config.workflowsDir, completedRunId);
+          const completedDir = path.join(config.workflowRunsDir, completedRunId);
           const completedScriptPath = path.join(completedDir, "script.js");
           const completedJournalPath = path.join(completedDir, "journal.jsonl");
           const completedResultText = "Workflow AlreadyDone completed.\nResult: 42";
@@ -1460,7 +1460,7 @@ describe("WorkflowService and workflow MCP tools", () => {
 
           // 3. run.json written before workflow.start crashed, so the task never existed in SQL.
           const unstartedRunId = "wf_0000dead0001";
-          const unstartedDir = path.join(config.workflowsDir, unstartedRunId);
+          const unstartedDir = path.join(config.workflowRunsDir, unstartedRunId);
           const unstartedScriptPath = path.join(unstartedDir, "script.js");
           const unstartedJournalPath = path.join(unstartedDir, "journal.jsonl");
           yield* fs.makeDirectory(unstartedDir, { recursive: true });
@@ -2004,7 +2004,7 @@ describe("WorkflowService and workflow MCP tools", () => {
           )!;
 
           const runId = "wf_sqlonly00001";
-          const dir = path.join(config.workflowsDir, runId);
+          const dir = path.join(config.workflowRunsDir, runId);
           const scriptPath = path.join(dir, "script.js");
           const journalPath = path.join(dir, "journal.jsonl");
           yield* fs.makeDirectory(dir, { recursive: true });
@@ -2251,7 +2251,7 @@ describe("WorkflowService and workflow MCP tools", () => {
         );
         expect(midTask?.status).toBe("running");
         const midMeta = JSON.parse(
-          yield* fs.readFileString(path.join(config.workflowsDir, started.runId, "run.json")),
+          yield* fs.readFileString(path.join(config.workflowRunsDir, started.runId, "run.json")),
         ) as { status: string };
         expect(midMeta.status).toBe("running");
 
@@ -2562,7 +2562,7 @@ describe("WorkflowService and workflow MCP tools", () => {
           const started = yield* decodeRunResult(runCall.structuredContent);
 
           yield* Deferred.await(completeFailedOnce);
-          const metaPath = path.join(config.workflowsDir, started.runId, "run.json");
+          const metaPath = path.join(config.workflowRunsDir, started.runId, "run.json");
           const midMeta = JSON.parse(yield* fs.readFileString(metaPath)) as { status: string };
           expect(midMeta.status).toBe("running");
           const midStatusCall = yield* callTool("t3_workflow_status", { runId: started.runId });
@@ -2588,7 +2588,7 @@ describe("WorkflowService and workflow MCP tools", () => {
             (r) => r.id === parentTurn.turn.runId,
           )!;
           const termMetaRunId = "wf_termmeta0001";
-          const termMetaDir = path.join(config.workflowsDir, termMetaRunId);
+          const termMetaDir = path.join(config.workflowRunsDir, termMetaRunId);
           const termMetaScript = path.join(termMetaDir, "script.js");
           const termMetaJournal = path.join(termMetaDir, "journal.jsonl");
           yield* fs.makeDirectory(termMetaDir, { recursive: true });
@@ -2660,7 +2660,7 @@ describe("WorkflowService and workflow MCP tools", () => {
 
           // (B) SQL terminal while run.json is still running.
           const termSqlRunId = "wf_termsql00001";
-          const termSqlDir = path.join(config.workflowsDir, termSqlRunId);
+          const termSqlDir = path.join(config.workflowRunsDir, termSqlRunId);
           const termSqlScript = path.join(termSqlDir, "script.js");
           const termSqlJournal = path.join(termSqlDir, "journal.jsonl");
           yield* fs.makeDirectory(termSqlDir, { recursive: true });
@@ -3008,7 +3008,7 @@ describe("WorkflowService and workflow MCP tools", () => {
           )!;
 
           const runId = "wf_cleanpend001";
-          const dir = path.join(config.workflowsDir, runId);
+          const dir = path.join(config.workflowRunsDir, runId);
           const scriptPath = path.join(dir, "script.js");
           const journalPath = path.join(dir, "journal.jsonl");
           yield* fs.makeDirectory(dir, { recursive: true });
@@ -3429,7 +3429,7 @@ describe("WorkflowService and workflow MCP tools", () => {
           )!;
 
           const runId = "wf_gatefail0001";
-          const dir = path.join(config.workflowsDir, runId);
+          const dir = path.join(config.workflowRunsDir, runId);
           const scriptPath = path.join(dir, "script.js");
           const journalPath = path.join(dir, "journal.jsonl");
           yield* fs.makeDirectory(dir, { recursive: true });
@@ -3616,7 +3616,7 @@ describe("WorkflowService and workflow MCP tools", () => {
 
           // 1. Terminal SQL workflow row with cleanupPending and a live child thread.
           const runId = "wf_termgate0001";
-          const dir = path.join(config.workflowsDir, runId);
+          const dir = path.join(config.workflowRunsDir, runId);
           const scriptPath = path.join(dir, "script.js");
           const journalPath = path.join(dir, "journal.jsonl");
           yield* fs.makeDirectory(dir, { recursive: true });
@@ -3707,7 +3707,7 @@ return { out };`,
 
           // 2. Taskless (taskId: null) run.json with cleanupPending and a journal-only child thread.
           const orphanRunId = "wf_taskless0001";
-          const orphanDir = path.join(config.workflowsDir, orphanRunId);
+          const orphanDir = path.join(config.workflowRunsDir, orphanRunId);
           const orphanScriptPath = path.join(orphanDir, "script.js");
           const orphanJournalPath = path.join(orphanDir, "journal.jsonl");
           yield* fs.makeDirectory(orphanDir, { recursive: true });
@@ -4029,7 +4029,7 @@ return { out };`,
           (r) => r.id === parentTurn.turn.runId,
         )!;
         const runId = `wf_disc_${scenario.replaceAll("-", "_")}`;
-        const dir = path.join(config.workflowsDir, runId);
+        const dir = path.join(config.workflowRunsDir, runId);
         yield* fs.makeDirectory(dir, { recursive: true });
         const scriptPath = path.join(dir, "script.js");
         const journalPath = path.join(dir, "journal.jsonl");
@@ -4093,7 +4093,7 @@ return { out };`,
             }),
           );
         }
-        return { runId, taskId, workflowsDir: config.workflowsDir };
+        return { runId, taskId, workflowsDir: config.workflowRunsDir };
       }).pipe(Effect.provide(harness1.layerToolkit));
 
       let coordinatorRecordReads = 0;
@@ -4289,16 +4289,16 @@ return { out };`,
 
         const workflowsDir = yield* Effect.gen(function* () {
           const config = yield* ServerConfig.ServerConfig;
-          yield* fs.makeDirectory(config.workflowsDir, { recursive: true });
+          yield* fs.makeDirectory(config.workflowRunsDir, { recursive: true });
           // Stray regular files (like Finder's .DS_Store) must not cause ENOTDIR during startup discovery.
-          yield* fs.writeFileString(path.join(config.workflowsDir, ".DS_Store"), "finder-meta");
-          yield* fs.writeFileString(path.join(config.workflowsDir, "README.txt"), "notes");
+          yield* fs.writeFileString(path.join(config.workflowRunsDir, ".DS_Store"), "finder-meta");
+          yield* fs.writeFileString(path.join(config.workflowRunsDir, "README.txt"), "notes");
           // Unrelated subdirectory without run.json.
-          yield* fs.makeDirectory(path.join(config.workflowsDir, "unrelated-dir"), {
+          yield* fs.makeDirectory(path.join(config.workflowRunsDir, "unrelated-dir"), {
             recursive: true,
           });
           // Directory whose run.json has a mismatched runId.
-          const mismatchedDir = path.join(config.workflowsDir, "wf_wrongdir0001");
+          const mismatchedDir = path.join(config.workflowRunsDir, "wf_wrongdir0001");
           yield* fs.makeDirectory(mismatchedDir, { recursive: true });
           yield* fs.writeFileString(
             path.join(mismatchedDir, "run.json"),
@@ -4323,10 +4323,13 @@ return { out };`,
             }),
           );
           // Orphan directory whose run.json is itself a directory (unreadable orphan history).
-          yield* fs.makeDirectory(path.join(config.workflowsDir, "wf_orphanbad001", "run.json"), {
-            recursive: true,
-          });
-          return config.workflowsDir;
+          yield* fs.makeDirectory(
+            path.join(config.workflowRunsDir, "wf_orphanbad001", "run.json"),
+            {
+              recursive: true,
+            },
+          );
+          return config.workflowRunsDir;
         }).pipe(Effect.provide(harness1.layerToolkit));
 
         const exit = yield* WorkflowService.recoverInterruptedWorkflows.pipe(
@@ -4564,7 +4567,7 @@ return { out };`,
           )!;
 
           const runId = `wf_gc_${failureMode.replaceAll("-", "_")}`;
-          const dir = path.join(config.workflowsDir, runId);
+          const dir = path.join(config.workflowRunsDir, runId);
           const scriptPath = path.join(dir, "script.js");
           const journalPath = path.join(dir, "journal.jsonl");
           yield* fs.makeDirectory(dir, { recursive: true });

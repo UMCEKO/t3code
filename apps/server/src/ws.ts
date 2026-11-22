@@ -52,7 +52,6 @@ import {
   type GitManagerServiceError,
   type MessageId,
   type NodeId,
-  type OrchestrationV2Subagent,
   type AcpRegistryDeleteSessionInput,
   type AcpRegistryDisableProviderInput,
   type AcpRegistryListProvidersInput,
@@ -1151,16 +1150,15 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
         return yield* snapshotThenLive();
       }
       const coalescedReplay = coalesceLiveUpdatedEvents(replayed);
-      // Cursor-only subscriptions never send a snapshot, so seed SQL workflow membership once for replay and live tail.
-      const sqlSubagents = yield* threadManagement
-        .getThreadRecords(input.threadId, ["subagents"])
+      // Cursor-only subscriptions never send a snapshot, so seed SQL workflow member IDs once for replay and live tail.
+      const knownWorkflowMemberIds = yield* threadManagement
+        .listWorkflowMemberSubagentIds(input.threadId)
         .pipe(
-          Effect.map((records) => records.subagents),
           Effect.catchIf(
             (cause) =>
               isOrchestratorProjectionError(cause) &&
               isProjectionStoreThreadNotFoundError(cause.cause),
-            () => Effect.succeed([] as ReadonlyArray<OrchestrationV2Subagent>),
+            () => Effect.succeed([] as ReadonlyArray<NodeId>),
           ),
           Effect.mapError(
             (cause) =>
@@ -1171,9 +1169,6 @@ export const subscribeOrchestrationV2Thread = Effect.fn("ws.orchestrationV2.subs
               }),
           ),
         );
-      const knownWorkflowMemberIds = sqlSubagents.flatMap((subagent) =>
-        subagent.completionWake === "never" ? [subagent.id] : [],
-      );
       const replay =
         knownWorkflowMemberIds.length > 0 ||
         coalescedReplay.some(

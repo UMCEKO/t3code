@@ -586,6 +586,10 @@ export interface ProjectionStoreV2Shape {
   readonly listAppOwnedChildThreadIds: (
     threadId: ThreadId,
   ) => Effect.Effect<ReadonlyArray<ThreadId>, ProjectionStoreV2Error>;
+  /** Subagent IDs whose completionWake is "never", without decoding full payloads. */
+  readonly listWorkflowMemberSubagentIds: (
+    threadId: ThreadId,
+  ) => Effect.Effect<ReadonlyArray<NodeId>, ProjectionStoreV2Error>;
   readonly hasPendingDelegatedCompletion: (
     childThreadId: ThreadId,
   ) => Effect.Effect<boolean, ProjectionStoreV2Error>;
@@ -6833,6 +6837,17 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         Effect.map((rows) => [...new Set(rows.map((row) => ThreadId.make(row.child_thread_id)))]),
         Effect.mapError(controlReadError(threadId)),
       );
+    const listWorkflowMemberSubagentIds: ProjectionStoreV2Shape["listWorkflowMemberSubagentIds"] = (
+      threadId,
+    ) =>
+      sql<{ readonly subagent_id: string }>`SELECT subagent_id
+        FROM orchestration_v2_projection_subagents
+        WHERE thread_id = ${threadId}
+          AND json_extract(payload_json, '$.completionWake') = 'never'
+        ORDER BY subagent_id ASC`.pipe(
+        Effect.map((rows) => rows.map((row) => NodeId.make(row.subagent_id))),
+        Effect.mapError(controlReadError(threadId)),
+      );
     const hasPendingDelegatedCompletion: ProjectionStoreV2Shape["hasPendingDelegatedCompletion"] =
       Effect.fn("ProjectionStore.hasPendingDelegatedCompletion")((childThreadId) =>
         sql`SELECT 1 FROM orchestration_v2_projection_subagents AS task
@@ -9988,6 +10003,7 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getSubagentCount: readOnReader(getSubagentCount),
       getRunCount: readOnReader(getRunCount),
       listAppOwnedChildThreadIds: readOnReader(listAppOwnedChildThreadIds),
+      listWorkflowMemberSubagentIds: readOnReader(listWorkflowMemberSubagentIds),
       hasPendingDelegatedCompletion: readOnReader(hasPendingDelegatedCompletion),
       getNextTurnItemOrdinal: readOnReader(getNextTurnItemOrdinal),
       getTurnItem: readOnReader(getTurnItem),

@@ -949,7 +949,9 @@ describe("orchestration V2 wire projection", () => {
           const layer = Layer.mergeAll(
             Layer.mock(ThreadManagementService.ThreadManagementService)({
               ensureLegacyTranscript: () => Effect.void,
-              getThreadRecords: () => Effect.succeed({ subagents: [memberSubagent] } as never),
+              getThreadRecords: () =>
+                Effect.die("cursor-only resume must not decode full subagents"),
+              listWorkflowMemberSubagentIds: () => Effect.succeed([memberSubagent.id]),
               getThreadSnapshot: () =>
                 Effect.succeed({
                   schemaVersion: 1,

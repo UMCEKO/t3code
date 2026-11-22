@@ -382,7 +382,7 @@ const resumeSkipsUnknownTypes = (scope: "thread" | "shell") =>
     const items = yield* subscription.pipe(
       Effect.provideService(ThreadManagement.ThreadManagementService, {
         ensureLegacyTranscript: () => Effect.void,
-        getThreadRecords: () => Effect.succeed({ subagents: [] }),
+        listWorkflowMemberSubagentIds: () => Effect.succeed([]),
         getShellSnapshot: () => Effect.die("shell resume must not load a full snapshot"),
         listActiveSubagentThreadIds: () => Effect.succeed([]),
         streamStoredEventsFrom: (
@@ -469,7 +469,7 @@ it.effect("coalesces streaming replay before synchronization and the live tail",
       Effect.flatMap(Stream.runCollect),
       Effect.provideService(ThreadManagement.ThreadManagementService, {
         ensureLegacyTranscript: () => Effect.void,
-        getThreadRecords: () => Effect.succeed({ subagents: [] }),
+        listWorkflowMemberSubagentIds: () => Effect.succeed([]),
         streamStoredEventsFrom: () =>
           Stream.unwrap(
             insert(4, "Next", false).pipe(
@@ -695,7 +695,7 @@ it.effect("shares each live event item across subscribers and dedupes bodies per
         Effect.map((items) => Array.from(items)),
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
-          getThreadRecords: () => Effect.succeed({ subagents: [] }),
+          listWorkflowMemberSubagentIds: () => Effect.succeed([]),
           streamStoredEventsFrom: () => Stream.fromIterable(live),
         } as unknown as ThreadManagement.ThreadManagementService["Service"]),
       );
@@ -804,9 +804,8 @@ it.effect.each([
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
           getThreadRecords: () =>
-            Effect.succeed({
-              subagents: [{ id: memberId, completionWake: "never" }],
-            }),
+            Effect.die("cursor-only resume must not load full subagent payloads"),
+          listWorkflowMemberSubagentIds: () => Effect.succeed([memberId]),
           streamStoredEventsFrom: () => Stream.fromIterable([liveEvent]),
         } as unknown as ThreadManagement.ThreadManagementService["Service"]),
       );
@@ -2442,7 +2441,7 @@ it.effect.each([
       const exit = yield* subscription.pipe(
         Effect.provideService(ThreadManagement.ThreadManagementService, {
           ensureLegacyTranscript: () => Effect.void,
-          getThreadRecords: () => Effect.succeed({ subagents: [] }),
+          listWorkflowMemberSubagentIds: () => Effect.succeed([]),
           getThreadSnapshot: () => Effect.die("snapshot"),
           listActiveShellIndex: () => Effect.die("snapshot"),
           readShellSnapshot: () => Effect.die("snapshot"),

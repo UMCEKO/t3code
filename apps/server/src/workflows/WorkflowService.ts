@@ -1478,7 +1478,7 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
   const fileSystem = yield* FileSystem.FileSystem;
   const path = yield* Path.Path;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
-  const storeDeps = { fileSystem, path, workflowsDir: serverConfig.workflowsDir };
+  const storeDeps = { fileSystem, path, workflowsDir: serverConfig.workflowRunsDir };
 
   const candidatesByKey = new Map<string, RecoveryCandidate>();
   const activeSqlRunIds = new Set<string>();
@@ -1526,14 +1526,14 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
 
   // 2. Discover running run.json entries (covers SQL-terminal and crashed-before-start runs).
   const dirExists = yield* fileSystem
-    .exists(serverConfig.workflowsDir)
+    .exists(serverConfig.workflowRunsDir)
     .pipe(
       Effect.tapError((error) =>
         Effect.logError("workflow.startup-sweep.workflows-dir-exists-failed", { error }),
       ),
     );
   if (dirExists) {
-    const entries = yield* fileSystem.readDirectory(serverConfig.workflowsDir).pipe(
+    const entries = yield* fileSystem.readDirectory(serverConfig.workflowRunsDir).pipe(
       Effect.catchIf(isPlatformNotFound, () => Effect.succeed([] as ReadonlyArray<string>)),
       Effect.tapError((error) =>
         Effect.logError("workflow.startup-sweep.workflows-dir-read-failed", { error }),
@@ -1541,7 +1541,7 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
     );
     for (const entry of entries) {
       if (!isSafeRunId(entry) || activeSqlRunIds.has(entry)) continue;
-      const entryDir = runDirIn(path, serverConfig.workflowsDir, entry);
+      const entryDir = runDirIn(path, serverConfig.workflowRunsDir, entry);
       const entryStat = yield* fileSystem.stat(entryDir).pipe(
         Effect.asSome,
         Effect.catchIf(isPlatformNotFound, () =>
@@ -1596,7 +1596,7 @@ export const recoverInterruptedWorkflows = Effect.gen(function* () {
       const { parentThreadId, taskId, persisted, sqlTask } = candidate;
       const runId = candidate.runId ?? persisted?.runId ?? taskId ?? "unknown";
       const journalPath =
-        persisted?.journalPath ?? journalPathIn(path, serverConfig.workflowsDir, runId);
+        persisted?.journalPath ?? journalPathIn(path, serverConfig.workflowRunsDir, runId);
       const journalEntries = yield* readJournalEntriesSafe(fileSystem, journalPath);
 
       const restartMessage = `The server restarted while this workflow ran. Resume it with t3_workflow_run resumeFromRunId=${runId}.`;
@@ -1886,7 +1886,7 @@ const make = Effect.gen(function* () {
   const path = yield* Path.Path;
   const threadManagement = yield* ThreadManagementService.ThreadManagementService;
   const orchestratorMcp = yield* OrchestratorMcpService.OrchestratorMcpService;
-  const storeDeps = { fileSystem, path, workflowsDir: serverConfig.workflowsDir };
+  const storeDeps = { fileSystem, path, workflowsDir: serverConfig.workflowRunsDir };
 
   yield* Effect.addFinalizer(() =>
     Effect.promise(() => reapUnconfirmedSandboxChildren()).pipe(Effect.ignore),
