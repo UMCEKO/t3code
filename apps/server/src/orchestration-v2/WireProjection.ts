@@ -368,9 +368,7 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
 
 type SubagentTurnItem = Extract<OrchestrationV2TurnItem, { readonly type: "subagent" }>;
 
-export function projectWorkflowMemberSubagentTurnItemForWire(
-  item: SubagentTurnItem,
-): SubagentTurnItem {
+function projectWorkflowMemberSubagentTurnItemForWire(item: SubagentTurnItem): SubagentTurnItem {
   const title =
     item.title === null ? null : truncateChars(item.title, MAX_WORKFLOW_AGENT_LABEL_CHARS);
   const prompt = truncateChars(item.prompt, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);

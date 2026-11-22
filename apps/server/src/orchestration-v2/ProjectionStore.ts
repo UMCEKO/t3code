@@ -1,11 +1,7 @@
 import type { ProjectThreadAwarenessV2Input } from "@t3tools/shared/agentAwareness";
 import { applyOrchestrationV2ThreadVisit, pendingGuestMessageCount } from "@t3tools/contracts";
 import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
-import {
-  projectSubagentForWire,
-  projectTurnItemForWire,
-  projectWorkflowMemberSubagentTurnItemForWire,
-} from "./WireProjection.ts";
+import { projectSubagentForWire, projectTurnItemForWire } from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { makeThreadFind } from "./ThreadFind.ts";
@@ -6736,16 +6732,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 AND status IN ('preparing', 'starting', 'running', 'waiting'))
             AND NOT EXISTS (
               SELECT 1
-              FROM orchestration_v2_projection_subagents AS child
+              FROM orchestration_v2_projection_threads AS coordinator
               JOIN orchestration_v2_projection_subagents AS workflow
-                ON workflow.thread_id = child.thread_id
-                AND workflow.subagent_id = child.parent_node_id
+                ON workflow.child_thread_id = coordinator.thread_id
               LEFT JOIN orchestration_v2_projection_threads AS parent
                 ON parent.thread_id = workflow.thread_id
-              WHERE child.child_thread_id = ${threadId}
-                AND child.origin = 'app_owned'
+              WHERE json_extract(thread.payload_json, '$.lineage.relationshipToParent') = 'subagent'
+                AND coordinator.thread_id = json_extract(thread.payload_json, '$.lineage.parentThreadId')
+                AND json_extract(coordinator.payload_json, '$.lineage.relationshipToParent') = 'subagent'
+                AND workflow.thread_id = json_extract(coordinator.payload_json, '$.lineage.parentThreadId')
                 AND workflow.origin = 'app_owned'
-                AND workflow.child_thread_id IS NULL
                 AND json_type(workflow.payload_json, '$.workflow') = 'object'
                 AND (
                   workflow.status <> 'running'
@@ -8030,29 +8026,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               AND subagent_id IN (SELECT value FROM json_each(${encodeIdList(subagentIds)}))
             ORDER BY COALESCE(started_at, ''), subagent_id ASC
           `.pipe(Effect.flatMap(decodeRows(decodeSubagentPayload, threadId)));
-            const workflowMemberSubagentIds = new Set(
-              rawSubagents
-                .filter((subagent) => subagent.completionWake === "never")
-                .map((subagent) => subagent.id),
-            );
             const subagents = rawSubagents.map(projectSubagentForWire);
-            const projectedRows =
-              workflowMemberSubagentIds.size === 0
-                ? rows
-                : rows.map((row) => {
-                    if (
-                      row.sourceThreadId !== threadId ||
-                      row.item.type !== "subagent" ||
-                      !workflowMemberSubagentIds.has(row.item.subagentId)
-                    ) {
-                      return row;
-                    }
-                    const item = projectWorkflowMemberSubagentTurnItemForWire(row.item);
-                    return item === row.item ? row : { ...row, item };
-                  });
             return {
               snapshotSequence,
-              items: projectedRows,
+              items: rows,
               nextCursor: bounded.hasMoreHistory ? bounded.nextCursor : page.nextCursor,
               hasMoreHistory: bounded.hasMoreHistory || page.hasMoreHistory,
               ...(subagents.length === 0 ? {} : { subagents }),

@@ -1325,6 +1325,7 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
       Effect.gen(function* () {
         const orchestrator = yield* Orchestrator.OrchestratorV2;
         const threads = yield* ThreadManagementService.ThreadManagementService;
+        const projectionStore = yield* ProjectionStore.ProjectionStoreV2;
         const sink = yield* EventSink.EventSinkV2;
         const projectId = ProjectId.make("project:remote-delegated-task");
 
@@ -1420,6 +1421,7 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
         // Completing the active run must NOT promote the already-queued retry.
         yield* completeChildRun(wfChildThreadId, wfFirstRun.id, "bad json", "wf-retry-gate-first");
 
+        assert.isFalse(yield* projectionStore.canStartQueuedRun(wfChildThreadId));
         yield* orchestrator.resumeQueuedRuns;
 
         const wfAfterFinish = yield* orchestrator.getThreadProjection(wfChildThreadId);
@@ -1469,6 +1471,7 @@ it.layer(layerWorkflowTest)("a server workflow task", (it) => {
           })
           .pipe(Effect.flip);
         assert.equal(refusedAfterComplete._tag, "OrchestratorDispatchError");
+        assert.isFalse(yield* projectionStore.canStartQueuedRun(wfChildThreadId));
 
         // Non-workflow delegated children are unaffected by workflow stop/completion.
         const plainQueued = yield* threads.sendToThread({
