@@ -6,7 +6,9 @@ import type {
   OrchestrationV2Subagent,
   OrchestrationV2SubagentWorkflow,
   OrchestrationV2TurnItem,
+  OrchestrationV2WorkflowLimits,
   ProviderInstanceId,
+  ThreadId,
 } from "@t3tools/contracts";
 import { isOrchestrationV2WorkActive, isProviderNativeSubagentThread } from "@t3tools/contracts";
 import { mFallback, msg } from "gt-i18n";
@@ -46,6 +48,7 @@ export interface SubagentRunHandles {
   readonly runId?: string | undefined;
   readonly scriptPath?: string | undefined;
   readonly transcriptDir?: string | undefined;
+  readonly journalPath?: string | undefined;
   readonly sessionUrl?: string | undefined;
 }
 
@@ -66,6 +69,7 @@ export interface RuntimeSubagent {
   readonly lastToolName: string | null;
   readonly result: string | null;
   readonly error: string | null;
+  readonly cached?: boolean | undefined;
   readonly outputFile: string | null;
   readonly parentAgentId: string | null;
   readonly agentIndex: number | null;
@@ -75,6 +79,9 @@ export interface RuntimeSubagent {
   readonly workflowName: string | null;
   readonly agentCount?: number | undefined;
   readonly phases: ReadonlyArray<SubagentWorkflowPhase>;
+  readonly logs?: ReadonlyArray<string> | undefined;
+  readonly limits?: OrchestrationV2WorkflowLimits | undefined;
+  readonly stopRequestedAt?: number | undefined;
   readonly runHandles: SubagentRunHandles | null;
   readonly childThreadId: string | null;
   readonly recentActivity: ReadonlyArray<SubagentActivityEntry>;
@@ -103,109 +110,20 @@ export function isLiveSubagentTurnItem(item: OrchestrationV2TurnItem): boolean {
   return item.type === "subagent" && isOrchestrationV2WorkActive(item.status);
 }
 
-export function isServerWorkflow<
-  T extends Pick<OrchestrationV2Subagent, "origin" | "childThreadId" | "workflow">,
->(subagent: T): subagent is T & { readonly workflow: OrchestrationV2SubagentWorkflow } {
-  return (
-    subagent.workflow !== undefined &&
-    subagent.origin === "app_owned" &&
-    subagent.childThreadId === null
-  );
-}
-
 export function isStoppableWorkflow(
   subagent: Pick<
     OrchestrationV2Subagent,
-    "status" | "origin" | "driver" | "childThreadId" | "nativeTaskRef" | "workflow"
+    "status" | "origin" | "driver" | "nativeTaskRef" | "workflow"
   >,
 ): boolean {
   if (subagent.workflow === undefined || subagent.status !== "running") return false;
-  if (isServerWorkflow(subagent)) return true;
+  if (subagent.origin === "app_owned") return true;
   return (
     subagent.origin === "provider_native" &&
     subagent.driver === "claudeAgent" &&
     Boolean(subagent.nativeTaskRef?.nativeId)
   );
 }
-
-type WorkflowMemberCandidate = {
-  readonly id: string;
-  readonly origin?: OrchestrationV2Subagent["origin"] | undefined;
-  readonly parentNodeId?: string | undefined;
-  readonly workflow?: OrchestrationV2SubagentWorkflow | undefined;
-};
-
-function isWorkflowMemberSubagent(
-  subagent: Pick<WorkflowMemberCandidate, "origin" | "parentNodeId" | "workflow">,
-  workflowIds: ReadonlySet<string>,
-): boolean {
-  return (
-    subagent.origin === "app_owned" &&
-    subagent.workflow === undefined &&
-    subagent.parentNodeId !== undefined &&
-    workflowIds.has(subagent.parentNodeId)
-  );
-}
-
-/**
- * Drops app-owned subagent rows spawned under a workflow task: those agents already appear inside
- * the workflow's `workflow.agents` list, so listing both would duplicate every member.
- */
-export function excludeWorkflowMemberSubagents<T extends WorkflowMemberCandidate>(
-  subagents: ReadonlyArray<T>,
-): ReadonlyArray<T> {
-  const workflowIds = new Set<string>();
-  for (const subagent of subagents) {
-    if (subagent.workflow !== undefined) workflowIds.add(subagent.id);
-  }
-  if (workflowIds.size === 0) return subagents;
-  return subagents.filter((subagent) => !isWorkflowMemberSubagent(subagent, workflowIds));
-}
-
-/**
- * Drops the parent timeline's turn items of workflow members: they belong to the workflow card,
- * not to whichever tool call the parent was on when they appeared. Memoized on its inputs.
- */
-export function createWorkflowMemberRowFilter<
-  Row extends { readonly item: { readonly type: string; readonly subagentId?: string } },
->() {
-  let previousRows: ReadonlyArray<Row> | undefined;
-  let previousSubagents: ReadonlyArray<WorkflowMemberFilterSubagent> | undefined;
-  let previousResult: ReadonlyArray<Row> = [];
-  return (
-    rows: ReadonlyArray<Row>,
-    subagents: ReadonlyArray<WorkflowMemberFilterSubagent>,
-  ): ReadonlyArray<Row> => {
-    if (rows === previousRows && subagents === previousSubagents) return previousResult;
-    const workflowIds = new Set<string>();
-    for (const subagent of subagents) {
-      if (subagent.workflow !== undefined) workflowIds.add(subagent.id);
-    }
-    const memberIds = new Set<string>();
-    for (const subagent of subagents) {
-      if (subagent.completionWake === "never" || isWorkflowMemberSubagent(subagent, workflowIds)) {
-        memberIds.add(subagent.id);
-      }
-    }
-    const kept =
-      memberIds.size === 0
-        ? rows
-        : rows.filter(
-            (row) =>
-              row.item.type !== "subagent" ||
-              row.item.subagentId === undefined ||
-              !memberIds.has(row.item.subagentId),
-          );
-    previousRows = rows;
-    previousSubagents = subagents;
-    previousResult = kept.length === rows.length ? rows : kept;
-    return previousResult;
-  };
-}
-
-type WorkflowMemberFilterSubagent = WorkflowMemberCandidate & {
-  readonly completionWake?: OrchestrationV2Subagent["completionWake"] | undefined;
-};
 
 export function waitingOnSubagentsLabel(count: number, resolve: MFunctionType = mFallback): string {
   return resolve(
@@ -249,7 +167,13 @@ function workflowMembersToRuntime(
   coordinator: RuntimeSubagent,
   workflow: OrchestrationV2SubagentWorkflow,
 ): ReadonlyArray<RuntimeSubagent> {
-  const { agentCount: _agentCount, ...memberBase } = coordinator;
+  const {
+    agentCount: _agentCount,
+    logs: _logs,
+    limits: _limits,
+    stopRequestedAt: _stopRequestedAt,
+    ...memberBase
+  } = coordinator;
   return workflow.agents.map((agent) => {
     const status =
       (agent.state === "queued" || agent.state === "running") &&
@@ -280,7 +204,8 @@ function workflowMembersToRuntime(
       usage: workflowUsage(agent),
       progress: agent.prompt ?? null,
       result: failed ? null : (agent.result ?? null),
-      error: failed ? (agent.result ?? null) : null,
+      error: failed ? (agent.error ?? agent.result ?? null) : null,
+      ...(agent.cached === true ? { cached: true } : {}),
       parentAgentId: coordinator.id,
       agentIndex: agent.index,
       phaseIndex: agent.phaseIndex ?? null,
@@ -341,7 +266,7 @@ export function projectedSubagentsToRuntime(
     readonly updatedAt: DateTime.Utc;
   }>,
 ): ReadonlyArray<RuntimeSubagent> {
-  return excludeWorkflowMemberSubagents(subagents).flatMap((subagent) => {
+  return subagents.flatMap((subagent) => {
     const updatedAt = DateTime.formatIso(subagent.updatedAt);
     const startedAt = subagent.startedAt === null ? null : DateTime.formatIso(subagent.startedAt);
     const firstSeenAt = startedAt ?? updatedAt;
@@ -370,7 +295,14 @@ export function projectedSubagentsToRuntime(
       workflowName: workflow?.name ?? null,
       ...(workflow === undefined
         ? {}
-        : { agentCount: workflow.agentCount ?? workflow.agents.length }),
+        : {
+            agentCount: workflow.agentCount ?? workflow.agents.length,
+            ...(workflow.logs === undefined ? {} : { logs: workflow.logs }),
+            ...(workflow.limits === undefined ? {} : { limits: workflow.limits }),
+            ...(workflow.stopRequestedAt === undefined
+              ? {}
+              : { stopRequestedAt: workflow.stopRequestedAt }),
+          }),
       phases: workflow?.phases ?? [],
       runHandles,
       childThreadId: subagent.childThreadId ?? null,
@@ -474,15 +406,21 @@ export function isWorkflowScriptMessage(message: {
 }
 
 type ProjectedSubagent = Parameters<typeof projectedSubagentsToRuntime>[0][number] &
-  Pick<OrchestrationV2Subagent, "driver" | "providerInstanceId">;
+  Pick<OrchestrationV2Subagent, "driver" | "providerInstanceId"> & {
+    readonly nativeTaskRef?: OrchestrationV2Subagent["nativeTaskRef"] | undefined;
+  };
 
 export interface WorkflowOpening {
   readonly messageId: string;
   readonly script: string;
   readonly name: string | null;
   readonly description: string | null;
+  readonly parentThreadId: ThreadId | null;
+  readonly subagentId: string | null;
+  readonly origin: OrchestrationV2Subagent["origin"] | null;
   readonly driver: OrchestrationV2Subagent["driver"] | null;
   readonly providerInstanceId: OrchestrationV2Subagent["providerInstanceId"] | null;
+  readonly stoppable: boolean;
   /** Null until the parent thread's coordinator row is loaded. */
   readonly group: SubagentWorkflowGroup | null;
 }
@@ -513,13 +451,27 @@ export function resolveWorkflowOpening(
   );
   if (first.workflowScript === false) return null;
   if (coordinator?.workflow === undefined && !isWorkflowScriptMessage(first)) return null;
+  const stoppable =
+    coordinator !== undefined &&
+    coordinator.origin !== undefined &&
+    isStoppableWorkflow({
+      status: coordinator.status,
+      origin: coordinator.origin,
+      driver: coordinator.driver,
+      nativeTaskRef: coordinator.nativeTaskRef ?? null,
+      workflow: coordinator.workflow,
+    });
   return {
     messageId: first.id,
     script: first.text,
     name: coordinator?.workflow?.name ?? null,
     description: coordinator?.title ?? null,
+    parentThreadId: input.thread.lineage.parentThreadId,
+    subagentId: coordinator?.id ?? null,
+    origin: coordinator?.origin ?? null,
     driver: coordinator?.driver ?? null,
     providerInstanceId: coordinator?.providerInstanceId ?? null,
+    stoppable,
     group:
       coordinator?.workflow === undefined
         ? null

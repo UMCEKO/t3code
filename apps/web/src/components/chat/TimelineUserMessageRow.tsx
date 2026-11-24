@@ -285,6 +285,8 @@ function UserMessageContent({ row }: { row: Extract<TimelineRow, { kind: "messag
     <WorkflowOpeningBlock
       opening={ctx.workflowOpening}
       environmentId={ctx.activeThreadEnvironmentId}
+      threadRef={ctx.threadRef}
+      canOperate={ctx.canOperateThread}
       onOpenThread={(threadId, intent) =>
         ctx.onOpenThread(ThreadId.make(threadId), undefined, intent)
       }

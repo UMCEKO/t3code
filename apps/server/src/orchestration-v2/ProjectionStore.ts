@@ -1,11 +1,7 @@
 import type { ProjectThreadAwarenessV2Input } from "@t3tools/shared/agentAwareness";
 import { applyOrchestrationV2ThreadVisit, pendingGuestMessageCount } from "@t3tools/contracts";
 import { applyThreadPullRequestLinkUpdate } from "../sourceControl/threadPullRequests.ts";
-import {
-  projectSubagentForWire,
-  projectTurnItemForWire,
-  projectWorkflowMemberSubagentTurnItemForWire,
-} from "./WireProjection.ts";
+import { projectSubagentForWire, projectTurnItemForWire } from "./WireProjection.ts";
 import * as Stream from "effect/Stream";
 import * as NodeSqliteClient from "@t3tools/shared/nodeSqliteClient";
 import { makeThreadFind } from "./ThreadFind.ts";
@@ -586,10 +582,6 @@ export interface ProjectionStoreV2Shape {
   readonly listAppOwnedChildThreadIds: (
     threadId: ThreadId,
   ) => Effect.Effect<ReadonlyArray<ThreadId>, ProjectionStoreV2Error>;
-  /** Subagent IDs whose completionWake is "never", without decoding full payloads. */
-  readonly listWorkflowMemberSubagentIds: (
-    threadId: ThreadId,
-  ) => Effect.Effect<ReadonlyArray<NodeId>, ProjectionStoreV2Error>;
   readonly hasPendingDelegatedCompletion: (
     childThreadId: ThreadId,
   ) => Effect.Effect<boolean, ProjectionStoreV2Error>;
@@ -6736,16 +6728,16 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
                 AND status IN ('preparing', 'starting', 'running', 'waiting'))
             AND NOT EXISTS (
               SELECT 1
-              FROM orchestration_v2_projection_subagents AS child
+              FROM orchestration_v2_projection_threads AS coordinator
               JOIN orchestration_v2_projection_subagents AS workflow
-                ON workflow.thread_id = child.thread_id
-                AND workflow.subagent_id = child.parent_node_id
+                ON workflow.child_thread_id = coordinator.thread_id
               LEFT JOIN orchestration_v2_projection_threads AS parent
                 ON parent.thread_id = workflow.thread_id
-              WHERE child.child_thread_id = ${threadId}
-                AND child.origin = 'app_owned'
+              WHERE json_extract(thread.payload_json, '$.lineage.relationshipToParent') = 'subagent'
+                AND coordinator.thread_id = json_extract(thread.payload_json, '$.lineage.parentThreadId')
+                AND json_extract(coordinator.payload_json, '$.lineage.relationshipToParent') = 'subagent'
+                AND workflow.thread_id = json_extract(coordinator.payload_json, '$.lineage.parentThreadId')
                 AND workflow.origin = 'app_owned'
-                AND workflow.child_thread_id IS NULL
                 AND json_type(workflow.payload_json, '$.workflow') = 'object'
                 AND (
                   workflow.status <> 'running'
@@ -6835,17 +6827,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
         WHERE thread_id = ${threadId} AND origin = 'app_owned' AND child_thread_id IS NOT NULL
         ORDER BY COALESCE(started_at, ''), subagent_id ASC`.pipe(
         Effect.map((rows) => [...new Set(rows.map((row) => ThreadId.make(row.child_thread_id)))]),
-        Effect.mapError(controlReadError(threadId)),
-      );
-    const listWorkflowMemberSubagentIds: ProjectionStoreV2Shape["listWorkflowMemberSubagentIds"] = (
-      threadId,
-    ) =>
-      sql<{ readonly subagent_id: string }>`SELECT subagent_id
-        FROM orchestration_v2_projection_subagents
-        WHERE thread_id = ${threadId}
-          AND json_extract(payload_json, '$.completionWake') = 'never'
-        ORDER BY subagent_id ASC`.pipe(
-        Effect.map((rows) => rows.map((row) => NodeId.make(row.subagent_id))),
         Effect.mapError(controlReadError(threadId)),
       );
     const hasPendingDelegatedCompletion: ProjectionStoreV2Shape["hasPendingDelegatedCompletion"] =
@@ -8030,29 +8011,10 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
               AND subagent_id IN (SELECT value FROM json_each(${encodeIdList(subagentIds)}))
             ORDER BY COALESCE(started_at, ''), subagent_id ASC
           `.pipe(Effect.flatMap(decodeRows(decodeSubagentPayload, threadId)));
-            const workflowMemberSubagentIds = new Set(
-              rawSubagents
-                .filter((subagent) => subagent.completionWake === "never")
-                .map((subagent) => subagent.id),
-            );
             const subagents = rawSubagents.map(projectSubagentForWire);
-            const projectedRows =
-              workflowMemberSubagentIds.size === 0
-                ? rows
-                : rows.map((row) => {
-                    if (
-                      row.sourceThreadId !== threadId ||
-                      row.item.type !== "subagent" ||
-                      !workflowMemberSubagentIds.has(row.item.subagentId)
-                    ) {
-                      return row;
-                    }
-                    const item = projectWorkflowMemberSubagentTurnItemForWire(row.item);
-                    return item === row.item ? row : { ...row, item };
-                  });
             return {
               snapshotSequence,
-              items: projectedRows,
+              items: rows,
               nextCursor: bounded.hasMoreHistory ? bounded.nextCursor : page.nextCursor,
               hasMoreHistory: bounded.hasMoreHistory || page.hasMoreHistory,
               ...(subagents.length === 0 ? {} : { subagents }),
@@ -10003,7 +9965,6 @@ export const layer: Layer.Layer<ProjectionStoreV2, never, SqlClient.SqlClient> =
       getSubagentCount: readOnReader(getSubagentCount),
       getRunCount: readOnReader(getRunCount),
       listAppOwnedChildThreadIds: readOnReader(listAppOwnedChildThreadIds),
-      listWorkflowMemberSubagentIds: readOnReader(listWorkflowMemberSubagentIds),
       hasPendingDelegatedCompletion: readOnReader(hasPendingDelegatedCompletion),
       getNextTurnItemOrdinal: readOnReader(getNextTurnItemOrdinal),
       getTurnItem: readOnReader(getTurnItem),

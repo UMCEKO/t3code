@@ -28,6 +28,8 @@ import {
 // A checkpoint over vendored or generated trees can list 15k+ files; the card needs a prefix.
 const MAX_WIRE_CHECKPOINT_FILES = 200;
 const MAX_WIRE_WORKFLOW_AGENTS = 200;
+const MAX_WIRE_WORKFLOW_LOGS = 50;
+const MAX_WIRE_WORKFLOW_LOG_CHARS = 2_000;
 // Workflow members render from the parent workflow's previews, not their own subagent rows.
 const MAX_WORKFLOW_MEMBER_PREVIEW_CHARS = 500;
 const MAX_WORKFLOW_AGENT_LABEL_CHARS = 200;
@@ -79,7 +81,16 @@ function projectWorkflowAgentForWire(
     agent.result === undefined
       ? undefined
       : truncateChars(agent.result, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);
-  if (label === agent.label && prompt === agent.prompt && result === agent.result) {
+  const error =
+    agent.error === undefined
+      ? undefined
+      : truncateChars(agent.error, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);
+  if (
+    label === agent.label &&
+    prompt === agent.prompt &&
+    result === agent.result &&
+    error === agent.error
+  ) {
     return agent;
   }
   return {
@@ -87,7 +98,22 @@ function projectWorkflowAgentForWire(
     label,
     ...(prompt === undefined ? {} : { prompt }),
     ...(result === undefined ? {} : { result }),
+    ...(error === undefined ? {} : { error }),
   };
+}
+
+function boundWorkflowLogsForWire(
+  logs: ReadonlyArray<string> | undefined,
+): ReadonlyArray<string> | undefined {
+  if (logs === undefined || logs.length === 0) return logs;
+  const sliced = logs.length > MAX_WIRE_WORKFLOW_LOGS ? logs.slice(-MAX_WIRE_WORKFLOW_LOGS) : logs;
+  let changed = sliced !== logs;
+  const bounded = sliced.map((entry) => {
+    const next = truncateChars(entry, MAX_WIRE_WORKFLOW_LOG_CHARS);
+    if (next !== entry) changed = true;
+    return next;
+  });
+  return changed ? bounded : logs;
 }
 
 function settledAgentRecency(agent: OrchestrationV2WorkflowAgent): number {
@@ -176,6 +202,7 @@ function projectWorkflowForWire(
   allowDelta: boolean,
 ): OrchestrationV2SubagentWorkflow {
   const agentCount = Math.max(workflow.agentCount ?? 0, workflow.agents.length);
+  const logs = boundWorkflowLogsForWire(workflow.logs);
   // A delta past the row cap would drop rows the client keeps stale, so send a replacement instead.
   if (
     allowDelta &&
@@ -188,6 +215,7 @@ function projectWorkflowForWire(
     );
     return {
       ...rest,
+      ...(logs === undefined ? {} : { logs }),
       agents,
       agentCount,
       agentsDelta: true,
@@ -201,6 +229,7 @@ function projectWorkflowForWire(
     !stripChanged &&
     !stripDelta &&
     agents === workflow.agents &&
+    logs === workflow.logs &&
     workflow.agentCount === agentCount
   ) {
     return workflow;
@@ -209,6 +238,7 @@ function projectWorkflowForWire(
   const { changedAgentIndices: _changed, agentsDelta, ...rest } = workflow;
   return {
     ...rest,
+    ...(logs === undefined ? {} : { logs }),
     agents,
     agentCount,
     ...(allowDelta && agentsDelta === true ? { agentsDelta: true as const } : {}),
@@ -366,31 +396,6 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
   }
 }
 
-type SubagentTurnItem = Extract<OrchestrationV2TurnItem, { readonly type: "subagent" }>;
-
-export function projectWorkflowMemberSubagentTurnItemForWire(
-  item: SubagentTurnItem,
-): SubagentTurnItem {
-  const title =
-    item.title === null ? null : truncateChars(item.title, MAX_WORKFLOW_AGENT_LABEL_CHARS);
-  const prompt = truncateChars(item.prompt, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);
-  const progress = truncateDetail(item.progress);
-  const result =
-    item.result === null ? null : truncateChars(item.result, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);
-  return title === item.title &&
-    prompt === item.prompt &&
-    progress === item.progress &&
-    result === item.result
-    ? item
-    : {
-        ...item,
-        title,
-        prompt,
-        ...(progress === undefined ? {} : { progress }),
-        result,
-      };
-}
-
 function hasDynamicValue(value: unknown): boolean {
   if (value === undefined || value === null) return false;
   if (typeof value === "string") return value.trim().length > 0;
@@ -537,22 +542,13 @@ export function projectSubagentForWire(subagent: OrchestrationV2Subagent): Orche
 export function projectThreadProjectionForWire(
   projection: OrchestrationV2ThreadProjection,
 ): OrchestrationV2ThreadProjection {
-  const workflowMemberSubagentIds = new Set<string>();
-  const subagents = projection.subagents.map((subagent) => {
-    if (subagent.completionWake === "never") workflowMemberSubagentIds.add(subagent.id);
-    return projectSubagentForWire(subagent);
-  });
+  const subagents = projection.subagents.map(projectSubagentForWire);
   const projectedById = new Map<string, OrchestrationV2TurnItem>();
   const project = (item: OrchestrationV2TurnItem) => {
     const key = `${item.threadId}:${item.id}`;
     const existing = projectedById.get(key);
     if (existing !== undefined) return existing;
-    const projected =
-      item.type === "subagent" &&
-      item.threadId === projection.thread.id &&
-      workflowMemberSubagentIds.has(item.subagentId)
-        ? projectWorkflowMemberSubagentTurnItemForWire(item)
-        : projectTurnItemForWire(item);
+    const projected = projectTurnItemForWire(item);
     projectedById.set(key, projected);
     return projected;
   };
@@ -633,66 +629,25 @@ function remember<K, V>(memory: Map<K, V>, key: K, value: V): void {
   if (memory.size > LIVE_DEDUPE_MEMORY) memory.delete(memory.keys().next().value as K);
 }
 
-/** One per subscription without body dedupe: workflow-member turn items ship as previews. */
-export function makeWorkflowMemberBounder(
-  knownMembers: Iterable<NodeId> = [],
-): (item: OrchestrationV2ThreadStreamItem) => OrchestrationV2ThreadStreamItem {
-  const members = new Set<NodeId>(knownMembers);
-  const note = (subagent: OrchestrationV2Subagent) => {
-    if (subagent.completionWake === "never") members.add(subagent.id);
-  };
-  return (item) => {
-    if (item.kind === "snapshot") {
-      for (const subagent of item.projection.subagents) note(subagent);
-      return item;
-    }
-    if (item.kind !== "event") return item;
-    const { event } = item;
-    if (event.type === "subagent.updated") {
-      note(event.payload);
-      return item;
-    }
-    if (
-      event.type !== "turn-item.updated" ||
-      event.payload.type !== "subagent" ||
-      !members.has(event.payload.subagentId)
-    ) {
-      return item;
-    }
-    const payload = projectWorkflowMemberSubagentTurnItemForWire(event.payload);
-    return payload === event.payload ? item : { ...item, event: { ...event, payload } };
-  };
-}
-
 /**
  * One per subscription, after coalescing, so it remembers only records the client received. A
  * record event comes before the turn item that repeats its body, so the item (or a repeated
  * subagent record) ships blank and marked. The other order, or a forgotten record, only costs
  * bytes: the repeat ships whole.
  */
-export function makeLiveBodyDeduper(
-  knownWorkflowMembers: Iterable<NodeId> = [],
-): (item: OrchestrationV2ThreadStreamItem) => OrchestrationV2ThreadStreamItem {
+export function makeLiveBodyDeduper(): (
+  item: OrchestrationV2ThreadStreamItem,
+) => OrchestrationV2ThreadStreamItem {
   const messageText = new Map<MessageId, string>();
   const checkpointFiles = new Map<CheckpointId, OrchestrationV2Checkpoint["files"]>();
-  const subagents = new Map<
-    NodeId,
-    Pick<OrchestrationV2Subagent, "prompt" | "result" | "completionWake">
-  >();
-  // Track workflow membership outside the bounded body-dedupe LRU so old members stay previewed.
-  const workflowMembers = new Set<NodeId>(knownWorkflowMembers);
+  const subagents = new Map<NodeId, Pick<OrchestrationV2Subagent, "prompt" | "result">>();
   const source = {
     messageText: (id: MessageId) => messageText.get(id),
     checkpointFiles: (id: CheckpointId) => checkpointFiles.get(id),
     subagent: (id: NodeId) => subagents.get(id),
   };
-  const rememberSubagent = ({ id, prompt, result, completionWake }: OrchestrationV2Subagent) => {
-    if (completionWake === "never") workflowMembers.add(id);
-    remember(subagents, id, {
-      prompt,
-      result,
-      ...(completionWake === undefined ? {} : { completionWake }),
-    });
+  const rememberSubagent = ({ id, prompt, result }: OrchestrationV2Subagent) => {
+    remember(subagents, id, { prompt, result });
   };
   return (item) => {
     if (item.kind === "snapshot") {
@@ -719,11 +674,7 @@ export function makeLiveBodyDeduper(
         return payload === event.payload ? item : { ...item, event: { ...event, payload } };
       }
       case "turn-item.updated": {
-        const bounded =
-          event.payload.type === "subagent" && workflowMembers.has(event.payload.subagentId)
-            ? projectWorkflowMemberSubagentTurnItemForWire(event.payload)
-            : event.payload;
-        const payload = dedupeTurnItemBodies(bounded, source);
+        const payload = dedupeTurnItemBodies(event.payload, source);
         return payload === event.payload ? item : { ...item, event: { ...event, payload } };
       }
       default:

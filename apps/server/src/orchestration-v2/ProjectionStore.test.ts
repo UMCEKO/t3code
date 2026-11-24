@@ -2600,41 +2600,6 @@ const commandReadsSkipSettledLeafNodes = Effect.gen(function* () {
     [...(yield* store.listAppOwnedChildThreadIds(threadId))],
     [childThreadIds.delivered, childThreadIds["no-delivery"]],
   );
-  // Seed one workflow-member subagent (`completionWake: "never"`) and confirm the id-only query returns only it.
-  const workflowMemberId = NodeId.make("node:settled-subagents:wf-member");
-  yield* store.apply({
-    id: EventId.make("event:settled-subagents:wf-member"),
-    type: "subagent.updated",
-    threadId,
-    runId: settledRun.id,
-    nodeId: workflowMemberId,
-    driver,
-    providerInstanceId,
-    occurredAt: now,
-    payload: {
-      id: workflowMemberId,
-      threadId,
-      runId: settledRun.id,
-      parentNodeId: settledRun.rootNodeId!,
-      origin: "app_owned",
-      createdBy: "agent",
-      driver,
-      providerInstanceId,
-      providerThreadId: null,
-      childThreadId: null,
-      nativeTaskRef: null,
-      prompt: "huge prompt".repeat(1_000),
-      title: "wf-member",
-      model: null,
-      status: "completed",
-      result: "huge result".repeat(1_000),
-      completionWake: "never",
-      startedAt: now,
-      completedAt: now,
-      updatedAt: now,
-    },
-  });
-  assert.deepEqual([...(yield* store.listWorkflowMemberSubagentIds(threadId))], [workflowMemberId]);
 });
 
 const backgroundThreadUpdatesKeepTimestamp = Effect.gen(function* () {

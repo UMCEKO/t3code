@@ -5,11 +5,15 @@ import {
   OrchestratorMcpDelegateTaskInput,
   OrchestratorMcpDelegateTaskResult,
   OrchestratorMcpThreadWaitResult,
+  OrchestratorMcpWorkflowMeta,
+  OrchestratorMcpWorkflowRunInput,
 } from "./orchestratorMcp.ts";
 
 const decodeDelegateTaskInput = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskInput);
 const decodeDelegateTaskResult = Schema.decodeUnknownSync(OrchestratorMcpDelegateTaskResult);
 const decodeThreadWaitResult = Schema.decodeUnknownSync(OrchestratorMcpThreadWaitResult);
+const decodeWorkflowRunInput = Schema.decodeUnknownSync(OrchestratorMcpWorkflowRunInput);
+const decodeWorkflowMeta = Schema.decodeUnknownSync(OrchestratorMcpWorkflowMeta);
 
 describe("orchestrator MCP contracts", () => {
   it("decodes cross-provider delegated task requests and durable results", () => {
@@ -80,5 +84,25 @@ describe("orchestrator MCP contracts", () => {
         next,
       }).next,
     ).toBe(next);
+  });
+
+  it("decodes optional concurrency on workflow meta and t3_workflow_run input", () => {
+    const meta = decodeWorkflowMeta({
+      name: "Audit",
+      description: "Audit files",
+      concurrency: 3,
+      phases: [{ title: "Scan" }],
+    });
+    expect(meta.concurrency).toBe(3);
+
+    const run = decodeWorkflowRunInput({
+      script: 'export const meta = { name: "Audit", description: "Audit files", concurrency: 3 };',
+      concurrency: 2,
+      tokenBudget: 10_000,
+    });
+    expect(run.concurrency).toBe(2);
+
+    expect(() => decodeWorkflowMeta({ name: "Audit", description: "d", concurrency: 0 })).toThrow();
+    expect(() => decodeWorkflowRunInput({ script: "x", concurrency: 0 })).toThrow();
   });
 });

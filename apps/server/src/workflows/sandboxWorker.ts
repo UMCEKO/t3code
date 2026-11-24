@@ -595,6 +595,15 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
     if (whenToUse !== undefined && typeof whenToUse !== "string") {
       throw new WorkerScriptError("meta.whenToUse must be a string");
     }
+    const rawConcurrency = ownProperty(raw, "concurrency");
+    if (
+      rawConcurrency !== undefined &&
+      (typeof rawConcurrency !== "number" ||
+        !Number.isInteger(rawConcurrency) ||
+        rawConcurrency < 1)
+    ) {
+      throw new WorkerScriptError("meta.concurrency must be a positive integer");
+    }
     const rawPhases = ownProperty(raw, "phases");
     const phases = [];
     if (rawPhases !== undefined) {
@@ -653,6 +662,7 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
       name,
       description,
       ...(whenToUse !== undefined ? { whenToUse } : {}),
+      ...(rawConcurrency !== undefined ? { concurrency: rawConcurrency } : {}),
       phases,
     };
   }
@@ -885,39 +895,6 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
         return undefined;
       },
     };
-  }
-
-  class FifoSemaphore {
-    constructor(limit) {
-      this.limit = limit;
-      this.active = 0;
-      this.queue = [];
-    }
-
-    tryAcquire() {
-      if (this.active >= this.limit) return false;
-      this.active += 1;
-      return true;
-    }
-
-    acquire() {
-      if (this.active < this.limit) {
-        this.active += 1;
-        return Promise.resolve();
-      }
-      return new Promise((resolve) => {
-        this.queue.push(resolve);
-      });
-    }
-
-    release() {
-      if (this.queue.length > 0) {
-        const next = this.queue.shift();
-        next();
-        return;
-      }
-      this.active -= 1;
-    }
   }
 
   const CONTEXT_SETUP_SOURCE = [
@@ -1272,7 +1249,6 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
 
   let config = null;
   let progressBudget = null;
-  let semaphore = null;
   let agentCount = 0;
   let budgetSpent = 0;
   let nextRequestId = 1;
@@ -1644,43 +1620,16 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
           agentCount += 1;
           nextRequestId += 1;
 
-          const runWithSlot = () => {
-            if (runClosed || contextClosed) {
-              semaphore.release();
-              return;
-            }
-            try {
-              checkBudget();
-            } catch (err) {
-              semaphore.release();
-              const spec = toErrorSpec(err, runtime.isContextTypeError);
-              if (inSlice) {
-                deferred.rejectSpecSync(spec.kind, spec.message);
-              } else {
-                settleDeferredWithSpec(deferred, spec.kind, spec.message);
-              }
-              return;
-            }
-            pendingAgents.set(requestId, {
-              onResolveJson: (json) => settleDeferredWithJson(deferred, json),
-              onRejectSpec: (kind, message) => settleDeferredWithSpec(deferred, kind, message),
-            });
-            if (!writeMessage(agentMsg)) {
-              const capMessage = stickyCapFailure ?? "Workflow sandbox output backlog exceeded the limit.";
-              runtime.setCapError(capMessage);
-              if (inSlice) {
-                deferred.rejectSpecSync("WorkflowScriptError", capMessage);
-              } else {
-                settleDeferredWithSpec(deferred, "WorkflowScriptError", capMessage);
-              }
-            }
-          };
-
-          if (semaphore.tryAcquire()) {
-            runWithSlot();
-            return;
+          // Send immediately in call-index order; the host enforces concurrency in strict FIFO order.
+          pendingAgents.set(requestId, {
+            onResolveJson: (json) => settleDeferredWithJson(deferred, json),
+            onRejectSpec: (kind, message) => settleDeferredWithSpec(deferred, kind, message),
+          });
+          if (!writeMessage(agentMsg)) {
+            const capMessage = stickyCapFailure ?? "Workflow sandbox output backlog exceeded the limit.";
+            runtime.setCapError(capMessage);
+            deferred.rejectSpecSync("WorkflowScriptError", capMessage);
           }
-          semaphore.acquire().then(runWithSlot);
         } catch (err) {
           const spec = toErrorSpec(err, runtime.isContextTypeError);
           deferred.rejectSpecSync(spec.kind, spec.message);
@@ -1947,7 +1896,6 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
         }
         budgetSpent = msg.budgetSpent;
         progressBudget = makeProgressBudget(config.progressLimits);
-        semaphore = new FifoSemaphore(config.concurrency);
 
         if (typeof msg.script !== "string") {
           postErrorAndClose("WorkflowScriptError", "Workflow script must be a string");
@@ -1995,7 +1943,6 @@ export const WORKFLOW_SANDBOX_WORKER_SOURCE = String.raw`
         const pending = pendingAgents.get(msg.id);
         if (!pending) return;
         pendingAgents.delete(msg.id);
-        semaphore.release();
         if (msg.ok) {
           const valueJson = msg.hasValue ? JSON.stringify(msg.value) : undefined;
           if (valueJson !== undefined && byteLength(valueJson, "utf8") > config.maxValueBytes) {

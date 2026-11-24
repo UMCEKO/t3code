@@ -246,6 +246,57 @@ describe("mergeClaudeWorkflowProgress", () => {
         phase(1, "Alpha"),
       ]),
     });
-    expect(workflow).toEqual({ phases: [{ index: 1, title: "Alpha" }], agents: [] });
+    expect(workflow).toEqual({
+      phases: [{ index: 1, title: "Alpha" }],
+      agents: [],
+      logs: ["Alpha: alpha:one"],
+    });
+  });
+
+  it("populates error on failed agents, appends distinct task_progress descriptions bounded to 50x2000, and preserves stopRequestedAt", () => {
+    let workflow = mergeClaudeWorkflowProgress({
+      previous: undefined,
+      message: {
+        ...snapshotFrame([
+          phase(1, "Alpha"),
+          agent({
+            state: "error",
+            resultPreview: "Provider timed out",
+            lastProgressAt: 5_000,
+          }),
+        ]),
+        description: "Running Alpha",
+      },
+    });
+    expect(workflow?.agents[0]).toMatchObject({
+      state: "failed",
+      result: "Provider timed out",
+      error: "Provider timed out",
+    });
+    expect(workflow?.logs).toEqual(["Running Alpha"]);
+
+    // Consecutive duplicate description is skipped; stopRequestedAt is preserved across frames.
+    workflow = mergeClaudeWorkflowProgress({
+      previous: workflow ? { ...workflow, stopRequestedAt: 9_999 } : undefined,
+      message: { ...snapshotFrame([]), description: "Running Alpha" },
+    });
+    expect(workflow?.logs).toEqual(["Running Alpha"]);
+    expect(workflow?.stopRequestedAt).toBe(9_999);
+
+    // Overflow past 50 entries keeps the newest 50 and truncates over-long lines to 2000 chars.
+    for (let i = 1; i <= 55; i += 1) {
+      workflow = mergeClaudeWorkflowProgress({
+        previous: workflow,
+        message: {
+          ...snapshotFrame([]),
+          description: i === 55 ? `end:${"z".repeat(2_500)}` : `Step ${i}`,
+        },
+      });
+    }
+    expect(workflow?.logs).toHaveLength(50);
+    expect(workflow?.logs?.[0]).toBe("Step 6");
+    expect(workflow?.logs?.[49]?.length).toBe(2_000);
+    expect(workflow?.logs?.[49]?.endsWith("…")).toBe(true);
+    expect(workflow?.stopRequestedAt).toBe(9_999);
   });
 });

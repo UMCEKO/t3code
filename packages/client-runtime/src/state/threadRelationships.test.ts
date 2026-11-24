@@ -255,8 +255,9 @@ describe("thread relationships", () => {
     expect(graph.nodes.has(staleParent)).toBe(false);
   });
 
-  it("hides workflow-owned child subagents and their result transfers on the parent thread", () => {
+  it("places workflow members under coordinator C rather than parent P in the relationship graph", () => {
     const parent = ThreadId.make("thread-parent");
+    const coordinator = ThreadId.make("thread-wf-coordinator");
     const workflowMember = ThreadId.make("thread-wf-member");
     const standalone = ThreadId.make("thread-standalone");
     const workflowNodeId = NodeId.make("wf-node");
@@ -269,11 +270,22 @@ describe("thread relationships", () => {
         lineage: { rootThreadId: parent, parentThreadId: null, relationshipToParent: null },
       },
       {
+        id: coordinator,
+        title: "Workflow · Review",
+        status: "running",
+        forkedFrom: null,
+        lineage: { rootThreadId: parent, parentThreadId: parent, relationshipToParent: "subagent" },
+      },
+      {
         id: workflowMember,
         title: "Workflow member",
         status: "completed",
         forkedFrom: null,
-        lineage: { rootThreadId: parent, parentThreadId: parent, relationshipToParent: "subagent" },
+        lineage: {
+          rootThreadId: parent,
+          parentThreadId: coordinator,
+          relationshipToParent: "subagent",
+        },
       },
       {
         id: standalone,
@@ -293,16 +305,9 @@ describe("thread relationships", () => {
             id: workflowNodeId,
             origin: "app_owned",
             parentNodeId: NodeId.make("root-node"),
-            childThreadId: null,
+            childThreadId: coordinator,
             status: "running",
             workflow: { phases: [], agents: [] },
-          },
-          {
-            id: NodeId.make("wf-member-task"),
-            origin: "app_owned",
-            parentNodeId: workflowNodeId,
-            childThreadId: workflowMember,
-            status: "completed",
           },
           {
             id: NodeId.make("standalone-task"),
@@ -312,14 +317,33 @@ describe("thread relationships", () => {
             status: "running",
           },
         ],
-        contextTransfers: [
-          { sourceThreadId: workflowMember, targetThreadId: parent, status: "consumed" },
-        ],
+        contextTransfers: [],
       } as never,
     });
     expect(immediateThreadRelationships(parentGraph, parent).map((row) => row.threadId)).toEqual([
+      coordinator,
       standalone,
     ]);
+
+    const coordGraph = deriveThreadRelationshipGraph({
+      threads: shells as never,
+      projection: {
+        thread: { id: coordinator },
+        subagents: [
+          {
+            id: NodeId.make("wf-member-task"),
+            origin: "app_owned",
+            parentNodeId: NodeId.make("coord-root"),
+            childThreadId: workflowMember,
+            status: "completed",
+          },
+        ],
+        contextTransfers: [],
+      } as never,
+    });
+    expect(
+      immediateThreadRelationships(coordGraph, coordinator).map((row) => row.threadId),
+    ).toEqual([parent, workflowMember]);
 
     const childGraph = deriveThreadRelationshipGraph({
       threads: shells as never,
@@ -331,7 +355,7 @@ describe("thread relationships", () => {
     });
     expect(
       immediateThreadRelationships(childGraph, workflowMember).map((row) => row.threadId),
-    ).toEqual([parent]);
+    ).toEqual([coordinator]);
   });
 
   it("resolves merge-back only for forks and prefers the recorded fork source", () => {

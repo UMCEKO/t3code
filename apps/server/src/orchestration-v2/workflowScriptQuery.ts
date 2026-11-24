@@ -4,11 +4,13 @@ import { readContainedWorkflowFile } from "./workflowFileRead.ts";
 
 export const readWorkflowScript = Effect.fn("orchestration.readWorkflowScript")(function* (input: {
   readonly scriptPath: string;
+  readonly workflowsDir?: string;
 }) {
   const file = yield* readContainedWorkflowFile({
     path: input.scriptPath,
     extension: ".js",
     byteCap: 256 * 1024,
+    ...(input.workflowsDir === undefined ? {} : { extraRoots: [input.workflowsDir] }),
   }).pipe(
     Effect.mapError(
       (error) =>

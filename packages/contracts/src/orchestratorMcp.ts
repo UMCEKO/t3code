@@ -987,11 +987,27 @@ export type OrchestratorMcpDeleteScheduledTaskResult =
 
 const OrchestratorMcpWorkflowRunId = TrimmedNonEmptyString.check(Schema.isMaxLength(128));
 
+export const OrchestratorMcpWorkflowMetaPhase = Schema.Struct({
+  title: TrimmedNonEmptyString,
+  detail: Schema.optional(Schema.String),
+  model: Schema.optional(Schema.String),
+});
+export type OrchestratorMcpWorkflowMetaPhase = typeof OrchestratorMcpWorkflowMetaPhase.Type;
+
+export const OrchestratorMcpWorkflowMeta = Schema.Struct({
+  name: TrimmedNonEmptyString,
+  description: TrimmedNonEmptyString,
+  whenToUse: Schema.optional(Schema.String),
+  phases: Schema.optional(Schema.Array(OrchestratorMcpWorkflowMetaPhase)),
+  concurrency: Schema.optional(PositiveInt),
+});
+export type OrchestratorMcpWorkflowMeta = typeof OrchestratorMcpWorkflowMeta.Type;
+
 export const OrchestratorMcpWorkflowRunInput = Schema.Struct({
   script: Schema.optional(
     TrimmedNonEmptyString.check(Schema.isMaxLength(524_288)).annotate({
       description:
-        "Plain JS starting with `export const meta = {name, description, phases?}` (a pure literal). Hooks: agent, parallel, pipeline, phase, log, args, budget, workflow.",
+        "Plain JS starting with `export const meta = {name, description, phases?, concurrency?}` (a pure literal). Hooks: agent, parallel, pipeline, phase, log, args, budget, workflow.",
     }),
   ),
   scriptPath: Schema.optional(
@@ -1016,6 +1032,11 @@ export const OrchestratorMcpWorkflowRunInput = Schema.Struct({
   tokenBudget: Schema.optional(
     PositiveInt.annotate({
       description: "Token ceiling for all agents; agent() throws once reached.",
+    }),
+  ),
+  concurrency: Schema.optional(
+    PositiveInt.annotate({
+      description: "Max agents running at once; overrides meta.concurrency.",
     }),
   ),
 });

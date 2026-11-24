@@ -136,6 +136,27 @@ describe("sandbox", () => {
         ),
       ).toThrow(WorkflowScriptError);
     });
+
+    it("parses optional meta.concurrency and rejects non-positive or non-integer values", () => {
+      expect(
+        parseWorkflowMeta(
+          `export const meta = { name: "a", description: "d", concurrency: 3 }; return 1;`,
+        ),
+      ).toEqual({
+        name: "a",
+        description: "d",
+        concurrency: 3,
+        phases: [],
+      });
+
+      for (const bad of ["0", "-2", "1.5", '"2"', "null", "true"]) {
+        expect(() =>
+          parseWorkflowMeta(
+            `export const meta = { name: "a", description: "d", concurrency: ${bad} };`,
+          ),
+        ).toThrow(/meta\.concurrency must be a positive integer/);
+      }
+    });
   });
 
   describe("determinism and isolation", () => {

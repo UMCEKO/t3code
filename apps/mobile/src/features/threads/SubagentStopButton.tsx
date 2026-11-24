@@ -32,10 +32,12 @@ export function SubagentStopButton(props: {
   if (target === null || !canStop) return null;
 
   const workflow = target.kind === "workflow";
+  const stopRequested = stopping || props.subagent.workflow?.stopRequestedAt !== undefined;
   const label =
     props.subagent.workflow?.name ??
     resolveSubagentRowPresentation(props.subagent, false, messages).title;
   const stop = async () => {
+    if (stopRequested) return;
     setStopping(true);
     const result = await (
       target.kind === "workflow"
@@ -54,14 +56,14 @@ export function SubagentStopButton(props: {
         variant="danger"
         accessibilityLabel={
           workflow
-            ? stopping
+            ? stopRequested
               ? gt("Stopping workflow {label}", { label })
               : gt("Stop workflow {label}", { label })
-            : stopping
+            : stopRequested
               ? gt("Stopping agent {label}", { label })
               : gt("Stop agent {label}", { label })
         }
-        disabled={stopping}
+        disabled={stopRequested}
         onPress={() =>
           Dialog.confirm({
             title: workflow ? gt("Stop workflow?") : gt("Stop agent?"),

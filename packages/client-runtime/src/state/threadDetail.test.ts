@@ -271,56 +271,6 @@ describe("timelineVisibleTurnItemsAtom", () => {
   });
 });
 
-describe("workflow member turn items", () => {
-  const ref = { environmentId: EnvironmentId.make("environment-1"), threadId: v2ThreadId };
-  const subagentItem = (id: string, subagentId: string, ordinal: number) =>
-    ({
-      ...assistant,
-      id: TurnItemId.make(id),
-      ordinal,
-      type: "subagent",
-      subagentId: NodeId.make(subagentId),
-    }) as unknown as OrchestrationV2TurnItem;
-
-  it("stay out of every timeline atom", () => {
-    const rows = [
-      subagentItem("item-plain", "plain", 1),
-      subagentItem("item-member", "member", 2),
-    ].map((item, position) => ({
-      position,
-      visibility: "local" as const,
-      sourceThreadId: v2ThreadId,
-      sourceItemId: item.id,
-      item,
-    }));
-    const projection = {
-      ...v2Projection,
-      turnItems: rows.map((row) => row.item),
-      visibleTurnItems: rows,
-      subagents: [
-        { id: NodeId.make("plain") },
-        { id: NodeId.make("member"), completionWake: "never" },
-      ],
-    } as unknown as OrchestrationV2ThreadProjection;
-    const stateAtom = Atom.make(
-      AsyncResult.success({ ...EMPTY_ENVIRONMENT_THREAD_STATE, data: Option.some(projection) }),
-    );
-    const details = createEnvironmentThreadDetailAtoms(() => stateAtom);
-    const registry = AtomRegistry.make();
-    const ids = (atoms: ReadonlyArray<{ item: { id: string } }>) => atoms.map((row) => row.item.id);
-    const visible = details.visibleTurnItemsAtom(ref);
-    const quiet = details.quietVisibleTurnItemsAtom(ref);
-    const timeline = details.timelineVisibleTurnItemsAtom(ref);
-    registry.mount(visible);
-    registry.mount(quiet);
-    registry.mount(timeline);
-    expect(ids(registry.get(visible))).toEqual(["item-plain"]);
-    expect(ids(registry.get(quiet))).toEqual(["item-plain"]);
-    expect(ids(registry.get(timeline))).toEqual(["item-plain"]);
-    registry.dispose();
-  });
-});
-
 it("only compares replaced entries in a streamed reducer delta", () => {
   const size = 100;
   let slotReads = 0;

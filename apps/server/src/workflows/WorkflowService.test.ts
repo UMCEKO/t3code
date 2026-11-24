@@ -158,7 +158,10 @@ interface ActiveTurnHandle {
   ) => Effect.Effect<void>;
   readonly complete: (
     text: string,
-    options?: { readonly turnTokenUsage?: TurnTokenUsage },
+    options?: {
+      readonly turnTokenUsage?: TurnTokenUsage;
+      readonly toolCalls?: number;
+    },
   ) => Effect.Effect<void>;
   readonly failUsageLimit: () => Effect.Effect<void>;
 }
@@ -176,6 +179,7 @@ interface HarnessOptions {
   readonly name: string;
   readonly databaseLayer?: typeof SqlitePersistence.layerMemory;
   readonly baseDir?: string;
+  readonly extraProviders?: ReadonlyArray<ServerProvider>;
   readonly runContinuationWorker?: boolean;
   readonly runEffectWorker?: boolean;
   readonly recoverOnStartup?: boolean;
@@ -310,6 +314,33 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
                       if (entry !== undefined) entry.terminal = true;
                       const doneAt = yield* DateTime.now;
                       const messageId = MessageId.make(`msg:assistant:${turn.attemptId}`);
+                      if (opts?.toolCalls !== undefined && opts.toolCalls > 0) {
+                        for (let tc = 0; tc < opts.toolCalls; tc += 1) {
+                          yield* Queue.offer(events, {
+                            type: "turn_item.updated",
+                            driver,
+                            turnItem: {
+                              id: TurnItemId.make(`item:tool:${turn.attemptId}:${tc}`),
+                              threadId: turn.threadId,
+                              runId: turn.runId,
+                              nodeId: turn.rootNodeId,
+                              providerThreadId: turn.providerThread.id,
+                              providerTurnId,
+                              nativeItemRef: null,
+                              parentItemId: null,
+                              ordinal: tc + 1,
+                              status: "completed",
+                              title: `Tool ${tc}`,
+                              startedAt: doneAt,
+                              completedAt: doneAt,
+                              updatedAt: doneAt,
+                              type: "command_execution",
+                              input: `echo ${tc}`,
+                              exitCode: 0,
+                            },
+                          });
+                        }
+                      }
                       if (text.length > 0) {
                         yield* Queue.offer(events, {
                           type: "message.updated",
@@ -341,7 +372,7 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
                             providerTurnId,
                             nativeItemRef: null,
                             parentItemId: null,
-                            ordinal: 1,
+                            ordinal: (opts?.toolCalls ?? 0) + 1,
                             status: "completed",
                             title: null,
                             startedAt: doneAt,
@@ -535,7 +566,9 @@ const makeWorkflowHarness = (options: HarnessOptions) =>
       Layer.provideMerge(layerOrchestration),
       Layer.provideMerge(layerServerConfig),
       Layer.provide(layerAdapters),
-      Layer.provide(ProviderRegistryMock.layer([providerSnapshot])),
+      Layer.provide(
+        ProviderRegistryMock.layer([providerSnapshot, ...(options.extraProviders ?? [])]),
+      ),
       Layer.provide(layerServerSettings),
       Layer.provide(Layer.mock(ScheduledTaskService.ScheduledTaskService)({})),
       Layer.provide(Layer.mock(PeerForwarding.PeerForwarding)({})),
@@ -1395,10 +1428,10 @@ describe("WorkflowService and workflow MCP tools", () => {
             throw new Error("missing stale workflow task");
           }
           const staleTaskId = staleTaskEvent.event.payload.id;
+          const staleCoordinatorThreadId = staleTaskEvent.event.payload.childThreadId!;
 
           const child = yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: staleTaskId,
+            coordinatorThreadId: staleCoordinatorThreadId,
             requestKey: `${staleRunId}:0`,
             task: { task: "Stale child task", title: "Orphan child" },
           });
@@ -1790,12 +1823,12 @@ describe("WorkflowService and workflow MCP tools", () => {
             .streamStoredEventsFrom({
               threadId: childThreadId,
               afterSequence: beforeChildSeq,
-              eventType: "run.updated",
+              eventType: "run.created",
             })
             .pipe(
               Stream.filter(
                 ({ event }) =>
-                  event.type === "run.updated" &&
+                  event.type === "run.created" &&
                   event.payload.id !== attempt1.turn.runId &&
                   event.payload.id !== reprompt1.turn.runId &&
                   event.payload.outputSchema !== undefined &&
@@ -1803,7 +1836,7 @@ describe("WorkflowService and workflow MCP tools", () => {
               ),
               Stream.runHead,
             );
-          if (Option.isNone(queuedReprompt) || queuedReprompt.value.event.type !== "run.updated") {
+          if (Option.isNone(queuedReprompt) || queuedReprompt.value.event.type !== "run.created") {
             throw new Error("Expected queued schema re-prompt run");
           }
           const repromptRunId = queuedReprompt.value.event.payload.id;
@@ -2004,20 +2037,11 @@ describe("WorkflowService and workflow MCP tools", () => {
     Effect.gen(function* () {
       const harness = yield* makeWorkflowHarness({ name: "reject-remote-env" });
       yield* Effect.gen(function* () {
-        const orchestrator = yield* Orchestrator.OrchestratorV2;
         const mcpService = yield* OrchestratorMcpService.OrchestratorMcpService;
-        const parentTurn = yield* startParentThreadAndRun(
-          harness.turnQueue,
-          harness.cwd,
-          "reject-remote-env",
-        );
-        const parentRun = (yield* orchestrator.getThreadProjection(parentThreadId)).runs.find(
-          (r) => r.id === parentTurn.turn.runId,
-        )!;
+        yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "reject-remote-env");
         const err = yield* mcpService
           .delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: parentRun.rootNodeId!,
+            coordinatorThreadId: ThreadId.make("thread:workflow:reject-remote-env"),
             requestKey: "wf_test:0",
             task: {
               task: "Do work",
@@ -2122,8 +2146,7 @@ describe("WorkflowService and workflow MCP tools", () => {
           );
 
           const child = yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: taskId,
+            coordinatorThreadId: taskEvent.event.payload.childThreadId!,
             requestKey: `${runId}:0`,
             task: { task: "Unjournaled child work", title: "Unjournaled" },
           });
@@ -2487,13 +2510,16 @@ describe("WorkflowService and workflow MCP tools", () => {
       Effect.gen(function* () {
         const fetchingChildSeq = yield* Deferred.make<ThreadId>();
         const releaseChildSeq = yield* Deferred.make<void>();
+        let targetChildThreadId: ThreadId | undefined;
         let interceptedChildSeq = false;
         const harness = yield* makeWorkflowHarness({
           name: "stop-during-reprompt-seq",
           wrapThreadManagement: (tm) => ({
             ...tm,
             getThreadEventSequence: (threadId) =>
-              threadId !== parentThreadId && !interceptedChildSeq
+              targetChildThreadId !== undefined &&
+              threadId === targetChildThreadId &&
+              !interceptedChildSeq
                 ? Effect.gen(function* () {
                     interceptedChildSeq = true;
                     yield* Deferred.succeed(fetchingChildSeq, threadId);
@@ -2527,6 +2553,7 @@ describe("WorkflowService and workflow MCP tools", () => {
           const started = yield* decodeRunResult(runCall.structuredContent);
 
           const attempt1 = yield* Queue.take(harness.turnQueue);
+          targetChildThreadId = attempt1.turn.threadId;
           yield* attempt1.complete("invalid json");
 
           const childThreadId = yield* Deferred.await(fetchingChildSeq);
@@ -2686,8 +2713,7 @@ describe("WorkflowService and workflow MCP tools", () => {
           }
           const termMetaTaskId = termMetaTaskEvent.event.payload.id;
           const termMetaChild = yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: termMetaTaskId,
+            coordinatorThreadId: termMetaTaskEvent.event.payload.childThreadId!,
             requestKey: `${termMetaRunId}:0`,
             task: { task: "Lingering child", title: "Lingering" },
           });
@@ -3102,8 +3128,7 @@ describe("WorkflowService and workflow MCP tools", () => {
           }
           const taskId = taskEvent.event.payload.id;
           const child = yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: taskId,
+            coordinatorThreadId: taskEvent.event.payload.childThreadId!,
             requestKey: `${runId}:0`,
             task: { task: "Work to resume", title: "Worker" },
           });
@@ -3517,8 +3542,7 @@ describe("WorkflowService and workflow MCP tools", () => {
           }
           const taskId = taskEvent.event.payload.id;
           yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: taskId,
+            coordinatorThreadId: taskEvent.event.payload.childThreadId!,
             requestKey: `${runId}:0`,
             task: { task: "Stuck child", title: "Worker" },
           });
@@ -3702,8 +3726,7 @@ return { out };`,
           }
           const taskId = taskEvent.event.payload.id;
           const child = yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: taskId,
+            coordinatorThreadId: taskEvent.event.payload.childThreadId!,
             requestKey: `${runId}:0`,
             task: { task: "Still running child", title: "Worker" },
           });
@@ -3766,11 +3789,10 @@ return { out };`,
             orphanScriptPath,
             `export const meta = { name: "TasklessGate", description: "Missing task row." }; return 1;`,
           );
-          const orphanChild = yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: parentRun.rootNodeId!,
-            requestKey: `${orphanRunId}:0`,
-            task: { task: "Journal-only child", title: "JournalWorker" },
+          const orphanChild = yield* mcpService.delegateTask(parentScope, {
+            task: "Journal-only child",
+            title: "JournalWorker",
+            clientRequestId: `${orphanRunId}:0`,
           });
           yield* Queue.take(harness1.turnQueue);
           yield* fs.writeFileString(
@@ -4113,8 +4135,7 @@ return { out };`,
         }
         const taskId = taskEvent.event.payload.id;
         yield* mcpService.delegateWorkflowAgent(parentScope, {
-          parentRunId: parentRun.id,
-          workflowNodeId: taskId,
+          coordinatorThreadId: taskEvent.event.payload.childThreadId!,
           requestKey: `${runId}:0`,
           task: { task: "Unaccepted child", title: "Worker" },
         });
@@ -4777,17 +4798,17 @@ return { out };`,
           }
           const taskId = taskEvent.event.payload.id;
 
+          const coordinatorThreadId = taskEvent.event.payload.childThreadId!;
+
           const child1 = yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: taskId,
+            coordinatorThreadId,
             requestKey: `${runId}:0`,
             task: { task: "First child (cleanup fails)", title: "Child 1" },
           });
           yield* Queue.take(harness1.turnQueue);
 
           const child2 = yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: taskId,
+            coordinatorThreadId,
             requestKey: `${runId}:1`,
             task: { task: "Second child (delegates grandchild)", title: "Child 2" },
           });
@@ -5873,11 +5894,12 @@ return { out };`,
           }
           const taskId = taskEvent.event.payload.id;
 
+          const coordinatorThreadId = taskEvent.event.payload.childThreadId!;
+
           const childThreadIds: Array<ThreadId> = [];
           for (let i = 0; i < childCount; i += 1) {
             const child = yield* mcpService.delegateWorkflowAgent(parentScope, {
-              parentRunId: parentRun.id,
-              workflowNodeId: taskId,
+              coordinatorThreadId,
               requestKey: `${runId}:${i}`,
               task: { task: `Fanout child ${i}`, title: `Child ${i}` },
             });
@@ -6150,8 +6172,7 @@ return { out };`,
 
           // Launch an unfinished child whose started entry appears at the tail of the >64 MiB journal.
           const tailChild = yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: taskId,
+            coordinatorThreadId: taskEvent.event.payload.childThreadId!,
             requestKey: `${runId}:20`,
             task: { task: "Tail active child", title: "Tail child" },
           });
@@ -6390,8 +6411,7 @@ return { out };`,
           const taskId = taskEvent.event.payload.id;
 
           const child = yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: taskId,
+            coordinatorThreadId: taskEvent.event.payload.childThreadId!,
             requestKey: `${runId}:0`,
             task: { task: "Stalling child", title: "Stalling child" },
           });
@@ -6873,8 +6893,7 @@ return { out };`,
           const taskId = taskEvent.event.payload.id;
 
           const tailChild = yield* mcpService.delegateWorkflowAgent(parentScope, {
-            parentRunId: parentRun.id,
-            workflowNodeId: taskId,
+            coordinatorThreadId: taskEvent.event.payload.childThreadId!,
             requestKey: `${runId}:1`,
             task: { task: "Unfinished tail child", title: "Tail child" },
           });
@@ -6968,5 +6987,377 @@ return { out };`,
           ).toBe(true);
         }).pipe(Effect.provide(harness2.layerToolkit));
       }).pipe(Effect.provide(NodeServices.layer)),
+  );
+
+  it.effect(
+    "creates all queued members up front on coordinator C, admits in strict FIFO call order under meta.concurrency, and honours t3_workflow_run concurrency override",
+    () =>
+      Effect.gen(function* () {
+        const firstStartHit = yield* Deferred.make<void>();
+        const releaseStarts = yield* Deferred.make<void>();
+        let gateStarts = true;
+        const harness = yield* makeWorkflowHarness({
+          name: "fifo-queued-concurrency",
+          wrapThreadManagement: (tm) => ({
+            ...tm,
+            dispatch: (command) =>
+              command.type === "workflow.agent.start" && gateStarts
+                ? Effect.gen(function* () {
+                    yield* Deferred.succeed(firstStartHit, undefined);
+                    yield* Deferred.await(releaseStarts);
+                    return yield* tm.dispatch(command);
+                  })
+                : tm.dispatch(command),
+          }),
+        });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "fifo-queued-concurrency");
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          const script = `
+            export const meta = {
+              name: "FifoFive",
+              description: "Runs five agents with concurrency 2.",
+              concurrency: 2,
+              phases: [{ title: "Work" }],
+            };
+            phase("Work");
+            log("starting five");
+            return await parallel([0, 1, 2, 3, 4].map((i) => () => agent("job-" + i, { label: "m" + i })));
+          `;
+          const runCall = yield* callTool("t3_workflow_run", { script });
+          expect(runCall.isError).not.toBe(true);
+          const started = yield* decodeRunResult(runCall.structuredContent);
+
+          // Pause before the first member starts running: all 5 must already be visible as queued.
+          yield* Deferred.await(firstStartHit);
+          yield* Effect.gen(function* () {
+            const parentBeforeStart = yield* orchestrator.getThreadProjection(parentThreadId);
+            const wfRowBeforeStart = parentBeforeStart.subagents.find(
+              (subagent) => subagent.id === started.taskId,
+            );
+            expect(wfRowBeforeStart?.childThreadId).not.toBeNull();
+            const coordinatorThreadId = wfRowBeforeStart!.childThreadId!;
+            // Parent holds only the coordinator row + clickable card, never member rows or items.
+            expect(parentBeforeStart.subagents).toHaveLength(1);
+            expect(
+              parentBeforeStart.turnItems.filter((item) => item.type === "subagent"),
+            ).toHaveLength(1);
+            expect(wfRowBeforeStart?.workflow?.limits).toEqual({
+              concurrency: 2,
+              maxAgents: 1000,
+            });
+            expect(wfRowBeforeStart?.workflow?.runHandles?.journalPath).toBe(started.journalPath);
+            expect(wfRowBeforeStart?.workflow?.logs).toEqual(["starting five"]);
+            expect(wfRowBeforeStart?.workflow?.agents).toHaveLength(5);
+            expect(wfRowBeforeStart?.workflow?.agents.map((agent) => agent.state)).toEqual([
+              "queued",
+              "queued",
+              "queued",
+              "queued",
+              "queued",
+            ]);
+
+            const statusBeforeStart = yield* decodeStatusResult(
+              (yield* callTool("t3_workflow_status", { runId: started.runId })).structuredContent,
+            );
+            expect(statusBeforeStart.agents).toEqual({
+              queued: 5,
+              running: 0,
+              completed: 0,
+              failed: 0,
+            });
+
+            const coordBeforeStart = yield* orchestrator.getThreadProjection(coordinatorThreadId);
+            expect(coordBeforeStart.thread.creationSource).toBe("server");
+            expect(coordBeforeStart.thread.lineage).toEqual({
+              parentThreadId,
+              rootThreadId: parentThreadId,
+              relationshipToParent: "subagent",
+            });
+            expect(coordBeforeStart.messages[0]?.workflowScript).toBe(true);
+            expect(coordBeforeStart.subagents).toHaveLength(5);
+            expect(coordBeforeStart.subagents.every((sub) => sub.status === "pending")).toBe(true);
+            expect(
+              coordBeforeStart.turnItems.filter((item) => item.type === "subagent"),
+            ).toHaveLength(0);
+            expect(Queue.sizeUnsafe(harness.turnQueue)).toBe(0);
+          }).pipe(
+            Effect.ensuring(
+              Effect.sync(() => {
+                gateStarts = false;
+              }).pipe(Effect.andThen(Deferred.succeed(releaseStarts, undefined))),
+            ),
+          );
+
+          const promptTail = (text: string) => text.split("\n\n").at(-1);
+          const startOrder: Array<string | undefined> = [];
+          const turn0 = yield* Queue.take(harness.turnQueue);
+          startOrder.push(promptTail(turn0.turn.message.text));
+          const turn1 = yield* Queue.take(harness.turnQueue);
+          startOrder.push(promptTail(turn1.turn.message.text));
+          expect(startOrder).toEqual(["job-0", "job-1"]);
+
+          const liveTwo = yield* decodeStatusResult(
+            (yield* callTool("t3_workflow_status", { runId: started.runId })).structuredContent,
+          );
+          expect(liveTwo.agents).toEqual({ queued: 3, running: 2, completed: 0, failed: 0 });
+          expect(Queue.sizeUnsafe(harness.turnQueue)).toBe(0);
+
+          // Complete #1 before #0; next admitted must still be #2 (strict FIFO).
+          yield* turn1.complete("r1", { toolCalls: 2 });
+          const turn2 = yield* Queue.take(harness.turnQueue);
+          startOrder.push(promptTail(turn2.turn.message.text));
+          expect(startOrder).toEqual(["job-0", "job-1", "job-2"]);
+          expect(Queue.sizeUnsafe(harness.turnQueue)).toBe(0);
+
+          yield* turn0.complete("r0", { toolCalls: 1 });
+          const turn3 = yield* Queue.take(harness.turnQueue);
+          startOrder.push(promptTail(turn3.turn.message.text));
+          expect(startOrder).toEqual(["job-0", "job-1", "job-2", "job-3"]);
+
+          yield* turn2.complete("r2");
+          const turn4 = yield* Queue.take(harness.turnQueue);
+          startOrder.push(promptTail(turn4.turn.message.text));
+          expect(startOrder).toEqual(["job-0", "job-1", "job-2", "job-3", "job-4"]);
+
+          yield* turn3.complete("r3");
+          yield* turn4.complete("r4");
+
+          const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
+          expect(terminal.status).toBe("completed");
+          expect(terminal.result).toContain('["r0","r1","r2","r3","r4"]');
+          expect(terminal.workflow?.toolCalls).toBe(3);
+          expect(terminal.workflow?.agents.find((a) => a.index === 0)?.toolCalls).toBe(1);
+          expect(terminal.workflow?.agents.find((a) => a.index === 1)?.toolCalls).toBe(2);
+
+          // Resuming marks replayed agents with cached: true in workflow.agents.
+          const beforeResumeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+          const resumedCall = yield* callTool("t3_workflow_run", {
+            script,
+            resumeFromRunId: started.runId,
+          });
+          expect(resumedCall.isError).not.toBe(true);
+          const resumed = yield* decodeRunResult(resumedCall.structuredContent);
+          const resumedTerminal = yield* awaitWorkflowTerminal(resumed.taskId, beforeResumeSeq);
+          expect(resumedTerminal.status).toBe("completed");
+          expect(resumedTerminal.workflow?.agents.every((agent) => agent.cached === true)).toBe(
+            true,
+          );
+
+          // Caller override concurrency: 1 overrides meta.concurrency = 2.
+          const beforeOverrideSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+          const overrideCall = yield* callTool("t3_workflow_run", {
+            script: `
+              export const meta = { name: "OverrideConc", description: "Overrides concurrency.", concurrency: 2 };
+              return await parallel([0, 1, 2].map((i) => () => agent("ov-" + i, { label: "ov" + i })));
+            `,
+            concurrency: 1,
+          });
+          expect(overrideCall.isError).not.toBe(true);
+          const overrideStarted = yield* decodeRunResult(overrideCall.structuredContent);
+
+          const ov0 = yield* Queue.take(harness.turnQueue);
+          expect(promptTail(ov0.turn.message.text)).toBe("ov-0");
+          const ovStatus = yield* decodeStatusResult(
+            (yield* callTool("t3_workflow_status", { runId: overrideStarted.runId }))
+              .structuredContent,
+          );
+          expect(ovStatus.agents).toEqual({ queued: 2, running: 1, completed: 0, failed: 0 });
+          expect(Queue.sizeUnsafe(harness.turnQueue)).toBe(0);
+          yield* ov0.complete("a");
+          const ov1 = yield* Queue.take(harness.turnQueue);
+          expect(promptTail(ov1.turn.message.text)).toBe("ov-1");
+          yield* ov1.complete("b");
+          const ov2 = yield* Queue.take(harness.turnQueue);
+          expect(promptTail(ov2.turn.message.text)).toBe("ov-2");
+          yield* ov2.complete("c");
+
+          const overrideTerminal = yield* awaitWorkflowTerminal(
+            overrideStarted.taskId,
+            beforeOverrideSeq,
+          );
+          expect(overrideTerminal.status).toBe("completed");
+          expect(overrideTerminal.workflow?.limits).toEqual({ concurrency: 1, maxAgents: 1000 });
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }),
+  );
+
+  it.effect("enforces tokenBudget once usage.tokens >= budget (including queued calls)", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWorkflowHarness({ name: "budget-enforce" });
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "budget-enforce");
+        const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+        // 1. Sequential call after spending >= tokenBudget throws inside agent().
+        const budgetCall = yield* callTool("t3_workflow_run", {
+          script: `
+              export const meta = { name: "BudgetSeq", description: "Stops once tokenBudget is spent." };
+              const first = await agent("first");
+              let caught = null;
+              try {
+                await agent("second");
+              } catch (err) {
+                caught = err.message;
+              }
+              return { first, caught };
+            `,
+          tokenBudget: 100,
+        });
+        expect(budgetCall.isError).not.toBe(true);
+        const budgetRun = yield* decodeRunResult(budgetCall.structuredContent);
+
+        const firstTurn = yield* Queue.take(harness.turnQueue);
+        yield* firstTurn.complete("ok", {
+          turnTokenUsage: {
+            usageStatus: "complete",
+            usageScope: "main_agent",
+            hasSubagents: false,
+            inputTokens: 60,
+            outputTokens: 50,
+          },
+        });
+
+        const budgetTerminal = yield* awaitWorkflowTerminal(budgetRun.taskId, beforeSeq);
+        expect(budgetTerminal.status).toBe("completed");
+        expect(budgetTerminal.result).toContain("The workflow's token budget is spent.");
+        expect(budgetTerminal.workflow?.limits?.tokenBudget).toBe(100);
+        expect(budgetTerminal.workflow?.totalTokens).toBe(110);
+
+        // 2. Queued member waiting for a slot when budget is spent is cancelled and throws.
+        const beforeQueuedBudgetSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+        const queuedBudgetCall = yield* callTool("t3_workflow_run", {
+          script: `
+              export const meta = { name: "BudgetQueued", description: "Queued agent hits budget.", concurrency: 1 };
+              const p0 = agent("spend-all", { label: "spender" });
+              const p1 = agent("blocked-by-budget", { label: "blocked" }).catch((err) => "ERR:" + err.message);
+              return await Promise.all([p0, p1]);
+            `,
+          tokenBudget: 100,
+        });
+        expect(queuedBudgetCall.isError).not.toBe(true);
+        const queuedBudgetRun = yield* decodeRunResult(queuedBudgetCall.structuredContent);
+
+        const spenderTurn = yield* Queue.take(harness.turnQueue);
+        yield* spenderTurn.complete("spent", {
+          turnTokenUsage: {
+            usageStatus: "complete",
+            usageScope: "main_agent",
+            hasSubagents: false,
+            inputTokens: 80,
+            outputTokens: 40,
+          },
+        });
+
+        const queuedBudgetTerminal = yield* awaitWorkflowTerminal(
+          queuedBudgetRun.taskId,
+          beforeQueuedBudgetSeq,
+        );
+        expect(queuedBudgetTerminal.status).toBe("completed");
+        expect(queuedBudgetTerminal.result).toContain("ERR:The workflow's token budget is spent.");
+        expect(queuedBudgetTerminal.workflow?.agents.find((a) => a.index === 1)).toMatchObject({
+          label: "blocked",
+          state: "failed",
+          error: "The workflow's token budget is spent.",
+        });
+      }).pipe(Effect.provide(harness.layerToolkit));
+    }),
+  );
+
+  it.effect("fails on the 1000-agent safety cap", () =>
+    Effect.gen(function* () {
+      const harness = yield* makeWorkflowHarness({ name: "max-agents-cap" });
+      yield* Effect.gen(function* () {
+        const orchestrator = yield* Orchestrator.OrchestratorV2;
+        yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "max-agents-cap");
+        const beforeCapSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+        const capCall = yield* callTool("t3_workflow_run", {
+          script: `
+            export const meta = { name: "TooMany", description: "Exceeds 1000 agents." };
+            const tasks = Array.from({ length: 1001 }, (_, i) => () => agent("a-" + i));
+            return await parallel(tasks);
+          `,
+        });
+        expect(capCall.isError).not.toBe(true);
+        const capRun = yield* decodeRunResult(capCall.structuredContent);
+        const capTerminal = yield* awaitWorkflowTerminal(capRun.taskId, beforeCapSeq);
+        expect(capTerminal.status).toBe("failed");
+        expect(capTerminal.result).toContain("A workflow runs at most 1000 agents");
+      }).pipe(Effect.provide(harness.layerToolkit));
+    }),
+  );
+
+  it.effect(
+    "fails fast on a signed-out provider target (both top-level and per-agent) with the provider's reason in agents[i].error",
+    () =>
+      Effect.gen(function* () {
+        const signedOutInstanceId = ProviderInstanceId.make("signedOut");
+        const signedOutProvider: ServerProvider = {
+          ...providerSnapshot,
+          instanceId: signedOutInstanceId,
+          auth: { status: "unauthenticated", type: "unknown" },
+        };
+        const harness = yield* makeWorkflowHarness({
+          name: "signed-out-target",
+          extraProviders: [signedOutProvider],
+        });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "signed-out-target");
+          const turnsBefore = (yield* Ref.get(harness.startedTurns)).length;
+
+          // 1. Top-level t3_workflow_run target fails fast before creating a run or launching any agent.
+          const topLevelCall = yield* callTool("t3_workflow_run", {
+            script: `
+              export const meta = { name: "SignedOutTop", description: "Top-level signed-out target." };
+              return await agent("Never launched");
+            `,
+            target: { providerInstanceId: signedOutInstanceId },
+          });
+          const topFailure = declaredFailure(topLevelCall);
+          expect(topFailure.code).toBe("provider_unavailable");
+          expect(topFailure.message).toContain("Provider is not authenticated.");
+          expect((yield* Ref.get(harness.startedTurns)).length).toBe(turnsBefore);
+
+          // 2. Per-agent signed-out target fails before launching a child thread and sets agents[i].error.
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+          const perAgentCall = yield* callTool("t3_workflow_run", {
+            script: `
+              export const meta = { name: "SignedOutAgent", description: "One signed-out agent." };
+              const out = await agent("Never launched", {
+                label: "unauth-worker",
+                target: { providerInstanceId: "signedOut" },
+              });
+              return { out };
+            `,
+          });
+          expect(perAgentCall.isError).not.toBe(true);
+          const started = yield* decodeRunResult(perAgentCall.structuredContent);
+          const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
+          expect(terminal.status).toBe("completed");
+          expect((yield* Ref.get(harness.startedTurns)).length).toBe(turnsBefore);
+          expect(terminal.workflow?.agents).toHaveLength(1);
+          expect(terminal.workflow?.agents[0]).toMatchObject({
+            index: 0,
+            label: "unauth-worker",
+            state: "failed",
+            error: expect.stringContaining("Provider is not authenticated."),
+          });
+          expect(terminal.workflow?.agents[0]?.childThreadId).toBeUndefined();
+          const status = yield* decodeStatusResult(
+            (yield* callTool("t3_workflow_status", { runId: started.runId })).structuredContent,
+          );
+          expect(status.failures).toEqual([
+            {
+              index: 0,
+              label: "unauth-worker",
+              error: expect.stringContaining("Provider is not authenticated."),
+            },
+          ]);
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }),
   );
 });

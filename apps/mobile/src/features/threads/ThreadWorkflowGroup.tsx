@@ -53,9 +53,7 @@ export function ThreadWorkflowGroup(props: {
   const { group } = props;
   const gt = useGT();
   const m = useMessages();
-  const provider = useEnvironmentServerConfig(props.environmentId)?.providers.find(
-    (candidate) => candidate.instanceId === props.subagent.providerInstanceId,
-  );
+  const providers = useEnvironmentServerConfig(props.environmentId)?.providers ?? [];
   const [selected, setSelected] = useState<string | null>(null);
   const rail = workflowRail(group, m);
   const open = rail.find((item) => item.key === selected);
@@ -145,15 +143,22 @@ export function ThreadWorkflowGroup(props: {
             <T>No agents yet</T>
           </Text>
         ) : (
-          open.members.map((member) => (
-            <WorkflowMemberRow
-              key={member.id}
-              environmentId={props.environmentId}
-              member={member}
-              provider={provider}
-              onOpen={props.onOpen}
-            />
-          ))
+          open.members.map((member) => {
+            const memberProviderInstanceId =
+              member.providerInstanceId ?? props.subagent.providerInstanceId;
+            const memberProvider = providers.find(
+              (candidate) => candidate.instanceId === memberProviderInstanceId,
+            );
+            return (
+              <WorkflowMemberRow
+                key={member.id}
+                environmentId={props.environmentId}
+                member={member}
+                provider={memberProvider}
+                onOpen={props.onOpen}
+              />
+            );
+          })
         )}
       </ListSection>
     </View>
@@ -232,6 +237,11 @@ function WorkflowMemberRow(props: {
             >
               {presentation.statusLabel}
             </Text>
+            {member.cached === true ? (
+              <Text textRole="label" className="shrink-0 text-foreground-muted">
+                · <T context="workflow member replayed from journal">Cached</T>
+              </Text>
+            ) : null}
           </View>
           <WorkflowElapsed timing={member} />
           {canOpen ? (

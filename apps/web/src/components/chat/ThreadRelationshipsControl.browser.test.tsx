@@ -11,6 +11,8 @@ import "~/index.css";
 const state = vi.hoisted(() => ({
   projection: null as unknown,
   commandSucceeds: false,
+  canOperateWorkflow: false,
+  commandCalls: [] as Array<unknown>,
   relatedShells: [] as unknown[],
   threadTitles: {} as Record<string, string>,
   archivedThreads: [] as unknown[],
@@ -26,7 +28,7 @@ vi.mock(import("../../state/query"), async (original) => ({
 
 vi.mock(import("@effect/atom-react"), async (original) => ({
   ...(await original()),
-  useAtomValue: (() => false) as never,
+  useAtomValue: (() => state.canOperateWorkflow) as never,
 }));
 
 vi.mock(import("../../state/entities"), () => ({
@@ -58,10 +60,12 @@ vi.mock(import("../../lib/archivedThreadsState"), () => ({
   })) as never,
 }));
 vi.mock(import("../../state/use-atom-command"), () => ({
-  useAtomCommand: (() => async () =>
-    state.commandSucceeds
+  useAtomCommand: (() => async (arg: unknown) => {
+    state.commandCalls.push(arg);
+    return state.commandSucceeds
       ? AsyncResult.success(undefined)
-      : AsyncResult.failure(Cause.fail(new Error("Connection lost")))) as never,
+      : AsyncResult.failure(Cause.fail(new Error("Connection lost")));
+  }) as never,
 }));
 
 import { scopeThreadRef } from "@t3tools/client-runtime/environment";
@@ -80,6 +84,8 @@ const threadId = ThreadId.make("fork");
 function setup() {
   useRightPanelStore.setState(useRightPanelStore.getInitialState());
   state.commandSucceeds = false;
+  state.canOperateWorkflow = false;
+  state.commandCalls = [];
   state.relatedShells = [];
   state.threadTitles = { source: "Source" };
   state.archivedThreads = [];
@@ -543,70 +549,137 @@ it.each([1, 18])("continues scrolling the panel past a list of %i subagents", as
   await vi.waitFor(() => expect(viewport.scrollTop).toBeGreaterThan(0));
 });
 
-it("opens a server workflow's phases from its header and each member's thread from its row", async () => {
-  setup();
-  const projection = makeThreadProjectionFixture();
-  const environmentId = EnvironmentId.make("local");
-  const memberId = ThreadId.make("workflow-member");
-  state.projection = {
-    ...projection,
-    subagents: [
+it.each(["provider_native", "app_owned"] as const)(
+  "lists one workflow row (C) on P for %s workflows, opens C or M_i, stops it, and keeps M_i off P's lineage",
+  async (origin) => {
+    setup();
+    state.canOperateWorkflow = true;
+    state.commandSucceeds = true;
+    const projection = makeThreadProjectionFixture();
+    const environmentId = EnvironmentId.make("local");
+    const coordinatorId = ThreadId.make(`workflow-coordinator-${origin}`);
+    const memberId = ThreadId.make(`workflow-member-${origin}`);
+    const driver = origin === "provider_native" ? "claudeAgent" : "codex";
+    state.relatedShells = [
       {
-        id: NodeId.make("workflow"),
-        threadId: projection.thread.id,
-        runId: null,
-        parentNodeId: NodeId.make("parent"),
-        origin: "app_owned",
-        createdBy: "agent",
-        driver: "codex",
-        providerInstanceId: projection.thread.providerInstanceId,
-        providerThreadId: null,
-        childThreadId: null,
-        nativeTaskRef: null,
-        prompt: "export const meta = {}",
-        title: "Review run",
-        model: null,
-        status: "running",
-        result: null,
-        startedAt: projection.thread.updatedAt,
-        completedAt: null,
-        updatedAt: projection.thread.updatedAt,
-        workflow: {
-          name: "Review run",
-          phases: [{ index: 0, title: "Scan" }],
-          agents: [
-            {
-              index: 0,
-              label: "scanner",
-              childThreadId: memberId,
-              state: "running",
-              phaseIndex: 0,
-              phaseTitle: "Scan",
-              startedAt: 1,
-            },
-          ],
+        ...projection.thread,
+        id: coordinatorId,
+        title: "Workflow · Review run",
+        creationSource: origin === "provider_native" ? "provider" : "server",
+        lineage: {
+          rootThreadId: projection.thread.id,
+          parentThreadId: projection.thread.id,
+          relationshipToParent: "subagent",
         },
+        activityRunStatus: "running",
       },
-    ],
-  };
-  await using screen = await render(
-    <ThreadRelationshipsPanel
-      environmentId={environmentId}
-      threadId={projection.thread.id}
-      showLineage
-      showSideChats
-    />,
-  );
-  const header = screen.getByRole("button", { name: /^Review run/ });
-  await expect.element(header).toHaveAttribute("aria-expanded", "false");
-  await header.click();
-  await expect.element(header).toHaveAttribute("aria-expanded", "true");
-  await expect.element(screen.getByRole("button", { name: /Scan phase/ })).toBeVisible();
-  const member = screen.getByRole("button", { name: "Open scanner chat" });
-  await expect.element(member).toBeEnabled();
-  await member.click();
-  const panelRef = scopeThreadRef(environmentId, projection.thread.id);
-  expect(
-    selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, panelRef),
-  ).toMatchObject({ isOpen: true, surfaces: [{ kind: "thread", threadId: memberId }] });
-});
+      {
+        ...projection.thread,
+        id: memberId,
+        title: "scanner",
+        creationSource: origin === "provider_native" ? "provider" : "mcp",
+        lineage: {
+          rootThreadId: projection.thread.id,
+          parentThreadId: coordinatorId,
+          relationshipToParent: "subagent",
+        },
+        activityRunStatus: "running",
+      },
+    ];
+    state.projection = {
+      ...projection,
+      subagents: [
+        {
+          id: NodeId.make("workflow"),
+          threadId: projection.thread.id,
+          runId: null,
+          parentNodeId: NodeId.make("parent"),
+          origin,
+          createdBy: "agent",
+          driver,
+          providerInstanceId: projection.thread.providerInstanceId,
+          providerThreadId: null,
+          childThreadId: coordinatorId,
+          nativeTaskRef:
+            origin === "provider_native"
+              ? { driver: "claudeAgent", nativeId: "native-wf", strength: "strong" }
+              : null,
+          prompt: "export const meta = {}",
+          title: "Review run",
+          model: null,
+          status: "running",
+          result: null,
+          startedAt: projection.thread.updatedAt,
+          completedAt: null,
+          updatedAt: projection.thread.updatedAt,
+          workflow: {
+            name: "Review run",
+            phases: [{ index: 0, title: "Scan" }],
+            agents: [
+              {
+                index: 0,
+                label: "scanner",
+                childThreadId: memberId,
+                state: "running",
+                phaseIndex: 0,
+                phaseTitle: "Scan",
+                startedAt: 1,
+              },
+            ],
+          },
+        },
+      ],
+    };
+    await using screen = await render(
+      <ThreadRelationshipsPanel
+        environmentId={environmentId}
+        threadId={projection.thread.id}
+        showLineage
+        showSideChats
+      />,
+    );
+
+    // P's top-level lineage lists only the coordinator workflow row C, never member M_i directly.
+    const topItems = screen.getByRole("list", { name: "Related threads" }).element().children;
+    expect(topItems).toHaveLength(1);
+    await expect
+      .element(screen.getByRole("button", { name: "Open scanner chat" }))
+      .not.toBeInTheDocument();
+
+    // Clicking the workflow row header opens C in the side panel.
+    await screen.getByRole("button", { name: /^Review run/ }).click();
+    const panelRef = scopeThreadRef(environmentId, projection.thread.id);
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, panelRef),
+    ).toMatchObject({ isOpen: true, surfaces: [{ kind: "thread", threadId: coordinatorId }] });
+
+    // Expanding the disclosure reveals the phase and opens member M_i.
+    const expand = screen.getByRole("button", { name: "Expand Review run" });
+    await expect.element(expand).toHaveAttribute("aria-expanded", "false");
+    await expand.click();
+    await expect
+      .element(screen.getByRole("button", { name: "Collapse Review run" }))
+      .toHaveAttribute("aria-expanded", "true");
+    await expect.element(screen.getByRole("button", { name: /Scan phase/ })).toBeVisible();
+    const member = screen.getByRole("button", { name: "Open scanner chat" });
+    await expect.element(member).toBeEnabled();
+    await member.click();
+    expect(
+      selectThreadRightPanelState(useRightPanelStore.getState().byThreadKey, panelRef),
+    ).toMatchObject({
+      isOpen: true,
+      surfaces: expect.arrayContaining([
+        expect.objectContaining({ kind: "thread", threadId: memberId }),
+      ]),
+    });
+
+    // Stop button calls stopWorkflow for both native and server workflows.
+    await screen.getByRole("button", { name: "Stop workflow Review run" }).click();
+    expect(state.commandCalls).toEqual([
+      {
+        environmentId,
+        input: { threadId: projection.thread.id, subagentId: NodeId.make("workflow") },
+      },
+    ]);
+  },
+);

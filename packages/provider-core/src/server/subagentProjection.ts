@@ -8,6 +8,7 @@ import type {
   OrchestrationV2ConversationMessage,
   OrchestrationV2CreationSource,
   OrchestrationV2DomainEvent,
+  OrchestrationV2ExecutionNode,
   OrchestrationV2ProviderRef,
   OrchestrationV2Run,
   OrchestrationV2ThreadProjection,
@@ -116,15 +117,17 @@ export function makeSubagentConversationArtifacts(input: {
   readonly role: "user" | "assistant";
   readonly text: string;
   readonly workflowScript?: boolean;
+  readonly creationSource?: OrchestrationV2CreationSource;
   readonly ordinal: number;
   readonly now: DateTime.Utc;
 }): {
   readonly message: OrchestrationV2ConversationMessage;
   readonly turnItem: OrchestrationV2TurnItem;
 } {
+  const creationSource = input.creationSource ?? "provider";
   const message: OrchestrationV2ConversationMessage = {
     createdBy: "agent",
-    creationSource: "provider",
+    creationSource,
     id: input.messageId,
     threadId: input.threadId,
     runId: null,
@@ -165,7 +168,7 @@ export function makeSubagentConversationArtifacts(input: {
       ? {
           ...base,
           createdBy: "agent",
-          creationSource: "provider",
+          creationSource,
           type: "user_message",
           ...(input.senderThreadId === undefined ? {} : { senderThreadId: input.senderThreadId }),
           ...(input.workflowScript === undefined ? {} : { workflowScript: input.workflowScript }),
@@ -178,6 +181,136 @@ export function makeSubagentConversationArtifacts(input: {
           streaming: false,
         };
   return { message, turnItem };
+}
+
+export const WORKFLOW_SCRIPT_OPENING_BYTE_CAP = 256 * 1024;
+
+const WORKFLOW_SCRIPT_TRUNCATION_NOTE =
+  "\n// [Truncated at 256 KiB; open the full script from scriptPath.]";
+
+function boundWorkflowScriptText(
+  scriptText: string,
+  byteCap: number,
+): { readonly text: string; readonly truncated: boolean } {
+  const totalBytes = Buffer.byteLength(scriptText, "utf8");
+  if (totalBytes <= byteCap) {
+    return { text: scriptText, truncated: false };
+  }
+  const noteBytes = Buffer.byteLength(WORKFLOW_SCRIPT_TRUNCATION_NOTE, "utf8");
+  const targetBytes = Math.max(0, byteCap - noteBytes);
+  let bytes = 0;
+  let end = 0;
+  while (end < scriptText.length) {
+    const codePoint = scriptText.codePointAt(end)!;
+    const step = codePoint > 0xffff ? 2 : 1;
+    const charBytes = codePoint <= 0x7f ? 1 : codePoint <= 0x7ff ? 2 : codePoint <= 0xffff ? 3 : 4;
+    if (bytes + charBytes > targetBytes) break;
+    bytes += charBytes;
+    end += step;
+  }
+  return {
+    text: `${scriptText.slice(0, end)}${WORKFLOW_SCRIPT_TRUNCATION_NOTE}`,
+    truncated: true,
+  };
+}
+
+export function makeWorkflowCoordinatorArtifacts(input: {
+  readonly parentThread: OrchestrationV2AppThread;
+  readonly coordinatorThreadId: ThreadId;
+  readonly workflowNodeId: NodeId;
+  readonly scriptText: string;
+  readonly title: string;
+  readonly status: OrchestrationV2ExecutionNode["status"];
+  readonly now: DateTime.Utc;
+  readonly modelSelection?: ModelSelection;
+  readonly creationSource?: OrchestrationV2CreationSource;
+  readonly nativeItemRef?: OrchestrationV2ProviderRef | null;
+  readonly rootNodeId?: NodeId;
+  readonly messageId?: MessageId;
+  readonly turnItemId?: TurnItemId;
+  readonly scriptByteCap?: number;
+}): {
+  readonly thread: OrchestrationV2AppThread;
+  readonly rootNode: OrchestrationV2ExecutionNode;
+  readonly scriptMessage: OrchestrationV2ConversationMessage;
+  readonly scriptTurnItem: OrchestrationV2TurnItem;
+  readonly scriptText: string;
+  readonly scriptTruncated: boolean;
+} {
+  const creationSource = input.creationSource ?? "server";
+  const modelSelection = input.modelSelection ?? input.parentThread.modelSelection;
+  const nativeItemRef = input.nativeItemRef ?? null;
+  const rootNodeId =
+    input.rootNodeId ??
+    derive.workflowCoordinatorRootNode({ coordinatorThreadId: input.coordinatorThreadId });
+  const messageId =
+    input.messageId ??
+    derive.workflowCoordinatorScriptMessage({ coordinatorThreadId: input.coordinatorThreadId });
+  const turnItemId =
+    input.turnItemId ??
+    derive.workflowCoordinatorScriptTurnItem({ coordinatorThreadId: input.coordinatorThreadId });
+  const bounded = boundWorkflowScriptText(
+    input.scriptText,
+    input.scriptByteCap ?? WORKFLOW_SCRIPT_OPENING_BYTE_CAP,
+  );
+  const thread = makeSubagentChildThread({
+    parentThread: input.parentThread,
+    childThreadId: input.coordinatorThreadId,
+    parentNodeId: input.workflowNodeId,
+    activeProviderThreadId: null,
+    providerInstanceId: modelSelection.instanceId,
+    modelSelection,
+    title: subagentThreadTitle({
+      parentTitle: input.parentThread.title,
+      title: input.title,
+      prompt: bounded.text,
+      ordinal: 1,
+    }),
+    now: input.now,
+    createdBy: "agent",
+    creationSource,
+  });
+  const rootNode: OrchestrationV2ExecutionNode = {
+    id: rootNodeId,
+    threadId: input.coordinatorThreadId,
+    runId: null,
+    parentNodeId: null,
+    rootNodeId,
+    kind: "root_turn",
+    status: input.status,
+    countsForRun: false,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef,
+    runtimeRequestId: null,
+    checkpointScopeId: null,
+    startedAt: input.now,
+    completedAt: isOrchestrationV2WorkActive(input.status) ? null : input.now,
+  };
+  const { message: scriptMessage, turnItem: scriptTurnItem } = makeSubagentConversationArtifacts({
+    messageId,
+    senderThreadId: input.parentThread.id,
+    turnItemId,
+    threadId: input.coordinatorThreadId,
+    rootNodeId,
+    providerThreadId: null,
+    providerTurnId: null,
+    nativeItemRef,
+    role: "user",
+    text: bounded.text,
+    workflowScript: true,
+    creationSource,
+    ordinal: 100,
+    now: input.now,
+  });
+  return {
+    thread,
+    rootNode,
+    scriptMessage,
+    scriptTurnItem,
+    scriptText: bounded.text,
+    scriptTruncated: bounded.truncated,
+  };
 }
 
 /** A delegated result, led by a note when the provider reported running another model than requested. */
