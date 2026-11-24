@@ -45,16 +45,30 @@ if (
   process.stdout.on("error", ignoreOutputError);
   process.stderr.on("error", ignoreOutputError);
 
-  // The launcher owns shutdown until its child exits, so it bypasses the Effect CLI runtime.
-  // A service unit passes nothing, or on Windows the launcher's own flags; help and anything
-  // else go through the full CLI.
-  const launcher =
-    process.argv[2] === "__service-launcher" ? await import("./cli/serviceLauncher.ts") : undefined;
-  const launcherOptions = launcher?.parseServiceLauncherArgs(process.argv.slice(3));
-  if (launcher !== undefined && launcherOptions !== undefined) {
-    await launcher.runServiceLauncherCli(launcherOptions);
+  // The sandbox worker, process launcher, and service launcher bypass the full CLI runtime so
+  // packaged SEA and desktop builds keep worker startup minimal and never load server modules
+  // into the sandbox.
+  if (process.argv[2] === "__workflow-sandbox-worker" && process.argv.length === 3) {
+    const { runWorkflowSandboxWorker } = await import("./workflows/sandboxWorker.ts");
+    runWorkflowSandboxWorker();
+  } else if (process.argv[2] === "__process-launcher") {
+    // Single executables host the launcher here; other builds start process-launcher.mjs directly.
+    const { runProcessLauncher } = await import("./process/processLauncherWorker.ts");
+    runProcessLauncher();
   } else {
-    const { runCliCommand } = await loadCliMain();
-    await runCliCommand();
+    // The launcher owns shutdown until its child exits, so it bypasses the Effect CLI runtime.
+    // A service unit passes nothing, or on Windows the launcher's own flags; help and anything
+    // else go through the full CLI.
+    const launcher =
+      process.argv[2] === "__service-launcher"
+        ? await import("./cli/serviceLauncher.ts")
+        : undefined;
+    const launcherOptions = launcher?.parseServiceLauncherArgs(process.argv.slice(3));
+    if (launcher !== undefined && launcherOptions !== undefined) {
+      await launcher.runServiceLauncherCli(launcherOptions);
+    } else {
+      const { runCliCommand } = await loadCliMain();
+      await runCliCommand();
+    }
   }
 }

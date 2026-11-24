@@ -15,22 +15,39 @@ import {
   TurnItemId,
   type OrchestrationV2DomainEvent,
   type OrchestrationV2StoredEvent,
+  type OrchestrationV2Subagent,
+  type OrchestrationV2SubagentWorkflow,
   type OrchestrationV2ThreadProjection,
   type OrchestrationV2ThreadStreamItem,
   OrchestrationV2TurnItem,
   OrchestrationV2TurnItemJson,
+  type OrchestrationV2WorkflowAgent,
 } from "@t3tools/contracts";
+import {
+  dedupeSnapshotBodies,
+  restoreSnapshotBodies,
+  restoreSubagentBodies,
+  restoreTurnItemBodies,
+} from "@t3tools/shared/orchestrationV2DedupedBodies";
 import { describe, expect, it } from "@effect/vitest";
 import * as DateTime from "effect/DateTime";
+import * as Effect from "effect/Effect";
+import * as Layer from "effect/Layer";
 import * as Schema from "effect/Schema";
+import * as Stream from "effect/Stream";
 
+import * as OrchestrationEventStore from "../persistence/OrchestrationEventStore.ts";
+import { subscribeOrchestrationV2Thread } from "../ws.ts";
 import { coalesceLiveUpdatedEvents } from "./ThreadLiveEventCoalescer.ts";
+import * as ThreadManagementService from "./ThreadManagementService.ts";
 import {
   makeLiveBodyDeduper,
+  makeWorkflowMemberBounder,
   projectTurnItemForWire,
   projectTurnItemForDetail,
   projectDomainEventForWire,
   projectStoredEventForWire,
+  projectThreadProjectionForWire,
 } from "./WireProjection.ts";
 import { threadShellFromProjection } from "./ProjectionStore.ts";
 import { MAX_TOOL_OUTPUT_IMAGES, toolOutputImages } from "@t3tools/shared/toolOutput";
@@ -421,6 +438,607 @@ describe("orchestration V2 wire projection", () => {
     };
     expect(projectStoredEventForWire(detached)).toBe(detached);
   });
+
+  it("bounds workflow-member prompts, results, and titles across events, snapshots, and dedup", () => {
+    const longPrompt = "a".repeat(498) + "😀" + "b".repeat(1_000);
+    const longResult = "r".repeat(501);
+    const longTitle = "t".repeat(198) + "😀" + "z".repeat(50);
+    const expectedPrompt = "a".repeat(498) + "…";
+    const expectedResult = "r".repeat(499) + "…";
+    const expectedTitle = "t".repeat(198) + "…";
+    const makeSubagent = (
+      id: string,
+      overrides: Partial<OrchestrationV2Subagent>,
+    ): OrchestrationV2Subagent => ({
+      id: NodeId.make(id),
+      threadId: base.threadId,
+      runId: null,
+      parentNodeId: NodeId.make("workflow-node"),
+      origin: "app_owned",
+      createdBy: "agent",
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      providerThreadId: null,
+      childThreadId: ThreadId.make(`child-${id}`),
+      nativeTaskRef: null,
+      prompt: longPrompt,
+      title: longTitle,
+      model: "gpt-5",
+      status: "completed",
+      result: longResult,
+      startedAt: base.startedAt,
+      completedAt: base.completedAt,
+      updatedAt: base.updatedAt,
+      ...overrides,
+    });
+    const makeSubagentItem = (id: string, subagent: OrchestrationV2Subagent) =>
+      ({
+        ...base,
+        id: TurnItemId.make(id),
+        type: "subagent" as const,
+        subagentId: subagent.id,
+        origin: "app_owned" as const,
+        driver: subagent.driver,
+        providerInstanceId: subagent.providerInstanceId,
+        childThreadId: subagent.childThreadId,
+        title: subagent.title,
+        prompt: subagent.prompt,
+        result: subagent.result,
+      }) satisfies OrchestrationV2TurnItem;
+
+    const workflowMember = makeSubagent("wf-member", { completionWake: "never" });
+    const shortMember = makeSubagent("wf-member-short", {
+      completionWake: "never",
+      title: "a".repeat(200),
+      prompt: "s".repeat(500),
+      result: "d".repeat(500),
+    });
+    const ordinaryTask = makeSubagent("ordinary-task", { completionWake: "always" });
+
+    const memberEvent = {
+      id: EventId.make("wf-member-event"),
+      type: "subagent.updated" as const,
+      threadId: base.threadId,
+      occurredAt: base.updatedAt,
+      payload: workflowMember,
+    };
+    const projectedMemberEvent = projectDomainEventForWire(memberEvent);
+    expect(
+      projectedMemberEvent.type === "subagent.updated" && projectedMemberEvent.payload,
+    ).toEqual({
+      ...workflowMember,
+      title: expectedTitle,
+      prompt: expectedPrompt,
+      result: expectedResult,
+    });
+    expect(projectDomainEventForWire(projectedMemberEvent)).toBe(projectedMemberEvent);
+    expect(workflowMember.prompt).toBe(longPrompt);
+    expect(workflowMember.result).toBe(longResult);
+
+    const shortEvent = { ...memberEvent, id: EventId.make("short-event"), payload: shortMember };
+    expect(projectDomainEventForWire(shortEvent)).toBe(shortEvent);
+
+    const memberItem = makeSubagentItem("item-wf-member", workflowMember);
+    const ordinaryItem = makeSubagentItem("item-ordinary", ordinaryTask);
+    const memberItemEvent = {
+      id: EventId.make("wf-member-item-event"),
+      type: "turn-item.updated" as const,
+      threadId: base.threadId,
+      occurredAt: base.updatedAt,
+      payload: memberItem,
+    };
+    const projectedItemEvent = projectDomainEventForWire(memberItemEvent);
+    expect(
+      projectedItemEvent.type === "turn-item.updated" && projectedItemEvent.payload,
+    ).toMatchObject({ prompt: longPrompt, result: longResult });
+    const bound = makeWorkflowMemberBounder();
+    bound({ kind: "event", sequence: 1, event: memberEvent } as OrchestrationV2ThreadStreamItem);
+    const boundedItem = bound({
+      kind: "event",
+      sequence: 2,
+      event: projectedItemEvent,
+    } as OrchestrationV2ThreadStreamItem);
+    expect(
+      boundedItem.kind === "event" &&
+        boundedItem.event.type === "turn-item.updated" &&
+        boundedItem.event.payload,
+    ).toMatchObject({ title: expectedTitle, prompt: expectedPrompt, result: expectedResult });
+    const ordinaryItemEvent = {
+      ...memberItemEvent,
+      id: EventId.make("ordinary-item-event"),
+      payload: makeSubagentItem("item-ordinary-live", ordinaryTask),
+    };
+    const ordinaryStreamItem = {
+      kind: "event",
+      sequence: 3,
+      event: ordinaryItemEvent,
+    } as OrchestrationV2ThreadStreamItem;
+    expect(bound(ordinaryStreamItem)).toBe(ordinaryStreamItem);
+
+    const snapshot = {
+      thread: { id: base.threadId },
+      checkpoints: [],
+      contextHandoffs: [],
+      messages: [],
+      subagents: [workflowMember, ordinaryTask],
+      turnItems: [memberItem, ordinaryItem],
+      visibleTurnItems: [memberItem, ordinaryItem].map((item, position) => ({
+        position,
+        visibility: "local" as const,
+        sourceThreadId: base.threadId,
+        sourceItemId: item.id,
+        item,
+      })),
+    } as unknown as OrchestrationV2ThreadProjection;
+
+    const projected = projectThreadProjectionForWire(snapshot);
+    expect(projected.subagents).toEqual([
+      { ...workflowMember, title: expectedTitle, prompt: expectedPrompt, result: expectedResult },
+      ordinaryTask,
+    ]);
+    expect(projected.turnItems[0]).toEqual({
+      ...memberItem,
+      title: expectedTitle,
+      prompt: expectedPrompt,
+      result: expectedResult,
+    });
+    expect(projected.visibleTurnItems[0]?.item).toBe(projected.turnItems[0]);
+    expect(projected.turnItems[1]).toMatchObject({
+      title: longTitle,
+      prompt: longPrompt,
+      result: longResult,
+    });
+
+    const deduped = dedupeSnapshotBodies(projected);
+    expect(deduped.turnItems[0]).toMatchObject({
+      prompt: "",
+      promptOmitted: true,
+      result: null,
+      resultOmitted: true,
+    });
+    expect(deduped.turnItems[1]).toMatchObject({
+      prompt: "",
+      promptOmitted: true,
+      result: null,
+      resultOmitted: true,
+    });
+    expect(restoreSnapshotBodies(deduped)).toEqual(projected);
+  });
+
+  describe("workflow wire bounding and deltas", () => {
+    const makeWorkflowAgent = (
+      index: number,
+      overrides: Partial<OrchestrationV2WorkflowAgent> = {},
+    ): OrchestrationV2WorkflowAgent => ({
+      index,
+      label: `agent-${index}-${"L".repeat(250)}`,
+      state: "completed",
+      phaseIndex: index % 3,
+      phaseTitle: `Phase ${(index % 3) + 1}`,
+      startedAt: 1_000 + index,
+      completedAt: 2_000 + index,
+      prompt: `prompt-${index}-${"p".repeat(1_200)}`,
+      result: `result-${index}-${"r".repeat(1_200)}`,
+      ...overrides,
+    });
+
+    const makeWorkflowSubagent = (
+      workflow: OrchestrationV2SubagentWorkflow,
+    ): OrchestrationV2Subagent => ({
+      id: NodeId.make("workflow-coord"),
+      threadId: base.threadId,
+      runId: null,
+      parentNodeId: NodeId.make("root-node"),
+      origin: "app_owned",
+      createdBy: "agent",
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      providerThreadId: null,
+      childThreadId: null,
+      nativeTaskRef: null,
+      prompt: "Run 1000 checks",
+      title: "Large workflow",
+      model: "gpt-5",
+      completionWake: "always",
+      status: "running",
+      workflow,
+      result: null,
+      startedAt: base.startedAt,
+      completedAt: null,
+      updatedAt: base.updatedAt,
+    });
+
+    const phases = [
+      { index: 0, title: "Phase 1" },
+      { index: 1, title: "Phase 2" },
+      { index: 2, title: "Phase 3" },
+    ];
+
+    it("keeps a 1,000-agent workflow progress event with one changed row under a few KB", () => {
+      const agents = Array.from({ length: 1_000 }, (_, index) =>
+        makeWorkflowAgent(
+          index,
+          index === 42 ? { state: "running" as const, completedAt: undefined } : undefined,
+        ),
+      );
+      const rawWorkflow: OrchestrationV2SubagentWorkflow = {
+        name: "fanout-1000",
+        phases,
+        agents,
+        changedAgentIndices: [42],
+        totalTokens: 500_000,
+        durationMs: 42_000,
+      };
+      const rawEvent: OrchestrationV2DomainEvent = {
+        id: EventId.make("wf-delta-1"),
+        type: "subagent.updated",
+        threadId: base.threadId,
+        occurredAt: base.updatedAt,
+        payload: makeWorkflowSubagent(rawWorkflow),
+      };
+
+      const projected = projectDomainEventForWire(rawEvent);
+      expect(projected.type).toBe("subagent.updated");
+      const projectedWorkflow =
+        projected.type === "subagent.updated" ? projected.payload.workflow : undefined;
+
+      expect(projectedWorkflow?.agentsDelta).toBe(true);
+      expect(projectedWorkflow?.agentCount).toBe(1_000);
+      expect(projectedWorkflow).not.toHaveProperty("changedAgentIndices");
+      expect(projectedWorkflow?.phases).toEqual(phases);
+      expect(projectedWorkflow?.agents).toHaveLength(1);
+      const [changed] = projectedWorkflow!.agents;
+      expect(changed?.index).toBe(42);
+      expect(changed?.label.length).toBeLessThanOrEqual(200);
+      expect(changed?.label.endsWith("…")).toBe(true);
+      expect(changed?.prompt?.length).toBeLessThanOrEqual(500);
+      expect(changed?.result?.length).toBeLessThanOrEqual(500);
+
+      const wireBytes = Buffer.byteLength(JSON.stringify(projected), "utf8");
+      expect(wireBytes).toBeLessThan(3_072);
+      expect(projectDomainEventForWire(projected)).toBe(projected);
+      expect(rawWorkflow.changedAgentIndices).toEqual([42]);
+      expect(rawWorkflow.agents).toHaveLength(1_000);
+
+      // An empty delta still drops changedAgentIndices and preserves total count.
+      const emptyDelta = projectDomainEventForWire({
+        ...rawEvent,
+        id: EventId.make("wf-delta-empty"),
+        payload: makeWorkflowSubagent({ ...rawWorkflow, changedAgentIndices: [] }),
+      });
+      const emptyWorkflow =
+        emptyDelta.type === "subagent.updated" ? emptyDelta.payload.workflow : undefined;
+      expect(emptyWorkflow?.agents).toEqual([]);
+      expect(emptyWorkflow?.agentsDelta).toBe(true);
+      expect(emptyWorkflow?.agentCount).toBe(1_000);
+      expect(emptyWorkflow).not.toHaveProperty("changedAgentIndices");
+
+      // A delta naming > 200 changed indices becomes a bounded replacement so no row stays stale.
+      const hugeDelta = projectDomainEventForWire({
+        ...rawEvent,
+        id: EventId.make("wf-delta-huge"),
+        payload: makeWorkflowSubagent({
+          ...rawWorkflow,
+          changedAgentIndices: Array.from({ length: 260 }, (_, index) => index),
+        }),
+      });
+      const hugeWorkflow =
+        hugeDelta.type === "subagent.updated" ? hugeDelta.payload.workflow : undefined;
+      expect(hugeWorkflow?.agents).toHaveLength(200);
+      expect(hugeWorkflow).not.toHaveProperty("agentsDelta");
+      expect(hugeWorkflow?.agentCount).toBe(1_000);
+      expect(hugeWorkflow).not.toHaveProperty("changedAgentIndices");
+    });
+
+    it("bounds snapshots and non-delta events to 200 rows with active first, then most recently completed", () => {
+      const agents = Array.from({ length: 1_000 }, (_, index) => {
+        if (index < 10) {
+          return makeWorkflowAgent(index, { state: "running", completedAt: undefined });
+        }
+        if (index >= 985) {
+          return makeWorkflowAgent(index, {
+            state: "queued",
+            startedAt: undefined,
+            completedAt: undefined,
+            queuedAt: 3_000 + index,
+          });
+        }
+        // Index 500 finished last so recency must beat index order.
+        const completedAt = index === 500 ? 99_999 : 2_000 + index;
+        return makeWorkflowAgent(index, {
+          state: index % 20 === 0 ? "failed" : "completed",
+          completedAt,
+        });
+      });
+
+      const subagent = makeWorkflowSubagent({
+        name: "bounded-snapshot",
+        phases,
+        agents,
+        changedAgentIndices: [0],
+      });
+      const snapshot = {
+        thread: { id: base.threadId },
+        checkpoints: [],
+        contextHandoffs: [],
+        messages: [],
+        subagents: [subagent],
+        turnItems: [],
+        visibleTurnItems: [],
+      } as unknown as OrchestrationV2ThreadProjection;
+
+      const projectedSnapshot = projectThreadProjectionForWire(snapshot);
+      const snapshotWorkflow = projectedSnapshot.subagents[0]?.workflow;
+      expect(snapshotWorkflow?.agents).toHaveLength(200);
+      expect(snapshotWorkflow?.agentCount).toBe(1_000);
+      expect(snapshotWorkflow?.phases).toEqual(phases);
+      expect(snapshotWorkflow).not.toHaveProperty("changedAgentIndices");
+      expect(snapshotWorkflow).not.toHaveProperty("agentsDelta");
+
+      const snapshotAgents = snapshotWorkflow!.agents;
+      expect(snapshotAgents.slice(0, 10).map((agent) => agent.index)).toEqual([
+        0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+      ]);
+      expect(snapshotAgents.slice(10, 25).map((agent) => agent.index)).toEqual(
+        Array.from({ length: 15 }, (_, offset) => 985 + offset),
+      );
+      expect(snapshotAgents[25]?.index).toBe(500);
+      expect(snapshotAgents[26]?.index).toBe(984);
+      expect(snapshotAgents.at(-1)?.index).toBe(811);
+      for (const agent of snapshotAgents) {
+        expect(agent.label.length).toBeLessThanOrEqual(200);
+        expect(agent.prompt?.length ?? 0).toBeLessThanOrEqual(500);
+        expect(agent.result?.length ?? 0).toBeLessThanOrEqual(500);
+      }
+
+      // Non-delta subagent.updated uses the same 200-row cap.
+      const nonDelta = projectDomainEventForWire({
+        id: EventId.make("wf-full"),
+        type: "subagent.updated",
+        threadId: base.threadId,
+        occurredAt: base.updatedAt,
+        payload: makeWorkflowSubagent({ name: "bounded-snapshot", phases, agents }),
+      });
+      const nonDeltaWorkflow =
+        nonDelta.type === "subagent.updated" ? nonDelta.payload.workflow : undefined;
+      expect(nonDeltaWorkflow).toEqual(snapshotWorkflow);
+      expect(projectDomainEventForWire(nonDelta)).toBe(nonDelta);
+
+      // When active rows alone exceed 200, running rows win over queued and settled rows.
+      const activeHeavy = projectDomainEventForWire({
+        id: EventId.make("wf-active-heavy"),
+        type: "subagent.updated",
+        threadId: base.threadId,
+        occurredAt: base.updatedAt,
+        payload: makeWorkflowSubagent({
+          name: "active-heavy",
+          phases,
+          agents: [
+            ...Array.from({ length: 50 }, (_, index) =>
+              makeWorkflowAgent(index, { state: "running", completedAt: undefined }),
+            ),
+            ...Array.from({ length: 200 }, (_, offset) =>
+              makeWorkflowAgent(50 + offset, {
+                state: "queued",
+                startedAt: undefined,
+                completedAt: undefined,
+              }),
+            ),
+            ...Array.from({ length: 50 }, (_, offset) =>
+              makeWorkflowAgent(250 + offset, { state: "completed", completedAt: 9_000 + offset }),
+            ),
+          ],
+        }),
+      });
+      const activeHeavyWorkflow =
+        activeHeavy.type === "subagent.updated" ? activeHeavy.payload.workflow : undefined;
+      expect(activeHeavyWorkflow?.agents).toHaveLength(200);
+      expect(activeHeavyWorkflow?.agentCount).toBe(300);
+      expect(activeHeavyWorkflow?.agents.filter((agent) => agent.state === "running")).toHaveLength(
+        50,
+      );
+      expect(activeHeavyWorkflow?.agents.filter((agent) => agent.state === "queued")).toHaveLength(
+        150,
+      );
+      expect(activeHeavyWorkflow?.agents.some((agent) => agent.state === "completed")).toBe(false);
+    });
+
+    it.effect(
+      "caps workflow previews, snapshots, replay, and live deltas on ws streams without acceptDedupedBodies",
+      () =>
+        Effect.gen(function* () {
+          const longPrompt = "p".repeat(10_000);
+          const longResult = "r".repeat(10_000);
+          const longLabel = "l".repeat(400);
+          const agents = Array.from({ length: 1_000 }, (_, index) =>
+            makeWorkflowAgent(index, { label: longLabel, prompt: longPrompt, result: longResult }),
+          );
+          const memberId = NodeId.make("wf-member-ws");
+          const memberSubagent: OrchestrationV2Subagent = {
+            ...makeWorkflowSubagent({ name: "ws-wf", phases, agents }),
+            id: memberId,
+            childThreadId: ThreadId.make("child-ws"),
+            completionWake: "never",
+            workflow: undefined,
+            title: longLabel,
+            prompt: longPrompt,
+            result: longResult,
+            status: "completed",
+            completedAt: base.completedAt,
+          };
+          const memberTurnItem: OrchestrationV2TurnItem = {
+            ...base,
+            id: TurnItemId.make("item-wf-member-ws"),
+            type: "subagent",
+            subagentId: memberId,
+            origin: "app_owned",
+            driver: ProviderDriverKind.make("codex"),
+            providerInstanceId: ProviderInstanceId.make("codex"),
+            childThreadId: memberSubagent.childThreadId,
+            title: longLabel,
+            prompt: longPrompt,
+            result: longResult,
+          };
+          const deltaStoredEvent: OrchestrationV2StoredEvent = {
+            sequence: 11,
+            commandId: null,
+            event: {
+              id: EventId.make("ev-wf-delta"),
+              type: "subagent.updated",
+              threadId: base.threadId,
+              occurredAt: base.updatedAt,
+              payload: makeWorkflowSubagent({
+                name: "ws-wf",
+                phases,
+                agents,
+                changedAgentIndices: [42],
+              }),
+            },
+          };
+          const memberSubagentStoredEvent: OrchestrationV2StoredEvent = {
+            sequence: 12,
+            commandId: null,
+            event: {
+              id: EventId.make("ev-member-subagent"),
+              type: "subagent.updated",
+              threadId: base.threadId,
+              occurredAt: base.updatedAt,
+              payload: memberSubagent,
+            },
+          };
+          const memberItemStoredEvent: OrchestrationV2StoredEvent = {
+            sequence: 13,
+            commandId: null,
+            event: {
+              id: EventId.make("ev-member-item"),
+              type: "turn-item.updated",
+              threadId: base.threadId,
+              occurredAt: base.updatedAt,
+              payload: memberTurnItem,
+            },
+          };
+          const snapshotProjection = {
+            thread: { id: base.threadId },
+            runs: [],
+            attempts: [],
+            nodes: [],
+            subagents: [makeWorkflowSubagent({ name: "ws-wf", phases, agents }), memberSubagent],
+            providerSessions: [],
+            providerThreads: [],
+            providerTurns: [],
+            runtimeRequests: [],
+            messages: [],
+            plans: [],
+            turnItems: [memberTurnItem],
+            checkpointScopes: [],
+            checkpoints: [],
+            contextHandoffs: [],
+            contextTransfers: [],
+            visibleTurnItems: [
+              {
+                position: 0,
+                visibility: "local" as const,
+                sourceThreadId: base.threadId,
+                sourceItemId: memberTurnItem.id,
+                item: memberTurnItem,
+              },
+            ],
+            updatedAt: base.updatedAt,
+          } as unknown as OrchestrationV2ThreadProjection;
+
+          const layer = Layer.mergeAll(
+            Layer.mock(ThreadManagementService.ThreadManagementService)({
+              ensureLegacyTranscript: () => Effect.void,
+              getThreadRecords: () =>
+                Effect.die("cursor-only resume must not decode full subagents"),
+              listWorkflowMemberSubagentIds: () => Effect.succeed([memberSubagent.id]),
+              getThreadSnapshot: () =>
+                Effect.succeed({
+                  schemaVersion: 1,
+                  snapshotSequence: 10,
+                  projection: snapshotProjection,
+                }),
+              streamStoredEventsFrom: () =>
+                Stream.fromIterable([
+                  deltaStoredEvent,
+                  memberSubagentStoredEvent,
+                  memberItemStoredEvent,
+                ]),
+            }),
+            Layer.mock(OrchestrationEventStore.OrchestrationEventStore)({
+              latestAgentSequence: () => Effect.succeed(13),
+              prunedThroughSequence: Effect.succeed(0),
+              getAgentReplayStats: () =>
+                Effect.succeed({
+                  eventCount: 2,
+                  rawPayloadBytes: 1_024,
+                  hasCreateEvent: false,
+                }),
+              // The cursor replay omits the member's subagent record, so only SQL membership bounds its item.
+              readAgentEvents: () => Stream.fromIterable([deltaStoredEvent, memberItemStoredEvent]),
+            }),
+          );
+
+          // Snapshot + live tail with acceptDedupedBodies omitted (false).
+          const snapshotAndLive = yield* subscribeOrchestrationV2Thread({
+            threadId: base.threadId,
+          }).pipe(Effect.flatMap(Stream.runCollect), Effect.provide(layer));
+          const [snap, liveDelta, , liveMemberItem] = Array.from(snapshotAndLive);
+          expect(snap?.kind).toBe("snapshot");
+          if (snap?.kind === "snapshot") {
+            expect(snap.projection.subagents[0]?.workflow?.agents).toHaveLength(200);
+            expect(snap.projection.subagents[0]?.workflow?.agentCount).toBe(1_000);
+            expect(snap.projection.subagents[1]?.prompt.length).toBe(500);
+            expect(snap.projection.subagents[1]?.result?.length).toBe(500);
+            expect(snap.projection.subagents[1]?.title?.length).toBe(200);
+            const snapItem = snap.projection.turnItems[0];
+            expect(snapItem?.type === "subagent" && snapItem.prompt.length).toBe(500);
+            expect(snapItem?.type === "subagent" && snapItem.result?.length).toBe(500);
+          }
+          expect(liveDelta?.kind).toBe("event");
+          if (liveDelta?.kind === "event" && liveDelta.event.type === "subagent.updated") {
+            expect(liveDelta.event.payload.workflow?.agentsDelta).toBe(true);
+            expect(liveDelta.event.payload.workflow?.agents).toHaveLength(1);
+            expect(liveDelta.event.payload.workflow?.agentCount).toBe(1_000);
+            expect(liveDelta.event.payload.workflow).not.toHaveProperty("changedAgentIndices");
+            expect(Buffer.byteLength(JSON.stringify(liveDelta), "utf8")).toBeLessThan(3_072);
+          }
+          expect(liveMemberItem?.kind).toBe("event");
+          if (
+            liveMemberItem?.kind === "event" &&
+            liveMemberItem.event.type === "turn-item.updated" &&
+            liveMemberItem.event.payload.type === "subagent"
+          ) {
+            expect(liveMemberItem.event.payload.prompt.length).toBe(500);
+            expect(liveMemberItem.event.payload.result?.length).toBe(500);
+            expect(liveMemberItem.event.payload.title?.length).toBe(200);
+          }
+
+          // Reconnect replay (afterSequence) without acceptDedupedBodies also caps turn-item.updated and deltas.
+          const replayed = yield* subscribeOrchestrationV2Thread({
+            threadId: base.threadId,
+            afterSequence: 10,
+          }).pipe(Effect.flatMap(Stream.runCollect), Effect.provide(layer));
+          const [replayDelta, replayMemberItem] = Array.from(replayed);
+          expect(replayDelta?.kind).toBe("event");
+          if (replayDelta?.kind === "event" && replayDelta.event.type === "subagent.updated") {
+            expect(replayDelta.event.payload.workflow?.agentsDelta).toBe(true);
+            expect(replayDelta.event.payload.workflow?.agents).toHaveLength(1);
+            expect(replayDelta.event.payload.workflow).not.toHaveProperty("changedAgentIndices");
+          }
+          expect(replayMemberItem?.kind).toBe("event");
+          if (
+            replayMemberItem?.kind === "event" &&
+            replayMemberItem.event.type === "turn-item.updated" &&
+            replayMemberItem.event.payload.type === "subagent"
+          ) {
+            expect(replayMemberItem.event.payload.prompt.length).toBe(500);
+            expect(replayMemberItem.event.payload.result?.length).toBe(500);
+            expect(replayMemberItem.event.payload.title?.length).toBe(200);
+          }
+        }),
+    );
+  });
 });
 
 describe("live body deduper", () => {
@@ -531,5 +1149,127 @@ describe("live body deduper", () => {
   it("ships a reply whole when its message arrives after it", () => {
     const first = reply(1, "a");
     expect([first, message(2, "a")].map(makeLiveBodyDeduper())[0]).toBe(first);
+  });
+
+  it("bounds workflow-member subagent updates and still dedupes repeated records and turn items", () => {
+    const subagentId = NodeId.make("wf-member-live");
+    const longPrompt = "p".repeat(40_000);
+    const longResult = "r".repeat(40_000);
+    const previewPrompt = "p".repeat(499) + "…";
+    const previewResult = "r".repeat(499) + "…";
+    const subagentRecord = (
+      status: OrchestrationV2Subagent["status"],
+      result: string | null,
+    ): OrchestrationV2Subagent => ({
+      id: subagentId,
+      threadId: base.threadId,
+      runId: null,
+      parentNodeId: NodeId.make("workflow-node"),
+      origin: "app_owned",
+      createdBy: "agent",
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      providerThreadId: null,
+      childThreadId: ThreadId.make("child-wf-member-live"),
+      nativeTaskRef: null,
+      prompt: longPrompt,
+      title: "Worker",
+      model: "gpt-5",
+      completionWake: "never",
+      status,
+      result,
+      startedAt: at,
+      completedAt: status === "completed" ? at : null,
+      updatedAt: at,
+    });
+    const subagentItem = (
+      status: OrchestrationV2TurnItem["status"],
+      result: string | null,
+    ): OrchestrationV2TurnItem => ({
+      ...base,
+      id: TurnItemId.make("turn-item-wf-member-live"),
+      type: "subagent",
+      subagentId,
+      origin: "app_owned",
+      driver: ProviderDriverKind.make("codex"),
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      childThreadId: ThreadId.make("child-wf-member-live"),
+      status,
+      prompt: longPrompt,
+      result,
+    });
+
+    const raw = [
+      event(1, { type: "subagent.updated", payload: subagentRecord("running", null) }),
+      event(2, { type: "turn-item.updated", payload: subagentItem("running", null) }),
+      event(3, { type: "subagent.updated", payload: subagentRecord("completed", longResult) }),
+      event(4, { type: "turn-item.updated", payload: subagentItem("completed", longResult) }),
+    ];
+    const dedupe = makeLiveBodyDeduper();
+    const [startedRecord, startedCard, completedRecord, completedCard] = raw.map((streamed) =>
+      dedupe({ ...streamed, event: projectDomainEventForWire(streamed.event) }),
+    );
+
+    const startedPayload = payloadOf(startedRecord!) as OrchestrationV2Subagent;
+    expect(startedPayload).toMatchObject({ prompt: previewPrompt, result: null });
+    expect(startedPayload).not.toHaveProperty("promptOmitted");
+
+    const startedCardPayload = payloadOf(startedCard!) as OrchestrationV2TurnItem;
+    expect(startedCardPayload).toMatchObject({
+      prompt: "",
+      promptOmitted: true,
+      result: null,
+    });
+
+    const completedPayload = payloadOf(completedRecord!) as OrchestrationV2Subagent;
+    expect(completedPayload).toMatchObject({
+      prompt: "",
+      promptOmitted: true,
+      result: previewResult,
+    });
+    expect(completedPayload).not.toHaveProperty("resultOmitted");
+
+    const completedCardPayload = payloadOf(completedCard!) as OrchestrationV2TurnItem;
+    expect(completedCardPayload).toMatchObject({
+      prompt: "",
+      promptOmitted: true,
+      result: null,
+      resultOmitted: true,
+    });
+
+    const restoredSubagent = restoreSubagentBodies(completedPayload, startedPayload);
+    expect(restoredSubagent).toMatchObject({ prompt: previewPrompt, result: previewResult });
+    const restoredCard = restoreTurnItemBodies(completedCardPayload, {
+      messageText: () => undefined,
+      checkpointFiles: () => undefined,
+      subagent: (id) => (id === subagentId ? restoredSubagent : undefined),
+    });
+    expect(restoredCard).toMatchObject({ prompt: previewPrompt, result: previewResult });
+
+    // Cursor-only subscriptions seed known workflow members so a live-tail turn item
+    // without a preceding subagent.updated still ships bounded, even after > 32 LRU entries.
+    const seededDedupe = makeLiveBodyDeduper([subagentId]);
+    for (let i = 0; i < 40; i += 1) {
+      seededDedupe(
+        event(10 + i, {
+          type: "subagent.updated",
+          payload: {
+            ...subagentRecord("completed", "ok"),
+            id: NodeId.make(`other-subagent-${i}`),
+            completionWake: "always",
+          },
+        }),
+      );
+    }
+    const tailCard = seededDedupe(
+      event(60, {
+        type: "turn-item.updated",
+        payload: subagentItem("completed", longResult),
+      }),
+    );
+    expect(payloadOf(tailCard)).toMatchObject({
+      prompt: previewPrompt,
+      result: previewResult,
+    });
   });
 });

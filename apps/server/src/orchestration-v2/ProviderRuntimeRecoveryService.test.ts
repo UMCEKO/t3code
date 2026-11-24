@@ -419,108 +419,125 @@ it.effect("cancels a stale waiting run when no checkpoint capture can finish it"
   }).pipe(Effect.provide(layer));
 });
 
-it.effect("recovery closes a secret card but leaves a link card and an unread steer open", () => {
-  const threadId = ThreadId.make("thread_secret_recovery");
-  const runId = RunId.make("run_secret_recovery");
-  let committedInput: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0] | null =
-    null;
-  const projection = {
-    thread: { id: threadId },
-    runtimeRequests: [],
-    providerSessions: [],
-    providerThreads: [],
-    providerTurns: [
-      { runAttemptId: RunAttemptId.make("attempt_secret_recovery"), status: "running" },
-    ],
-    runs: [
-      {
-        id: runId,
-        status: "running",
-        activeAttemptId: RunAttemptId.make("attempt_secret_recovery"),
-        providerInstanceId: ProviderInstanceId.make("codex"),
-      },
-    ],
-    attempts: [],
-    nodes: [],
-    subagents: [],
-    messages: [],
-    turnItems: [
-      {
-        id: "turn-item:secret-request:recovery",
-        threadId,
-        runId,
-        nodeId: null,
-        type: "secret_request",
-        status: "waiting",
-        secretStatus: "pending",
-        label: "GitHub token",
-        reason: "Used as GH_TOKEN.",
-      },
-      {
-        id: "turn-item:link-request:recovery",
-        threadId,
-        runId,
-        nodeId: null,
-        type: "link_request",
-        status: "waiting",
-        linkStatus: "pending",
-        url: "https://box.example.ts.net",
-        reason: "Run the suite there.",
-      },
-      {
-        id: "turn-item:steer:recovery",
-        threadId,
-        runId,
-        nodeId: null,
-        type: "user_message",
-        status: "pending",
-        inputIntent: "steer",
-        messageId: "message:steer:recovery",
-      },
-    ],
-  } as unknown as OrchestrationV2ThreadProjection;
-  const layer = ProviderRuntimeRecovery.layer.pipe(
-    Layer.provide(ServerSettings.layerTest()),
-    Layer.provide(
-      Layer.mergeAll(
-        Layer.mock(ProjectionStore.ProjectionStoreV2)({
-          getRecoveryThreadIds: () => Effect.succeed([threadId]),
-          getRuntimeRecoveryProjection: () => Effect.succeed(projection),
-        }),
-        Layer.mock(EventSink.EventSinkV2)({
-          commitCommand: (input) => {
-            committedInput = input;
-            return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);
-          },
-        }),
-        IdAllocator.layer,
-        Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({
-          runRecoveryOnce: Effect.succeed(false),
-        }),
-        Layer.mock(EffectOutbox.EffectOutboxV2)({
-          listByCommandId: () => Effect.succeed([]),
-          reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
-        }),
+it.effect(
+  "recovery closes a secret card but leaves link and feedback cards and an unread steer open",
+  () => {
+    const threadId = ThreadId.make("thread_secret_recovery");
+    const runId = RunId.make("run_secret_recovery");
+    let committedInput: Parameters<EventSink.EventSinkV2["Service"]["commitCommand"]>[0] | null =
+      null;
+    const projection = {
+      thread: { id: threadId },
+      runtimeRequests: [],
+      providerSessions: [],
+      providerThreads: [],
+      providerTurns: [
+        { runAttemptId: RunAttemptId.make("attempt_secret_recovery"), status: "running" },
+      ],
+      runs: [
+        {
+          id: runId,
+          status: "running",
+          activeAttemptId: RunAttemptId.make("attempt_secret_recovery"),
+          providerInstanceId: ProviderInstanceId.make("codex"),
+        },
+      ],
+      attempts: [],
+      nodes: [],
+      subagents: [],
+      messages: [],
+      turnItems: [
+        {
+          id: "turn-item:secret-request:recovery",
+          threadId,
+          runId,
+          nodeId: null,
+          type: "secret_request",
+          status: "waiting",
+          secretStatus: "pending",
+          label: "GitHub token",
+          reason: "Used as GH_TOKEN.",
+        },
+        {
+          id: "turn-item:link-request:recovery",
+          threadId,
+          runId,
+          nodeId: null,
+          type: "link_request",
+          status: "waiting",
+          linkStatus: "pending",
+          url: "https://box.example.ts.net",
+          reason: "Run the suite there.",
+        },
+        {
+          id: "turn-item:feedback-request:recovery",
+          threadId,
+          runId,
+          nodeId: null,
+          type: "feedback_request",
+          status: "waiting",
+          feedbackStatus: "pending",
+        },
+        {
+          id: "turn-item:steer:recovery",
+          threadId,
+          runId,
+          nodeId: null,
+          type: "user_message",
+          status: "pending",
+          inputIntent: "steer",
+          messageId: "message:steer:recovery",
+        },
+      ],
+    } as unknown as OrchestrationV2ThreadProjection;
+    const layer = ProviderRuntimeRecovery.layer.pipe(
+      Layer.provide(ServerSettings.layerTest()),
+      Layer.provide(
+        Layer.mergeAll(
+          Layer.mock(ProjectionStore.ProjectionStoreV2)({
+            getRecoveryThreadIds: () => Effect.succeed([threadId]),
+            getRuntimeRecoveryProjection: () => Effect.succeed(projection),
+          }),
+          Layer.mock(EventSink.EventSinkV2)({
+            commitCommand: (input) => {
+              committedInput = input;
+              return Effect.succeed({ committed: true, cancelledEffectCount: 0 } as never);
+            },
+          }),
+          IdAllocator.layer,
+          Layer.mock(EffectWorker.OrchestrationEffectWorkerV2)({
+            runRecoveryOnce: Effect.succeed(false),
+          }),
+          Layer.mock(EffectOutbox.EffectOutboxV2)({
+            listByCommandId: () => Effect.succeed([]),
+            reconcileAfterProcessLoss: Effect.succeed({ requeued: 0, cancelled: 0 }),
+          }),
+        ),
       ),
-    ),
-  );
+    );
 
-  return Effect.gen(function* () {
-    yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).reconcile("startup");
-    const cards = (committedInput?.events ?? []).flatMap((event) =>
-      event.type === "turn-item.updated" ? [event.payload] : [],
-    );
-    const secret = cards.find((card) => card.type === "secret_request");
-    assert.equal(secret?.status, "cancelled");
-    assert.equal(secret?.type === "secret_request" ? secret.secretStatus : null, "cancelled");
-    // Nothing in memory waits on a link card; the user can still answer it.
-    // Claude never reported reading the steer, so the orchestrator queues it.
-    assert.deepEqual(
-      cards.filter((card) => card.type === "link_request" || card.type === "user_message"),
-      [],
-    );
-  }).pipe(Effect.provide(layer));
-});
+    return Effect.gen(function* () {
+      yield* (yield* ProviderRuntimeRecovery.ProviderRuntimeRecoveryService).reconcile("startup");
+      const cards = (committedInput?.events ?? []).flatMap((event) =>
+        event.type === "turn-item.updated" ? [event.payload] : [],
+      );
+      const secret = cards.find((card) => card.type === "secret_request");
+      assert.equal(secret?.status, "cancelled");
+      assert.equal(secret?.type === "secret_request" ? secret.secretStatus : null, "cancelled");
+      // Nothing in memory waits on a link or feedback card; the user can still answer it.
+      // Claude never reported reading the steer, so the orchestrator queues it.
+      assert.deepEqual(
+        cards.filter(
+          (card) =>
+            card.type === "link_request" ||
+            card.type === "feedback_request" ||
+            card.type === "user_message",
+        ),
+        [],
+      );
+    }).pipe(Effect.provide(layer));
+  },
+);
 
 it.effect.each([
   "queued",
@@ -535,6 +552,7 @@ it.effect.each([
   "running-delegated-capped",
   "running-delegated-snoozed",
   "running-delegated-stopped",
+  "running-delegated-workflow",
   "running-resume",
 ] as const)("recovers $0 work after restart", (scenario) => {
   const status = scenario.startsWith("starting")
@@ -550,12 +568,16 @@ it.effect.each([
     scenario === "running-delegated-capped" ||
     scenario === "running-delegated-snoozed" ||
     scenario === "running-delegated-stopped" ||
+    scenario === "running-delegated-workflow" ||
     scenario === "running-resume";
   const startedAt =
     status === "running" || scenario === "starting-steered"
       ? DateTime.makeUnsafe("2026-11-01T19:34:40.403Z")
       : null;
   const threadId = ThreadId.make("thread_queued_restart");
+  const workflowParentThreadId = ThreadId.make("thread_queued_restart_workflow_parent");
+  const workflowNodeId = NodeId.make("node_queued_restart_workflow");
+  const workflowAgentTaskId = NodeId.make("node_queued_restart_workflow_agent");
   const runId = RunId.make("run_queued_restart");
   const attemptId = RunAttemptId.make("attempt_queued_restart");
   const steeredAttemptId = RunAttemptId.make("attempt_queued_restart_steered");
@@ -573,7 +595,14 @@ it.effect.each([
         scenario === "running-delegated-snoozed"
           ? DateTime.makeUnsafe("2099-07-25T09:00:00.000Z")
           : null,
-      lineage: { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
+      lineage:
+        scenario === "running-delegated-workflow"
+          ? {
+              parentThreadId: workflowParentThreadId,
+              relationshipToParent: "subagent",
+              rootThreadId: workflowParentThreadId,
+            }
+          : { parentThreadId: null, relationshipToParent: null, rootThreadId: threadId },
       forkedFrom: null,
       ...(scenario === "running-resume"
         ? {
@@ -619,6 +648,9 @@ it.effect.each([
         userMessageId: MessageId.make("message_queued_restart"),
         queuePosition: 1,
         providerInstanceId: ProviderInstanceId.make("codex"),
+        ...(scenario === "running-delegated-workflow"
+          ? { delegatedTaskId: workflowAgentTaskId }
+          : {}),
         ...(scenario === "running-resume"
           ? { usageLimitContinuationOfRunId: RunId.make("run_queued_restart_limited") }
           : {}),
@@ -712,7 +744,35 @@ it.effect.each([
                   .map((message) => [message.id, message]),
               ),
             ),
-          getThreadRecords: () => Effect.succeed(projection),
+          getThreadRecords: (requestedThreadId, _fields, filter) =>
+            Effect.succeed(
+              scenario === "running-delegated-workflow" &&
+                requestedThreadId === workflowParentThreadId
+                ? ({
+                    thread: { id: workflowParentThreadId },
+                    subagents: [
+                      {
+                        id: workflowAgentTaskId,
+                        parentNodeId: workflowNodeId,
+                        runId: RunId.make("run_queued_restart_workflow_parent"),
+                        result: null,
+                        status: "running",
+                      },
+                      {
+                        id: workflowNodeId,
+                        origin: "app_owned",
+                        childThreadId: null,
+                        status: "running",
+                        workflow: { phases: [], agents: [], stopRequestedAt: 1 },
+                      },
+                    ].filter(
+                      (task) =>
+                        filter?.subagentIds === undefined || filter.subagentIds.includes(task.id),
+                    ),
+                    turnItems: [],
+                  } as unknown as OrchestrationV2ThreadProjection)
+                : projection,
+            ),
         }),
         Layer.mock(EventSink.EventSinkV2)({
           commitCommand: (input) => {

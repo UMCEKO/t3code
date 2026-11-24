@@ -22,7 +22,11 @@ import * as Fiber from "effect/Fiber";
 import * as Layer from "effect/Layer";
 import * as Option from "effect/Option";
 import * as ServerSettings from "../serverSettings.ts";
-import { restartContinuationRun, continueRestartedRun } from "./RestartContinuation.ts";
+import {
+  restartContinuationRun,
+  continueRestartedRun,
+  restartStopRequested,
+} from "./RestartContinuation.ts";
 import { continuationStartRetryDelayMs } from "./RestartBackgroundNote.ts";
 import * as ThreadManagementService from "./ThreadManagementService.ts";
 import * as ProviderRuntimeRecovery from "./ProviderRuntimeRecoveryService.ts";
@@ -1478,4 +1482,214 @@ it.effect("skips restart discovery when no project enables continuation", () =>
     yield* recovery.prepareForShutdown;
     yield* recovery.prepareForShutdown;
   }),
+);
+
+it.effect("treats a stopping or ended server workflow as a stop for its agents' threads", () =>
+  Effect.gen(function* () {
+    const parentThreadId = "thread:parent";
+    const workflowTask = (status: string, stopRequestedAt?: number) => ({
+      id: "node:workflow",
+      origin: "app_owned",
+      childThreadId: null,
+      status,
+      workflow: {
+        phases: [],
+        agents: [],
+        ...(stopRequestedAt === undefined ? {} : { stopRequestedAt }),
+      },
+    });
+    const agentTask = {
+      id: "node:agent",
+      parentNodeId: "node:workflow",
+      runId: "run:parent",
+      result: null,
+      status: "running",
+    };
+    const check = (
+      owner: ReturnType<typeof workflowTask>,
+      options?: { readonly serverRestart?: boolean },
+    ) =>
+      restartStopRequested<never>(
+        ((
+          threadId: string,
+          fields: ReadonlyArray<string>,
+          filter: { readonly subagentIds?: ReadonlyArray<string> },
+        ) =>
+          Effect.succeed(
+            fields.includes("subagents")
+              ? {
+                  subagents:
+                    threadId !== parentThreadId
+                      ? []
+                      : [agentTask, owner].filter((task) => filter.subagentIds?.includes(task.id)),
+                }
+              : { turnItems: [] },
+          )) as never,
+        {
+          id: "thread:agent",
+          lineage: { relationshipToParent: "subagent", parentThreadId },
+          forkedFrom: null,
+        } as never,
+        { id: "run:agent", delegatedTaskId: "node:agent" } as never,
+        options,
+      );
+    assert.isFalse(yield* check(workflowTask("running")));
+    assert.isTrue(yield* check(workflowTask("running"), { serverRestart: true }));
+    assert.isTrue(yield* check(workflowTask("running", 1)));
+    assert.isTrue(yield* check(workflowTask("failed")));
+  }),
+);
+
+it.effect(
+  "walks durable delegation ancestry so workflow grandchildren are treated as stop-requested on restart",
+  () =>
+    Effect.gen(function* () {
+      const rootThreadId = "thread:root";
+      const childThreadId = "thread:wf-child";
+      const grandchildThreadId = "thread:wf-grandchild";
+      const greatGrandchildThreadId = "thread:wf-great-grandchild";
+      const threads = {
+        [rootThreadId]: {
+          id: rootThreadId,
+          lineage: { relationshipToParent: null, parentThreadId: null },
+          forkedFrom: null,
+        },
+        [childThreadId]: {
+          id: childThreadId,
+          lineage: { relationshipToParent: "subagent", parentThreadId: rootThreadId },
+          forkedFrom: { type: "node", nodeId: "node:wf-child" },
+        },
+        [grandchildThreadId]: {
+          id: grandchildThreadId,
+          lineage: { relationshipToParent: "subagent", parentThreadId: childThreadId },
+          forkedFrom: { type: "node", nodeId: "node:wf-grandchild" },
+        },
+        [greatGrandchildThreadId]: {
+          id: greatGrandchildThreadId,
+          lineage: { relationshipToParent: "subagent", parentThreadId: grandchildThreadId },
+          forkedFrom: { type: "node", nodeId: "node:wf-great-grandchild" },
+        },
+      } as const;
+      const runsByThread: Record<
+        string,
+        ReadonlyArray<{ id: string; delegatedTaskId?: string }>
+      > = {
+        [childThreadId]: [{ id: "run:child-1", delegatedTaskId: "node:wf-child" }],
+        [grandchildThreadId]: [{ id: "run:grandchild-1", delegatedTaskId: "node:wf-grandchild" }],
+      };
+      const checkGrandchild = (
+        targetThread:
+          | (typeof threads)[typeof grandchildThreadId]
+          | (typeof threads)[typeof greatGrandchildThreadId],
+        targetSource: { readonly id: string; readonly delegatedTaskId: string },
+        workflowStatus: string,
+        options?: {
+          readonly serverRestart?: boolean;
+          readonly stopRequestedAt?: number;
+          readonly grandchildSettled?: boolean;
+        },
+      ) => {
+        const subagentsByThread: Record<string, ReadonlyArray<Record<string, unknown>>> = {
+          [rootThreadId]: [
+            {
+              id: "node:workflow",
+              origin: "app_owned",
+              childThreadId: null,
+              status: workflowStatus,
+              workflow: {
+                phases: [],
+                agents: [],
+                ...(options?.stopRequestedAt === undefined
+                  ? {}
+                  : { stopRequestedAt: options.stopRequestedAt }),
+              },
+            },
+            {
+              id: "node:wf-child",
+              parentNodeId: "node:workflow",
+              runId: "run:root",
+              result: null,
+              status: "running",
+            },
+          ],
+          [childThreadId]: [
+            {
+              id: "node:wf-grandchild",
+              parentNodeId: "node:child-root",
+              runId: "run:child-1",
+              result: options?.grandchildSettled ? { summary: "done" } : null,
+              status: options?.grandchildSettled ? "completed" : "pending",
+            },
+          ],
+          [grandchildThreadId]: [
+            {
+              id: "node:wf-great-grandchild",
+              parentNodeId: "node:grandchild-root",
+              runId: "run:grandchild-1",
+              result: null,
+              status: "pending",
+            },
+          ],
+        };
+        return restartStopRequested<never>(
+          ((
+            tid: keyof typeof threads,
+            fields: ReadonlyArray<string>,
+            filter: {
+              readonly subagentIds?: ReadonlyArray<string>;
+              readonly runIds?: ReadonlyArray<string>;
+            },
+          ) =>
+            Effect.succeed({
+              thread: threads[tid],
+              ...(fields.includes("subagents")
+                ? {
+                    subagents: (subagentsByThread[tid] ?? []).filter(
+                      (task) => filter.subagentIds?.includes(String(task.id)) ?? true,
+                    ),
+                  }
+                : {}),
+              ...(fields.includes("runs")
+                ? {
+                    runs: (runsByThread[tid] ?? []).filter(
+                      (run) => filter.runIds?.includes(run.id) ?? true,
+                    ),
+                  }
+                : {}),
+              ...(fields.includes("turnItems") ? { turnItems: [] } : {}),
+            })) as never,
+          targetThread as never,
+          targetSource as never,
+          options?.serverRestart === undefined
+            ? undefined
+            : { serverRestart: options.serverRestart },
+        );
+      };
+
+      const gcSource = { id: "run:gc-unaccepted", delegatedTaskId: "node:wf-grandchild" };
+      const ggcSource = { id: "run:ggc-unaccepted", delegatedTaskId: "node:wf-great-grandchild" };
+      assert.isFalse(yield* checkGrandchild(threads[grandchildThreadId], gcSource, "running"));
+      assert.isTrue(
+        yield* checkGrandchild(threads[grandchildThreadId], gcSource, "running", {
+          serverRestart: true,
+        }),
+      );
+      assert.isTrue(
+        yield* checkGrandchild(threads[grandchildThreadId], gcSource, "running", {
+          stopRequestedAt: 1,
+        }),
+      );
+      assert.isTrue(yield* checkGrandchild(threads[grandchildThreadId], gcSource, "failed"));
+      assert.isTrue(
+        yield* checkGrandchild(threads[greatGrandchildThreadId], ggcSource, "running", {
+          serverRestart: true,
+        }),
+      );
+      assert.isTrue(
+        yield* checkGrandchild(threads[greatGrandchildThreadId], ggcSource, "running", {
+          serverRestart: true,
+          grandchildSettled: true,
+        }),
+      );
+    }),
 );

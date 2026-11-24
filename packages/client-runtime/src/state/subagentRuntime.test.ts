@@ -10,10 +10,14 @@ import * as DateTime from "effect/DateTime";
 
 import {
   deriveWorkflowGroups,
+  excludeWorkflowMemberSubagents,
+  isServerWorkflow,
+  isStoppableWorkflow,
   isWorkflowScriptMessage,
   projectedSubagentsToRuntime,
   resolveWorkflowOpening,
   workflowMemberModelSelection,
+  workflowOpeningHeadline,
 } from "./subagentRuntime.ts";
 import { resolveSubagentMetadata } from "./subagentDisplay.ts";
 import { formatSubagentEffort } from "./threadExecution.ts";
@@ -165,6 +169,114 @@ describe("projectedSubagentsToRuntime workflow expansion", () => {
     ]);
     expect(untitled?.title).toBe(`${"a".repeat(76)}...`);
   });
+
+  it("hides app-owned subagents whose parentNodeId is a workflow task", () => {
+    const workflow = subagent({
+      id: "wf-1",
+      origin: "app_owned",
+      parentNodeId: "root-node",
+      childThreadId: null,
+      workflow: {
+        name: "audit",
+        phases: [{ index: 0, title: "Review" }],
+        agents: [
+          member({
+            index: 0,
+            label: "mod-a",
+            phaseIndex: 0,
+            childThreadId: ThreadId.make("child-a"),
+          }),
+        ],
+      },
+    });
+    const workflowChild = subagent({
+      id: "task-a",
+      origin: "app_owned",
+      parentNodeId: "wf-1",
+      childThreadId: ThreadId.make("child-a"),
+    });
+    const standalone = subagent({
+      id: "task-b",
+      origin: "app_owned",
+      parentNodeId: "root-node",
+      childThreadId: ThreadId.make("child-b"),
+    });
+    const nativeUnderSameParent = subagent({
+      id: "native-c",
+      origin: "provider_native",
+      parentNodeId: "wf-1",
+      childThreadId: null,
+    });
+
+    const filtered = excludeWorkflowMemberSubagents([
+      workflow,
+      workflowChild,
+      standalone,
+      nativeUnderSameParent,
+    ]);
+    expect(filtered.map((entry) => entry.id)).toEqual(["wf-1", "task-b", "native-c"]);
+
+    const runtime = projectedSubagentsToRuntime([
+      workflow,
+      workflowChild,
+      standalone,
+      nativeUnderSameParent,
+    ]);
+    expect(runtime.map((entry) => [entry.id, entry.kind])).toEqual([
+      ["wf-1", "workflow"],
+      ["wf-1:agent:0", "workflow_agent"],
+      ["task-b", "subagent"],
+      ["native-c", "subagent"],
+    ]);
+  });
+});
+
+describe("server workflow predicates", () => {
+  const workflow = { name: "audit", phases: [], agents: [] };
+  const base = {
+    status: "running" as const,
+    origin: "app_owned" as const,
+    driver: ProviderDriverKind.make("codex"),
+    childThreadId: null as ThreadId | null,
+    nativeTaskRef: null as OrchestrationV2Subagent["nativeTaskRef"],
+    workflow,
+  };
+
+  it("identifies server workflows and gates workflow Stop across server and Claude workflows", () => {
+    expect(isServerWorkflow(base)).toBe(true);
+    expect(isServerWorkflow({ ...base, childThreadId: ThreadId.make("child") })).toBe(false);
+    expect(isServerWorkflow({ ...base, origin: "provider_native" })).toBe(false);
+    expect(isServerWorkflow({ ...base, workflow: undefined })).toBe(false);
+
+    expect(isStoppableWorkflow(base)).toBe(true);
+    expect(isStoppableWorkflow({ ...base, status: "waiting" })).toBe(false);
+    expect(isStoppableWorkflow({ ...base, status: "completed" })).toBe(false);
+    expect(isStoppableWorkflow({ ...base, childThreadId: ThreadId.make("child") })).toBe(false);
+    expect(isStoppableWorkflow({ ...base, workflow: undefined })).toBe(false);
+
+    const claudeNative = {
+      ...base,
+      origin: "provider_native" as const,
+      driver: ProviderDriverKind.make("claudeAgent"),
+      childThreadId: ThreadId.make("coord"),
+      nativeTaskRef: {
+        driver: ProviderDriverKind.make("claudeAgent"),
+        strength: "strong" as const,
+        nativeId: "native-wf",
+      },
+    };
+    expect(isStoppableWorkflow(claudeNative)).toBe(true);
+    expect(isStoppableWorkflow({ ...claudeNative, driver: ProviderDriverKind.make("codex") })).toBe(
+      false,
+    );
+    expect(isStoppableWorkflow({ ...claudeNative, nativeTaskRef: null })).toBe(false);
+    expect(
+      isStoppableWorkflow({
+        ...claudeNative,
+        nativeTaskRef: { ...claudeNative.nativeTaskRef, nativeId: "" },
+      }),
+    ).toBe(false);
+  });
 });
 
 describe("deriveWorkflowGroups over a dynamic workflow", () => {
@@ -199,7 +311,27 @@ describe("deriveWorkflowGroups over a dynamic workflow", () => {
     ]);
     expect(group?.phases.map((phase) => phase.settledCount)).toEqual([2, 0]);
     expect(group?.phases.flatMap((phase) => phase.members)).toHaveLength(4);
+    expect(group?.agentCount).toBe(4);
     expect(group?.unphasedMembers).toEqual([]);
+  });
+
+  it("uses workflow.agentCount for totals and headline text when agents is a bounded subset", () => {
+    const groups = groupsOf([
+      subagent({
+        workflow: {
+          name: "fan-out",
+          phases: [{ index: 0, title: "Scan" }],
+          agents: [
+            member({ index: 0, state: "running", phaseIndex: 0 }),
+            member({ index: 1, state: "completed", phaseIndex: 0 }),
+          ],
+          agentCount: 1_000,
+        },
+      }),
+    ]);
+    expect(groups[0]?.workflow.agentCount).toBe(1_000);
+    expect(groups[0]?.agentCount).toBe(1_000);
+    expect(groups[0]?.phases[0]?.members[0]?.agentCount).toBeUndefined();
   });
 
   it.each([false, true])("keeps a reported phase title, missing title first=%s", (missingFirst) => {
@@ -328,5 +460,67 @@ describe("resolveWorkflowOpening", () => {
     expect(
       isWorkflowScriptMessage({ role: "user", text: `${"/**/".repeat(200)}const x = 1;` }),
     ).toBe(false);
+  });
+
+  it("formats opening headline agent counts from agentCount ?? agents.length", () => {
+    const full = resolveWorkflowOpening({
+      thread: childThread,
+      messages: [brief(SCRIPT, true)],
+      parentSubagents: [
+        coordinator({
+          name: "probe-wf",
+          phases: [{ index: 1, title: "Alpha" }],
+          agents: [
+            member({ index: 0, state: "running" }),
+            member({ index: 1, state: "completed" }),
+          ],
+        }),
+      ],
+    });
+    expect(workflowOpeningHeadline(full!).agents).toBe("2 agents · 1 working · 1 done");
+
+    const bounded = resolveWorkflowOpening({
+      thread: childThread,
+      messages: [brief(SCRIPT, true)],
+      parentSubagents: [
+        coordinator({
+          name: "probe-wf",
+          phases: [{ index: 1, title: "Alpha" }],
+          agents: [
+            member({ index: 0, state: "running" }),
+            member({ index: 1, state: "completed" }),
+          ],
+          agentCount: 1_000,
+        }),
+      ],
+    });
+    expect(workflowOpeningHeadline(bounded!).agents).toBe("1000 agents");
+
+    const emptyDelta = resolveWorkflowOpening({
+      thread: childThread,
+      messages: [brief(SCRIPT, true)],
+      parentSubagents: [
+        coordinator({
+          name: "probe-wf",
+          phases: [],
+          agents: [],
+          agentCount: 1,
+        }),
+      ],
+    });
+    expect(workflowOpeningHeadline(emptyDelta!).agents).toBe("1 agent");
+
+    const empty = resolveWorkflowOpening({
+      thread: childThread,
+      messages: [brief(SCRIPT, true)],
+      parentSubagents: [
+        coordinator({
+          name: "probe-wf",
+          phases: [],
+          agents: [],
+        }),
+      ],
+    });
+    expect(workflowOpeningHeadline(empty!).agents).toBeNull();
   });
 });

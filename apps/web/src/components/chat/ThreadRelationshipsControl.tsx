@@ -9,6 +9,9 @@ import { PullRequestGlyph } from "../pullRequest/pullRequestIcons";
 import { scopedThreadKey, scopeThreadRef } from "@t3tools/client-runtime/environment";
 import {
   deriveWorkflowGroups,
+  excludeWorkflowMemberSubagents,
+  isServerWorkflow,
+  isStoppableWorkflow,
   projectedSubagentsToRuntime,
   type RuntimeSubagent,
 } from "@t3tools/client-runtime/state/subagentRuntime";
@@ -36,6 +39,7 @@ import {
   type OrchestrationV2DelegatedFrom,
   type OrchestrationV2RemoteTaskChild,
   type OrchestrationV2Subagent,
+  type OrchestrationV2SubagentWorkflow,
   type OrchestrationV2ThreadShell,
   type ScopedThreadRef,
   type ServerProvider,
@@ -121,19 +125,28 @@ function ThreadLineageRowList(props: {
   readonly children: ReactNode;
 }) {
   const gt = useGT();
+  const listRef = useRef<HTMLUListElement>(null);
+  const showMore = () => {
+    const exhausting = props.hiddenCount <= THREAD_LINEAGE_PAGE_COUNT;
+    props.onShowMore();
+    // The button unmounts on the final page; focus the list so focus isn't dropped.
+    if (exhausting) listRef.current?.focus({ preventScroll: true });
+  };
   return (
     <>
       {/* ScrollArea's max-height viewport measures badly inside this scrolling panel. */}
       <ul
+        ref={listRef}
+        tabIndex={-1}
         aria-label={gt("Related threads")}
-        className="m-0 max-h-[13.5rem] list-none overflow-y-auto p-0 has-data-workflow-expanded:max-h-[min(28rem,55dvh)]"
+        className="m-0 max-h-[13.5rem] list-none overflow-y-auto p-0 outline-none focus-visible:ring-2 focus-visible:ring-inset focus-visible:ring-ring/70 has-data-workflow-expanded:max-h-[min(28rem,55dvh)]"
       >
         {props.children}
       </ul>
       {props.hiddenCount > 0 ? (
         <button
           type="button"
-          onClick={props.onShowMore}
+          onClick={showMore}
           className={`flex h-8 w-full cursor-pointer items-center rounded-lg ${THREAD_DETAILS_PANEL_ROW_CONTENT_CLASS} text-sm font-medium text-muted-foreground/70 hover:bg-black/[0.055] hover:text-foreground/80 dark:hover:bg-white/[0.075]`}
         >
           <PlusIcon aria-hidden className="size-4 shrink-0" />
@@ -150,11 +163,18 @@ type RemoteSubagent = OrchestrationV2Subagent & {
   readonly remoteChild: OrchestrationV2RemoteTaskChild;
 };
 
-/** A task delegated to a linked environment has no thread here, so it gets its own row kind. */
-type LineageRow = ThreadRelationshipWalkRow | { readonly remote: RemoteSubagent };
+type ServerWorkflowSubagent = OrchestrationV2Subagent & {
+  readonly workflow: OrchestrationV2SubagentWorkflow;
+};
+
+/** Remote tasks and server workflows have no local child thread, so each gets its own row kind. */
+type LineageRow =
+  | ThreadRelationshipWalkRow
+  | { readonly remote: RemoteSubagent }
+  | { readonly workflow: ServerWorkflowSubagent };
 
 const lineageRowStatus = (row: LineageRow) =>
-  "remote" in row ? row.remote.status : row.edge.status;
+  "remote" in row ? row.remote.status : "workflow" in row ? row.workflow.status : row.edge.status;
 
 const isFinishedAgentStatus = (status: string | null | undefined) =>
   ["completed", "failed", "error", "cancelled", "interrupted", "idle"].includes(status ?? "");
@@ -527,10 +547,11 @@ export function ThreadRelationshipsPanel(props: {
     ? deriveProviderSubagentStatus(parentProjection)?.status
     : undefined;
   const projected = projection?.subagents ?? [];
-  const runtimeSubagents = projectedSubagentsToRuntime(projected);
+  const visibleSubagents = excludeWorkflowMemberSubagents(projected);
+  const runtimeSubagents = projectedSubagentsToRuntime(visibleSubagents);
   const byId = new Map(runtimeSubagents.map((agent) => [agent.id, agent]));
   const subagentsByThreadId = new Map(
-    projected
+    visibleSubagents
       .filter((subagent) => subagent.childThreadId !== null)
       .map((subagent) => [
         subagent.childThreadId,
@@ -539,12 +560,14 @@ export function ThreadRelationshipsPanel(props: {
           id: subagent.id,
           threadId: subagent.threadId,
           runId: subagent.runId,
+          childThreadId: subagent.childThreadId,
           nativeTaskRef: subagent.nativeTaskRef,
           nativeStatus: subagent.status,
           driver: subagent.driver,
           providerInstanceId: subagent.providerInstanceId,
           origin: subagent.origin,
           modelSelection: subagent.modelSelection,
+          workflow: subagent.workflow,
         },
       ]),
   );
@@ -626,10 +649,15 @@ export function ThreadRelationshipsPanel(props: {
     return isFinishedAgentStatus(edge.status) ? "previous" : "active";
   });
   const { remoteActive = [], remotePrevious = [] } = groupBy(
-    (projection?.subagents ?? [])
+    visibleSubagents
       .filter((agent): agent is RemoteSubagent => agent.remoteChild !== undefined)
       .map((remote) => ({ remote })),
     ({ remote }) => (isFinishedAgentStatus(remote.status) ? "remotePrevious" : "remoteActive"),
+  );
+  const { workflowActive = [], workflowPrevious = [] } = groupBy(
+    visibleSubagents.filter(isServerWorkflow).map((workflow) => ({ workflow })),
+    ({ workflow }) =>
+      isFinishedAgentStatus(workflow.status) ? "workflowPrevious" : "workflowActive",
   );
   const groups: ReadonlyArray<{
     id: string;
@@ -638,18 +666,22 @@ export function ThreadRelationshipsPanel(props: {
     expanded: boolean;
   }> = [
     { id: "related", label: null, rows: related, expanded: true },
-    { id: "active", label: null, rows: [...active, ...remoteActive], expanded: true },
+    {
+      id: "active",
+      label: null,
+      rows: [...active, ...remoteActive, ...workflowActive],
+      expanded: true,
+    },
     {
       id: "previous",
       label: gt("Previous agents"),
-      rows: [...previous, ...remotePrevious],
+      rows: [...previous, ...remotePrevious, ...workflowPrevious],
       expanded: false,
     },
   ];
   const runningCount =
-    (projection?.subagents.filter(
-      (agent) => agent.childThreadId === null && agent.status === "running",
-    ).length ?? 0) + active.filter(({ edge }) => edge.status === "running").length;
+    visibleSubagents.filter((agent) => agent.childThreadId === null && agent.status === "running")
+      .length + active.filter(({ edge }) => edge.status === "running").length;
 
   // A linked environment's agent may have delegated this thread from there.
   const delegatedFrom = currentThread?.delegatedFrom;
@@ -662,6 +694,8 @@ export function ThreadRelationshipsPanel(props: {
       runningCount > 0 ||
       remoteActive.length > 0 ||
       remotePrevious.length > 0 ||
+      workflowActive.length > 0 ||
+      workflowPrevious.length > 0 ||
       delegatedFrom !== undefined ||
       // Disconnect lives in this heading, so a thread with only side chats still shows it.
       (canDetach && sideChats.length > 0));
@@ -805,6 +839,7 @@ export function ThreadRelationshipsPanel(props: {
     const failed = rowStatus === "failed" || rowStatus === "error";
     const canStop =
       agent &&
+      !workflowGroup &&
       (agent.origin === "app_owned" ||
         (agent.origin === "provider_native" &&
           agent.driver === "claudeAgent" &&
@@ -833,9 +868,9 @@ export function ThreadRelationshipsPanel(props: {
     const providerDriver = agent?.driver ?? provider?.driver;
     const canStopWorkflow =
       canOperateWorkflow &&
-      workflowGroup?.workflow.status === "running" &&
-      agent?.origin === "provider_native" &&
-      providerDriver === "claudeAgent";
+      workflowGroup !== undefined &&
+      agent !== undefined &&
+      isStoppableWorkflow(agent);
     const trailingVisibilityClass = (workflowGroup ? canStopWorkflow : canStop)
       ? "group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:opacity-0 [@media(hover:none)]:opacity-0"
       : "";
@@ -1035,6 +1070,103 @@ export function ThreadRelationshipsPanel(props: {
     );
   };
 
+  const renderServerWorkflowRow = (workflowAgent: ServerWorkflowSubagent) => {
+    const workflowGroup = workflowGroupsById.get(workflowAgent.id);
+    if (workflowGroup === undefined) return null;
+    const runtimeAgent = byId.get(workflowAgent.id);
+    const threadTitle = relationshipThreadTitle({
+      title: workflowGroup.workflow.workflowName ?? workflowAgent.title ?? workflowAgent.id,
+      isSubagent: true,
+    });
+    const provider = providers?.find(
+      (entry) => entry.instanceId === workflowAgent.providerInstanceId,
+    );
+    const providerDriver = workflowAgent.driver ?? provider?.driver;
+    const failed = workflowAgent.status === "failed";
+    const canStopWorkflow = canOperateWorkflow && isStoppableWorkflow(workflowAgent);
+    const trailingVisibilityClass = canStopWorkflow
+      ? "group-hover:opacity-0 group-focus-within:opacity-0 pointer-coarse:opacity-0 [@media(hover:none)]:opacity-0"
+      : "";
+    const header = (
+      <Tooltip>
+        <TooltipTrigger
+          delay={200}
+          render={
+            <ThreadDetailsControl
+              size="sm"
+              variant="ghost"
+              part="primary"
+              render={<div />}
+              className="cursor-default active:scale-100"
+            />
+          }
+        >
+          <ThreadRelationshipIcon
+            driver={providerDriver}
+            provider={provider}
+            providerEntries={providerEntries}
+            fallbackIcon={BotIcon}
+            status={workflowAgent.status}
+          />
+          <span className="min-w-0 flex-1">
+            <span className="block truncate text-left text-sm font-medium leading-4 text-foreground/85">
+              {threadTitle}
+            </span>
+          </span>
+          {runtimeAgent &&
+          !failed &&
+          (deriveSubagentElapsedMs(runtimeAgent, 0) !== null || canStopWorkflow) ? (
+            <span
+              className={`shrink-0 text-2xs font-normal tabular-nums text-muted-foreground ${canStopWorkflow ? "min-w-6 text-end" : ""} ${trailingVisibilityClass}`}
+            >
+              <AgentElapsed agent={runtimeAgent} compact />
+            </span>
+          ) : (
+            <span className="sr-only">
+              {threadRelationshipStatusLabel(workflowAgent.status, m)}
+            </span>
+          )}
+        </TooltipTrigger>
+        <ThreadHoverCardPopup side="left">
+          <SubagentTooltipContent
+            title={threadTitle}
+            model={workflowAgent.model}
+            providerInstanceId={workflowAgent.providerInstanceId}
+            origin={workflowAgent.origin}
+            modelSelection={workflowAgent.modelSelection}
+            provider={provider}
+            providers={providers}
+            driver={providerDriver}
+            elapsed={runtimeAgent ? <AgentElapsed agent={runtimeAgent} /> : undefined}
+            status={workflowAgent.status}
+            result={workflowAgent.result}
+            progress={workflowAgent.progress}
+            parentThread={currentThread ?? undefined}
+            parentProject={currentProject}
+          />
+        </ThreadHoverCardPopup>
+      </Tooltip>
+    );
+    return (
+      <ThreadLineageWorkflowRow
+        key={workflowAgent.id}
+        group={workflowGroup}
+        providerInstanceId={workflowAgent.providerInstanceId}
+        provider={provider}
+        providers={providers}
+        providerEntries={providerEntries}
+        driver={providerDriver}
+        onOpenThread={(memberThreadId, intent) =>
+          openSideThreadRow(memberThreadId as ThreadId, intent)
+        }
+        onStop={canStopWorkflow ? () => void stopWorkflow(workflowAgent.id) : undefined}
+        stopping={stoppingId === workflowAgent.id}
+        stopDisabled={stoppingId !== null}
+        header={header}
+      />
+    );
+  };
+
   return (
     <>
       {lineageVisible ? (
@@ -1052,6 +1184,7 @@ export function ThreadRelationshipsPanel(props: {
             related.length > 0 ||
             active.length > 0 ||
             remoteActive.length > 0 ||
+            workflowActive.length > 0 ||
             delegatedFrom !== undefined
           }
           data-thread-relationships-panel
@@ -1105,6 +1238,8 @@ export function ThreadRelationshipsPanel(props: {
                         ?.find((entry) => entry.instanceId === row.remote.providerInstanceId)}
                       anyInstanceBadge={hasInstanceBadge(providerEntries)}
                     />
+                  ) : "workflow" in row ? (
+                    renderServerWorkflowRow(row.workflow)
                   ) : (
                     renderRelationshipRow(row)
                   ),

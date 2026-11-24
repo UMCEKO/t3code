@@ -445,7 +445,9 @@ export const make = Effect.gen(function* () {
       for (const run of unattendedRuns) {
         if (
           restartContinuationBlocked(projection, run, now, false) ||
-          (yield* restartStopRequested(projections.getThreadRecords, projection.thread, run).pipe(
+          (yield* restartStopRequested(projections.getThreadRecords, projection.thread, run, {
+            serverRestart: true,
+          }).pipe(
             Effect.mapError(
               (cause) =>
                 new ProviderRuntimeRecoveryError({
@@ -761,6 +763,8 @@ export const make = Effect.gen(function* () {
             !isAppOwnedDelegationItem(candidate) &&
             // A link card waits on the user, not the run, and answers by message.
             candidate.type !== "link_request" &&
+            // So does a feedback card, answered from what it recorded.
+            candidate.type !== "feedback_request" &&
             // The orchestrator queues a steer the provider never reported reading.
             !(
               candidate.type === "user_message" &&

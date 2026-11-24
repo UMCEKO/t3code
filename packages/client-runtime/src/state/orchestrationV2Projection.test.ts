@@ -486,7 +486,13 @@ describe("applyOrchestrationV2ProjectionEvent", () => {
 
   it("hides a steer that fell back to the queue until its run starts", () => {
     const queuedRunId = RunId.make("run-requeued-steer");
-    const queuedRun = { ...run, id: queuedRunId, ordinal: 2, status: "queued" } as const;
+    const queuedRun = {
+      ...run,
+      id: queuedRunId,
+      ordinal: 2,
+      status: "queued",
+      startedAt: null,
+    } as const;
     const reply = commandItem("item-reply", "reply", 102);
     const steer: OrchestrationV2TurnItem = {
       id: TurnItemId.make("item-steer"),
@@ -890,6 +896,189 @@ describe("provider-thread.updated", () => {
     expect(foreign?.thread.activeProviderThreadId).toBeNull();
     expect(foreign?.providerThreads.map((thread) => thread.id)).toEqual([
       ProviderThreadId.make("provider-thread-foreign"),
+    ]);
+  });
+});
+
+describe("subagent.updated workflow deltas", () => {
+  const workflowSubagent = (
+    workflow: NonNullable<OrchestrationV2ThreadProjection["subagents"][number]["workflow"]>,
+    overrides: Partial<OrchestrationV2ThreadProjection["subagents"][number]> = {},
+  ): OrchestrationV2ThreadProjection["subagents"][number] =>
+    ({
+      id: NodeId.make("node-workflow"),
+      threadId,
+      runId: RunId.make("run-workflow"),
+      parentNodeId: NodeId.make("node-root"),
+      origin: "app_owned",
+      createdBy: "agent",
+      driver: "codex",
+      providerInstanceId: ProviderInstanceId.make("codex"),
+      providerThreadId: null,
+      childThreadId: null,
+      nativeTaskRef: null,
+      prompt: "Audit modules",
+      title: "Audit",
+      model: "gpt-5",
+      status: "running",
+      workflow,
+      result: null,
+      startedAt: now,
+      completedAt: null,
+      updatedAt: now,
+      ...overrides,
+    }) as OrchestrationV2ThreadProjection["subagents"][number];
+
+  const applySubagent = (
+    projection: OrchestrationV2ThreadProjection,
+    payload: OrchestrationV2ThreadProjection["subagents"][number],
+  ) =>
+    applyOrchestrationV2ProjectionEvent(projection, {
+      id: "event-workflow-subagent",
+      type: "subagent.updated",
+      threadId,
+      occurredAt: now,
+      payload,
+    } as OrchestrationV2DomainEvent)!;
+
+  it("merges agentsDelta rows by index, preserves untouched rows, and takes other fields from the event", () => {
+    const initial = applySubagent(
+      emptyProjection,
+      workflowSubagent({
+        name: "audit",
+        phases: [{ index: 0, title: "Scan" }],
+        agents: [
+          { index: 0, label: "a0", state: "completed", result: "ok" },
+          { index: 1, label: "a1", state: "running" },
+        ],
+        totalTokens: 100,
+        durationMs: 500,
+        agentCount: 2,
+      }),
+    );
+
+    const merged = applySubagent(
+      initial,
+      workflowSubagent(
+        {
+          name: "audit",
+          phases: [
+            { index: 0, title: "Scan" },
+            { index: 1, title: "Verify" },
+          ],
+          agents: [
+            { index: 2, label: "a2", state: "queued" },
+            { index: 1, label: "a1", state: "completed", result: "done" },
+          ],
+          totalTokens: 350,
+          durationMs: 1200,
+          stopRequestedAt: 9999,
+          agentCount: 3,
+          agentsDelta: true,
+        },
+        { prompt: "", promptOmitted: true },
+      ),
+    );
+
+    expect(merged.subagents).toHaveLength(1);
+    expect(merged.subagents[0]?.prompt).toBe("Audit modules");
+    expect(merged.subagents[0]?.workflow).toEqual({
+      name: "audit",
+      phases: [
+        { index: 0, title: "Scan" },
+        { index: 1, title: "Verify" },
+      ],
+      agents: [
+        { index: 0, label: "a0", state: "completed", result: "ok" },
+        { index: 1, label: "a1", state: "completed", result: "done" },
+        { index: 2, label: "a2", state: "queued" },
+      ],
+      totalTokens: 350,
+      durationMs: 1200,
+      stopRequestedAt: 9999,
+      agentCount: 3,
+    });
+
+    const metadataOnly = applySubagent(
+      merged,
+      workflowSubagent({
+        name: "audit",
+        phases: [
+          { index: 0, title: "Scan" },
+          { index: 1, title: "Verify" },
+        ],
+        agents: [],
+        totalTokens: 400,
+        durationMs: 1500,
+        agentCount: 3,
+        agentsDelta: true,
+      }),
+    );
+    expect(metadataOnly.subagents[0]?.workflow?.agents).toBe(merged.subagents[0]?.workflow?.agents);
+    expect(metadataOnly.subagents[0]?.workflow?.totalTokens).toBe(400);
+  });
+
+  it("replaces the workflow when agentsDelta is absent", () => {
+    const initial = applySubagent(
+      emptyProjection,
+      workflowSubagent({
+        name: "audit",
+        phases: [{ index: 0, title: "Scan" }],
+        agents: [
+          { index: 0, label: "a0", state: "completed" },
+          { index: 1, label: "a1", state: "running" },
+        ],
+        agentCount: 2,
+      }),
+    );
+
+    const replaced = applySubagent(
+      initial,
+      workflowSubagent({
+        name: "audit",
+        phases: [{ index: 0, title: "Scan" }],
+        agents: [{ index: 1, label: "a1", state: "completed" }],
+        agentCount: 1,
+      }),
+    );
+    expect(replaced.subagents[0]?.workflow?.agents).toEqual([
+      { index: 1, label: "a1", state: "completed" },
+    ]);
+    expect(replaced.subagents[0]?.workflow?.agentCount).toBe(1);
+  });
+
+  it("keeps delta rows when no base workflow exists and replaces on a later full update", () => {
+    const fromDelta = applySubagent(
+      emptyProjection,
+      workflowSubagent({
+        name: "audit",
+        phases: [{ index: 0, title: "Scan" }],
+        agents: [{ index: 42, label: "a42", state: "running" }],
+        agentCount: 1000,
+        agentsDelta: true,
+      }),
+    );
+    expect(fromDelta.subagents[0]?.workflow).toEqual({
+      name: "audit",
+      phases: [{ index: 0, title: "Scan" }],
+      agents: [{ index: 42, label: "a42", state: "running" }],
+      agentCount: 1000,
+    });
+
+    const fullSnapshot = applySubagent(
+      fromDelta,
+      workflowSubagent({
+        name: "audit",
+        phases: [{ index: 0, title: "Scan" }],
+        agents: [
+          { index: 0, label: "a0", state: "completed" },
+          { index: 42, label: "a42", state: "completed" },
+        ],
+        agentCount: 1000,
+      }),
+    );
+    expect(fullSnapshot.subagents[0]?.workflow?.agents.map((agent) => agent.index)).toEqual([
+      0, 42,
     ]);
   });
 });

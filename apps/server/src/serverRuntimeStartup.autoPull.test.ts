@@ -140,6 +140,7 @@ it.effect("parks automatic pull until activation without delaying command readin
       Layer.mock(ProjectService.ProjectService)({ snapshot: Effect.succeed(snapshot) }),
       Layer.mock(ThreadManagement.ThreadManagementService)({
         countThreads: () => Effect.succeed(0),
+        listActiveShellIndex: () => Effect.succeed([]),
       }),
       Layer.mock(ThreadLaunch.ThreadLaunchService)({}),
       Layer.mock(ServiceLauncherClient.ServiceLauncherClient)({
@@ -158,7 +159,7 @@ it.effect("parks automatic pull until activation without delaying command readin
             Effect.onInterrupt(() => Deferred.succeed(statusInterrupted, undefined)),
           ),
       }),
-      Layer.mock(AnalyticsService.AnalyticsService)({ record: () => Effect.void }),
+      Layer.mock(AnalyticsService.AnalyticsService)({ record: () => Effect.succeed(true) }),
       // No provider logins or Connect link, so startup records no owners.
       FileSystem.layerNoop({}),
       Layer.mock(ServerSecretStore.ServerSecretStore)({ get: () => Effect.succeedNone }),

@@ -7,9 +7,11 @@ import type {
   OrchestrationV2ContextHandoff,
   OrchestrationV2StoredEvent,
   OrchestrationV2Subagent,
+  OrchestrationV2SubagentWorkflow,
   OrchestrationV2ThreadProjection,
   OrchestrationV2ThreadStreamItem,
   OrchestrationV2TurnItem,
+  OrchestrationV2WorkflowAgent,
 } from "@t3tools/contracts";
 import {
   dedupeSubagentBodies,
@@ -25,6 +27,10 @@ import {
 
 // A checkpoint over vendored or generated trees can list 15k+ files; the card needs a prefix.
 const MAX_WIRE_CHECKPOINT_FILES = 200;
+const MAX_WIRE_WORKFLOW_AGENTS = 200;
+// Workflow members render from the parent workflow's previews, not their own subagent rows.
+const MAX_WORKFLOW_MEMBER_PREVIEW_CHARS = 500;
+const MAX_WORKFLOW_AGENT_LABEL_CHARS = 200;
 const MAX_DETAIL_STRING_BYTES = 32_768;
 const MAX_DYNAMIC_VALUE_BYTES = 16_384;
 const MAX_ON_DEMAND_BYTES = 256 * 1024;
@@ -49,6 +55,164 @@ function truncateDetail(
     .toString("utf8")
     .replace(/\uFFFD$/u, "");
   return `${prefix}${TRUNCATION_MARKER}`;
+}
+
+function truncateChars(value: string, maxChars: number): string {
+  if (value.length <= maxChars) return value;
+  let end = maxChars - 1;
+  const last = value.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) {
+    end -= 1;
+  }
+  return `${value.slice(0, end)}…`;
+}
+
+function projectWorkflowAgentForWire(
+  agent: OrchestrationV2WorkflowAgent,
+): OrchestrationV2WorkflowAgent {
+  const label = truncateChars(agent.label, MAX_WORKFLOW_AGENT_LABEL_CHARS);
+  const prompt =
+    agent.prompt === undefined
+      ? undefined
+      : truncateChars(agent.prompt, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);
+  const result =
+    agent.result === undefined
+      ? undefined
+      : truncateChars(agent.result, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);
+  if (label === agent.label && prompt === agent.prompt && result === agent.result) {
+    return agent;
+  }
+  return {
+    ...agent,
+    label,
+    ...(prompt === undefined ? {} : { prompt }),
+    ...(result === undefined ? {} : { result }),
+  };
+}
+
+function settledAgentRecency(agent: OrchestrationV2WorkflowAgent): number {
+  if (agent.completedAt !== undefined) return agent.completedAt;
+  if (agent.startedAt !== undefined) return agent.startedAt + (agent.durationMs ?? 0);
+  return agent.queuedAt ?? -1;
+}
+
+function boundWorkflowAgentsForWire(
+  agents: ReadonlyArray<OrchestrationV2WorkflowAgent>,
+): ReadonlyArray<OrchestrationV2WorkflowAgent> {
+  if (agents.length <= MAX_WIRE_WORKFLOW_AGENTS) {
+    let changed = false;
+    const projected = agents.map((agent) => {
+      const next = projectWorkflowAgentForWire(agent);
+      if (next !== agent) changed = true;
+      return next;
+    });
+    return changed ? projected : agents;
+  }
+
+  const running: OrchestrationV2WorkflowAgent[] = [];
+  const queued: OrchestrationV2WorkflowAgent[] = [];
+  const settled: OrchestrationV2WorkflowAgent[] = [];
+  for (const agent of agents) {
+    if (agent.state === "running") running.push(agent);
+    else if (agent.state === "queued") queued.push(agent);
+    else settled.push(agent);
+  }
+
+  const selected: OrchestrationV2WorkflowAgent[] = [];
+  const take = (list: ReadonlyArray<OrchestrationV2WorkflowAgent>) => {
+    const budget = MAX_WIRE_WORKFLOW_AGENTS - selected.length;
+    if (budget <= 0 || list.length === 0) return;
+    const limit = Math.min(budget, list.length);
+    for (let index = 0; index < limit; index += 1) {
+      selected.push(projectWorkflowAgentForWire(list[index]!));
+    }
+  };
+
+  if (running.length > MAX_WIRE_WORKFLOW_AGENTS) {
+    running.sort((left, right) => left.index - right.index);
+  }
+  take(running);
+
+  if (selected.length < MAX_WIRE_WORKFLOW_AGENTS) {
+    if (queued.length > MAX_WIRE_WORKFLOW_AGENTS - selected.length) {
+      queued.sort((left, right) => left.index - right.index);
+    }
+    take(queued);
+  }
+
+  if (selected.length < MAX_WIRE_WORKFLOW_AGENTS && settled.length > 0) {
+    settled.sort(
+      (left, right) =>
+        settledAgentRecency(right) - settledAgentRecency(left) || right.index - left.index,
+    );
+    take(settled);
+  }
+
+  return selected;
+}
+
+function selectChangedWorkflowAgents(
+  agents: ReadonlyArray<OrchestrationV2WorkflowAgent>,
+  changedAgentIndices: ReadonlyArray<number>,
+): ReadonlyArray<OrchestrationV2WorkflowAgent> {
+  if (changedAgentIndices.length === 0) return [];
+  if (changedAgentIndices.length === 1) {
+    const target = changedAgentIndices[0]!;
+    const direct = agents[target];
+    if (direct !== undefined && direct.index === target) return [direct];
+    const found = agents.find((agent) => agent.index === target);
+    return found === undefined ? [] : [found];
+  }
+  const wanted = new Set(changedAgentIndices);
+  const selected: OrchestrationV2WorkflowAgent[] = [];
+  for (const agent of agents) {
+    if (wanted.has(agent.index)) selected.push(agent);
+  }
+  return selected;
+}
+
+function projectWorkflowForWire(
+  workflow: OrchestrationV2SubagentWorkflow,
+  allowDelta: boolean,
+): OrchestrationV2SubagentWorkflow {
+  const agentCount = Math.max(workflow.agentCount ?? 0, workflow.agents.length);
+  // A delta past the row cap would drop rows the client keeps stale, so send a replacement instead.
+  if (
+    allowDelta &&
+    workflow.changedAgentIndices !== undefined &&
+    workflow.changedAgentIndices.length <= MAX_WIRE_WORKFLOW_AGENTS
+  ) {
+    const { changedAgentIndices, ...rest } = workflow;
+    const agents = boundWorkflowAgentsForWire(
+      selectChangedWorkflowAgents(workflow.agents, changedAgentIndices),
+    );
+    return {
+      ...rest,
+      agents,
+      agentCount,
+      agentsDelta: true,
+    };
+  }
+
+  const agents = boundWorkflowAgentsForWire(workflow.agents);
+  const stripChanged = workflow.changedAgentIndices !== undefined;
+  const stripDelta = !allowDelta && workflow.agentsDelta !== undefined;
+  if (
+    !stripChanged &&
+    !stripDelta &&
+    agents === workflow.agents &&
+    workflow.agentCount === agentCount
+  ) {
+    return workflow;
+  }
+
+  const { changedAgentIndices: _changed, agentsDelta, ...rest } = workflow;
+  return {
+    ...rest,
+    agents,
+    agentCount,
+    ...(allowDelta && agentsDelta === true ? { agentsDelta: true as const } : {}),
+  };
 }
 
 /** Bound stored diffs to the client wire limit to avoid retaining invisible data in SQLite and heap. */
@@ -202,6 +366,31 @@ export function projectTurnItemForWire(item: OrchestrationV2TurnItem): Orchestra
   }
 }
 
+type SubagentTurnItem = Extract<OrchestrationV2TurnItem, { readonly type: "subagent" }>;
+
+export function projectWorkflowMemberSubagentTurnItemForWire(
+  item: SubagentTurnItem,
+): SubagentTurnItem {
+  const title =
+    item.title === null ? null : truncateChars(item.title, MAX_WORKFLOW_AGENT_LABEL_CHARS);
+  const prompt = truncateChars(item.prompt, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);
+  const progress = truncateDetail(item.progress);
+  const result =
+    item.result === null ? null : truncateChars(item.result, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);
+  return title === item.title &&
+    prompt === item.prompt &&
+    progress === item.progress &&
+    result === item.result
+    ? item
+    : {
+        ...item,
+        title,
+        prompt,
+        ...(progress === undefined ? {} : { progress }),
+        result,
+      };
+}
+
 function hasDynamicValue(value: unknown): boolean {
   if (value === undefined || value === null) return false;
   if (typeof value === "string") return value.trim().length > 0;
@@ -301,15 +490,69 @@ export function projectContextHandoffForWire(
   return { ...projected, summaryText: "" };
 }
 
+function projectSubagentRecordForWire(
+  subagent: OrchestrationV2Subagent,
+  allowDelta: boolean,
+): OrchestrationV2Subagent {
+  if (subagent.completionWake !== "never") {
+    if (subagent.workflow === undefined) return subagent;
+    const workflow = projectWorkflowForWire(subagent.workflow, allowDelta);
+    return workflow === subagent.workflow ? subagent : { ...subagent, workflow };
+  }
+  const title =
+    subagent.title === null ? null : truncateChars(subagent.title, MAX_WORKFLOW_AGENT_LABEL_CHARS);
+  const prompt = truncateChars(subagent.prompt, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);
+  const progress = truncateDetail(subagent.progress);
+  const result =
+    subagent.result === null
+      ? null
+      : truncateChars(subagent.result, MAX_WORKFLOW_MEMBER_PREVIEW_CHARS);
+  const workflow =
+    subagent.workflow === undefined
+      ? undefined
+      : projectWorkflowForWire(subagent.workflow, allowDelta);
+  if (
+    title === subagent.title &&
+    prompt === subagent.prompt &&
+    progress === subagent.progress &&
+    result === subagent.result &&
+    workflow === subagent.workflow
+  ) {
+    return subagent;
+  }
+  return {
+    ...subagent,
+    title,
+    prompt,
+    ...(progress === undefined ? {} : { progress }),
+    result,
+    ...(workflow === undefined ? {} : { workflow }),
+  };
+}
+
+export function projectSubagentForWire(subagent: OrchestrationV2Subagent): OrchestrationV2Subagent {
+  return projectSubagentRecordForWire(subagent, false);
+}
+
 export function projectThreadProjectionForWire(
   projection: OrchestrationV2ThreadProjection,
 ): OrchestrationV2ThreadProjection {
+  const workflowMemberSubagentIds = new Set<string>();
+  const subagents = projection.subagents.map((subagent) => {
+    if (subagent.completionWake === "never") workflowMemberSubagentIds.add(subagent.id);
+    return projectSubagentForWire(subagent);
+  });
   const projectedById = new Map<string, OrchestrationV2TurnItem>();
   const project = (item: OrchestrationV2TurnItem) => {
     const key = `${item.threadId}:${item.id}`;
     const existing = projectedById.get(key);
     if (existing !== undefined) return existing;
-    const projected = projectTurnItemForWire(item);
+    const projected =
+      item.type === "subagent" &&
+      item.threadId === projection.thread.id &&
+      workflowMemberSubagentIds.has(item.subagentId)
+        ? projectWorkflowMemberSubagentTurnItemForWire(item)
+        : projectTurnItemForWire(item);
     projectedById.set(key, projected);
     return projected;
   };
@@ -317,6 +560,7 @@ export function projectThreadProjectionForWire(
     ...projection,
     checkpoints: projection.checkpoints.map(capCheckpointFiles),
     contextHandoffs: projection.contextHandoffs.map(projectContextHandoffForWire),
+    subagents,
     turnItems: projection.turnItems.map(project),
     visibleTurnItems: projection.visibleTurnItems.map((row) => ({
       ...row,
@@ -328,13 +572,24 @@ export function projectThreadProjectionForWire(
 export function projectDomainEventForWire(
   event: OrchestrationV2DomainEvent,
 ): OrchestrationV2DomainEvent {
-  return event.type === "turn-item.updated"
-    ? { ...event, payload: projectTurnItemForWire(event.payload) }
-    : event.type === "context-handoff.updated"
-      ? { ...event, payload: projectContextHandoffForWire(event.payload) }
-      : event.type === "checkpoint.captured"
-        ? { ...event, payload: capCheckpointFiles(event.payload) }
-        : event;
+  switch (event.type) {
+    case "turn-item.updated": {
+      const payload = projectTurnItemForWire(event.payload);
+      return payload === event.payload ? event : { ...event, payload };
+    }
+    case "context-handoff.updated":
+      return { ...event, payload: projectContextHandoffForWire(event.payload) };
+    case "checkpoint.captured": {
+      const payload = capCheckpointFiles(event.payload);
+      return payload === event.payload ? event : { ...event, payload };
+    }
+    case "subagent.updated": {
+      const payload = projectSubagentRecordForWire(event.payload, true);
+      return payload === event.payload ? event : { ...event, payload };
+    }
+    default:
+      return event;
+  }
 }
 
 // Keyed on the stored event PubSub hands every subscriber, so all of them share one projection
@@ -347,9 +602,13 @@ export function projectStoredEventForWire(
   const cached = projectedStoredEvents.get(stored);
   if (cached !== undefined) return cached;
   const event = projectDomainEventForWire(stored.event);
-  if (event === stored.event) return stored;
+  if (event === stored.event) {
+    projectedStoredEvents.set(stored, stored);
+    return stored;
+  }
   const projected = { ...stored, event };
   projectedStoredEvents.set(stored, projected);
+  projectedStoredEvents.set(projected, projected);
   return projected;
 }
 
@@ -374,25 +633,67 @@ function remember<K, V>(memory: Map<K, V>, key: K, value: V): void {
   if (memory.size > LIVE_DEDUPE_MEMORY) memory.delete(memory.keys().next().value as K);
 }
 
+/** One per subscription without body dedupe: workflow-member turn items ship as previews. */
+export function makeWorkflowMemberBounder(
+  knownMembers: Iterable<NodeId> = [],
+): (item: OrchestrationV2ThreadStreamItem) => OrchestrationV2ThreadStreamItem {
+  const members = new Set<NodeId>(knownMembers);
+  const note = (subagent: OrchestrationV2Subagent) => {
+    if (subagent.completionWake === "never") members.add(subagent.id);
+  };
+  return (item) => {
+    if (item.kind === "snapshot") {
+      for (const subagent of item.projection.subagents) note(subagent);
+      return item;
+    }
+    if (item.kind !== "event") return item;
+    const { event } = item;
+    if (event.type === "subagent.updated") {
+      note(event.payload);
+      return item;
+    }
+    if (
+      event.type !== "turn-item.updated" ||
+      event.payload.type !== "subagent" ||
+      !members.has(event.payload.subagentId)
+    ) {
+      return item;
+    }
+    const payload = projectWorkflowMemberSubagentTurnItemForWire(event.payload);
+    return payload === event.payload ? item : { ...item, event: { ...event, payload } };
+  };
+}
+
 /**
  * One per subscription, after coalescing, so it remembers only records the client received. A
  * record event comes before the turn item that repeats its body, so the item (or a repeated
  * subagent record) ships blank and marked. The other order, or a forgotten record, only costs
  * bytes: the repeat ships whole.
  */
-export function makeLiveBodyDeduper(): (
-  item: OrchestrationV2ThreadStreamItem,
-) => OrchestrationV2ThreadStreamItem {
+export function makeLiveBodyDeduper(
+  knownWorkflowMembers: Iterable<NodeId> = [],
+): (item: OrchestrationV2ThreadStreamItem) => OrchestrationV2ThreadStreamItem {
   const messageText = new Map<MessageId, string>();
   const checkpointFiles = new Map<CheckpointId, OrchestrationV2Checkpoint["files"]>();
-  const subagents = new Map<NodeId, Pick<OrchestrationV2Subagent, "prompt" | "result">>();
+  const subagents = new Map<
+    NodeId,
+    Pick<OrchestrationV2Subagent, "prompt" | "result" | "completionWake">
+  >();
+  // Track workflow membership outside the bounded body-dedupe LRU so old members stay previewed.
+  const workflowMembers = new Set<NodeId>(knownWorkflowMembers);
   const source = {
     messageText: (id: MessageId) => messageText.get(id),
     checkpointFiles: (id: CheckpointId) => checkpointFiles.get(id),
     subagent: (id: NodeId) => subagents.get(id),
   };
-  const rememberSubagent = ({ id, prompt, result }: OrchestrationV2Subagent) =>
-    remember(subagents, id, { prompt, result });
+  const rememberSubagent = ({ id, prompt, result, completionWake }: OrchestrationV2Subagent) => {
+    if (completionWake === "never") workflowMembers.add(id);
+    remember(subagents, id, {
+      prompt,
+      result,
+      ...(completionWake === undefined ? {} : { completionWake }),
+    });
+  };
   return (item) => {
     if (item.kind === "snapshot") {
       // The client now holds exactly these records; their bodies are never blanked.
@@ -418,7 +719,11 @@ export function makeLiveBodyDeduper(): (
         return payload === event.payload ? item : { ...item, event: { ...event, payload } };
       }
       case "turn-item.updated": {
-        const payload = dedupeTurnItemBodies(event.payload, source);
+        const bounded =
+          event.payload.type === "subagent" && workflowMembers.has(event.payload.subagentId)
+            ? projectWorkflowMemberSubagentTurnItemForWire(event.payload)
+            : event.payload;
+        const payload = dedupeTurnItemBodies(bounded, source);
         return payload === event.payload ? item : { ...item, event: { ...event, payload } };
       }
       default:

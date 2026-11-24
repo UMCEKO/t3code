@@ -70,6 +70,7 @@ export interface RuntimeSubagent {
   readonly phaseTitle: string | null;
   readonly attempt: number | null;
   readonly workflowName: string | null;
+  readonly agentCount?: number | undefined;
   readonly phases: ReadonlyArray<SubagentWorkflowPhase>;
   readonly runHandles: SubagentRunHandles | null;
   readonly childThreadId: string | null;
@@ -99,6 +100,65 @@ export function isLiveSubagentTurnItem(item: OrchestrationV2TurnItem): boolean {
   return item.type === "subagent" && isOrchestrationV2WorkActive(item.status);
 }
 
+export function isServerWorkflow<
+  T extends Pick<OrchestrationV2Subagent, "origin" | "childThreadId" | "workflow">,
+>(subagent: T): subagent is T & { readonly workflow: OrchestrationV2SubagentWorkflow } {
+  return (
+    subagent.workflow !== undefined &&
+    subagent.origin === "app_owned" &&
+    subagent.childThreadId === null
+  );
+}
+
+export function isStoppableWorkflow(
+  subagent: Pick<
+    OrchestrationV2Subagent,
+    "status" | "origin" | "driver" | "childThreadId" | "nativeTaskRef" | "workflow"
+  >,
+): boolean {
+  if (subagent.workflow === undefined || subagent.status !== "running") return false;
+  if (isServerWorkflow(subagent)) return true;
+  return (
+    subagent.origin === "provider_native" &&
+    subagent.driver === "claudeAgent" &&
+    Boolean(subagent.nativeTaskRef?.nativeId)
+  );
+}
+
+type WorkflowMemberCandidate = {
+  readonly id: string;
+  readonly origin?: OrchestrationV2Subagent["origin"] | undefined;
+  readonly parentNodeId?: string | undefined;
+  readonly workflow?: OrchestrationV2SubagentWorkflow | undefined;
+};
+
+function isWorkflowMemberSubagent(
+  subagent: Pick<WorkflowMemberCandidate, "origin" | "parentNodeId" | "workflow">,
+  workflowIds: ReadonlySet<string>,
+): boolean {
+  return (
+    subagent.origin === "app_owned" &&
+    subagent.workflow === undefined &&
+    subagent.parentNodeId !== undefined &&
+    workflowIds.has(subagent.parentNodeId)
+  );
+}
+
+/**
+ * Drops app-owned subagent rows spawned under a workflow task: those agents already appear inside
+ * the workflow's `workflow.agents` list, so listing both would duplicate every member.
+ */
+export function excludeWorkflowMemberSubagents<T extends WorkflowMemberCandidate>(
+  subagents: ReadonlyArray<T>,
+): ReadonlyArray<T> {
+  const workflowIds = new Set<string>();
+  for (const subagent of subagents) {
+    if (subagent.workflow !== undefined) workflowIds.add(subagent.id);
+  }
+  if (workflowIds.size === 0) return subagents;
+  return subagents.filter((subagent) => !isWorkflowMemberSubagent(subagent, workflowIds));
+}
+
 export function waitingOnSubagentsLabel(count: number, resolve: MFunctionType = mFallback): string {
   return resolve(
     msg("{count, plural, =1 {Waiting on a subagent} other {Waiting on {count} subagents}}", {
@@ -109,6 +169,7 @@ export function waitingOnSubagentsLabel(count: number, resolve: MFunctionType = 
 
 export interface SubagentWorkflowGroup {
   readonly workflow: RuntimeSubagent;
+  readonly agentCount: number;
   readonly phases: ReadonlyArray<{
     readonly index: number;
     readonly title: string;
@@ -140,6 +201,7 @@ function workflowMembersToRuntime(
   coordinator: RuntimeSubagent,
   workflow: OrchestrationV2SubagentWorkflow,
 ): ReadonlyArray<RuntimeSubagent> {
+  const { agentCount: _agentCount, ...memberBase } = coordinator;
   return workflow.agents.map((agent) => {
     const status =
       (agent.state === "queued" || agent.state === "running") &&
@@ -157,7 +219,7 @@ function workflowMembersToRuntime(
           : coordinator.completedAt))
       : null;
     return {
-      ...coordinator,
+      ...memberBase,
       id: `${coordinator.id}:agent:${agent.index}`,
       kind: "workflow_agent" as const,
       title: agent.label,
@@ -186,7 +248,7 @@ function workflowMembersToRuntime(
   });
 }
 
-function promptTitle(prompt: string): string {
+export function promptTitle(prompt: string): string {
   if (prompt.length <= 80) return prompt;
   let end = 77;
   const previous = prompt.charCodeAt(end - 1);
@@ -215,6 +277,8 @@ export function workflowMemberModelSelection(
 export function projectedSubagentsToRuntime(
   subagents: ReadonlyArray<{
     readonly id: string;
+    readonly origin?: OrchestrationV2Subagent["origin"] | undefined;
+    readonly parentNodeId?: string | undefined;
     readonly title: string | null;
     readonly prompt: string;
     readonly model: string | null;
@@ -228,7 +292,7 @@ export function projectedSubagentsToRuntime(
     readonly updatedAt: DateTime.Utc;
   }>,
 ): ReadonlyArray<RuntimeSubagent> {
-  return subagents.flatMap((subagent) => {
+  return excludeWorkflowMemberSubagents(subagents).flatMap((subagent) => {
     const updatedAt = DateTime.formatIso(subagent.updatedAt);
     const startedAt = subagent.startedAt === null ? null : DateTime.formatIso(subagent.startedAt);
     const firstSeenAt = startedAt ?? updatedAt;
@@ -255,6 +319,9 @@ export function projectedSubagentsToRuntime(
       phaseTitle: null,
       attempt: null,
       workflowName: workflow?.name ?? null,
+      ...(workflow === undefined
+        ? {}
+        : { agentCount: workflow.agentCount ?? workflow.agents.length }),
       phases: workflow?.phases ?? [],
       runHandles,
       childThreadId: subagent.childThreadId ?? null,
@@ -329,7 +396,12 @@ export function deriveWorkflowGroups(
       .filter((member) => member.phaseIndex === null)
       .sort((a, b) => (a.agentIndex ?? 0) - (b.agentIndex ?? 0));
 
-    return { workflow, phases, unphasedMembers };
+    return {
+      workflow,
+      agentCount: Math.max(workflow.agentCount ?? 0, workflowMembers.length),
+      phases,
+      unphasedMembers,
+    };
   });
 }
 
@@ -446,6 +518,7 @@ export function workflowOpeningHeadline(
           ...opening.group.phases.flatMap((phase) => phase.members),
           ...opening.group.unphasedMembers,
         ];
+  const totalAgents = opening.group?.agentCount ?? members.length;
   const counts = new Map<string, number>();
   for (const member of members) {
     const key = isTerminalSubagentStatus(member.status)
@@ -457,18 +530,21 @@ export function workflowOpeningHeadline(
       : "working";
     counts.set(key, (counts.get(key) ?? 0) + 1);
   }
+  // Omit per-status counts when the snapshot holds a subset so settled totals never undercount.
   const agents =
-    members.length === 0
+    totalAgents === 0
       ? null
       : [
           resolve(
             msg("{count, plural, one {{count} agent} other {{count} agents}}", {
-              count: members.length,
+              count: totalAgents,
             }),
           ),
-          ...(["working", "done", "failed", "stopped"] as const)
-            .filter((key) => counts.has(key))
-            .map((key) => resolve(WORKFLOW_AGENT_COUNTS[key], { count: counts.get(key)! })),
+          ...(totalAgents === members.length
+            ? (["working", "done", "failed", "stopped"] as const)
+                .filter((key) => counts.has(key))
+                .map((key) => resolve(WORKFLOW_AGENT_COUNTS[key], { count: counts.get(key)! }))
+            : []),
         ].join(" · ");
   return {
     title,

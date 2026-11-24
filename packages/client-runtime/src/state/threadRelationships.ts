@@ -6,6 +6,7 @@ import {
 import * as DateTime from "effect/DateTime";
 
 import type { ThreadStructure } from "./models.ts";
+import { excludeWorkflowMemberSubagents } from "./subagentRuntime.ts";
 
 export type ThreadRelationshipKind = "parent" | "fork" | "subagent" | "transfer";
 
@@ -82,6 +83,17 @@ export function deriveThreadRelationshipGraph(input: {
   };
 
   const selectedThread = input.projection?.thread;
+  const visibleSubagents =
+    input.projection === null ? [] : excludeWorkflowMemberSubagents(input.projection.subagents);
+  const workflowMemberChildThreadIds = new Set<ThreadId>();
+  if (input.projection !== null && visibleSubagents.length !== input.projection.subagents.length) {
+    const visibleIds = new Set(visibleSubagents.map((subagent) => subagent.id));
+    for (const subagent of input.projection.subagents) {
+      if (!visibleIds.has(subagent.id) && subagent.childThreadId !== null) {
+        workflowMemberChildThreadIds.add(subagent.childThreadId);
+      }
+    }
+  }
   const lineageThreads =
     selectedThread !== undefined && !threadsById.has(selectedThread.id)
       ? [...threads, { ...selectedThread, activityRunStatus: null, status: null }]
@@ -92,6 +104,13 @@ export function deriveThreadRelationshipGraph(input: {
         ? thread.forkedFrom.threadId
         : thread.lineage.parentThreadId;
     if (parentThreadId === null) continue;
+    if (
+      parentThreadId === selectedThread?.id &&
+      thread.lineage.relationshipToParent === "subagent" &&
+      workflowMemberChildThreadIds.has(thread.id)
+    ) {
+      continue;
+    }
     addEdge({
       sourceThreadId: parentThreadId,
       targetThreadId: thread.id,
@@ -102,7 +121,7 @@ export function deriveThreadRelationshipGraph(input: {
 
   if (input.projection !== null) {
     const ownerThreadId = input.projection.thread.id;
-    for (const subagent of input.projection.subagents) {
+    for (const subagent of visibleSubagents) {
       if (subagent.childThreadId === null) continue;
       const child = threadsById.get(subagent.childThreadId);
       addEdge({
@@ -118,6 +137,14 @@ export function deriveThreadRelationshipGraph(input: {
     }
     for (const transfer of input.projection.contextTransfers) {
       if (transfer.sourceThreadId === transfer.targetThreadId) continue;
+      if (
+        (transfer.sourceThreadId === ownerThreadId &&
+          workflowMemberChildThreadIds.has(transfer.targetThreadId)) ||
+        (transfer.targetThreadId === ownerThreadId &&
+          workflowMemberChildThreadIds.has(transfer.sourceThreadId))
+      ) {
+        continue;
+      }
       addEdge({
         sourceThreadId: transfer.sourceThreadId,
         targetThreadId: transfer.targetThreadId,

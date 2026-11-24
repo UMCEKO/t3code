@@ -51,6 +51,7 @@ import { getServerOwners } from "./telemetry/Identify.ts";
 import * as ServerEnvironment from "./environment/ServerEnvironment.ts";
 import * as EnvironmentAuth from "./auth/EnvironmentAuth.ts";
 import { formatHeadlessServeOutput, issueHeadlessServeAccessInfo } from "./startupAccess.ts";
+import * as WorkflowService from "./workflows/WorkflowService.ts";
 
 export class ServerRuntimeStartupError extends Schema.TaggedError<ServerRuntimeStartupError>()(
   "ServerRuntimeStartupError",
@@ -426,23 +427,27 @@ const runOrderedV2StartupPhases = Effect.fn("serverRuntimeStartup.runOrderedV2St
     Recovery,
     Bootstrap,
     ImportError,
+    WorkflowRecoveryError,
     RecoveryError,
     DelegationError,
     WorkerError,
     BootstrapError,
     ImportContext,
+    WorkflowRecoveryContext,
     RecoveryContext,
     DelegationContext,
     WorkerContext,
     BootstrapContext,
   >(input: {
     readonly importLegacyShells: Effect.Effect<Import, ImportError, ImportContext>;
+    readonly recoverWorkflows: Effect.Effect<void, WorkflowRecoveryError, WorkflowRecoveryContext>;
     readonly recover: Effect.Effect<Recovery, RecoveryError, RecoveryContext>;
     readonly recoverDelegatedTasks: Effect.Effect<void, DelegationError, DelegationContext>;
     readonly startEffectWorker: Effect.Effect<void, WorkerError, WorkerContext>;
     readonly autoBootstrap: Effect.Effect<Bootstrap, BootstrapError, BootstrapContext>;
   }) {
     yield* input.importLegacyShells;
+    yield* input.recoverWorkflows;
     const recovery = yield* input.recover;
     yield* input.recoverDelegatedTasks;
     yield* input.startEffectWorker;
@@ -552,6 +557,10 @@ const make = Effect.fn("serverRuntimeStartup.make")(function* (options?: Startup
               : Effect.logInfo("Imported legacy v1 thread shells", summary),
           ),
         ),
+      ),
+      recoverWorkflows: runStartupPhase(
+        "orchestration-v2.workflows.recover",
+        WorkflowService.recoverInterruptedWorkflows,
       ),
       recover: runStartupPhase("orchestration-v2.recovery", providerRuntimeRecovery.recover),
       recoverDelegatedTasks: runStartupPhase(

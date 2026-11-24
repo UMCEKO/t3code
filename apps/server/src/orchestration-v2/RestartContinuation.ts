@@ -100,6 +100,7 @@ export const restartStopRequested = Effect.fn("RestartContinuation.restartStopRe
     ) => Effect.Effect<ProjectionRecords<K>, E>,
     thread: Pick<ProjectionRuntimeRecoveryState["thread"], "id" | "lineage" | "forkedFrom">,
     source: Pick<OrchestrationV2Run, "id" | "delegatedTaskId">,
+    options?: { readonly serverRestart?: boolean },
   ) {
     const { turnItems } = yield* getThreadRecords(thread.id, ["turnItems"], {
       turnItemRunIds: [source.id],
@@ -107,32 +108,80 @@ export const restartStopRequested = Effect.fn("RestartContinuation.restartStopRe
     });
     if (turnItems.some((item) => item.runId === source.id && item.type === "run_interrupt_request"))
       return true;
-    const { lineage, forkedFrom } = thread;
-    const taskId =
-      source.delegatedTaskId ?? (forkedFrom?.type === "node" ? forkedFrom.nodeId : undefined);
-    if (
-      lineage.relationshipToParent !== "subagent" ||
-      lineage.parentThreadId === null ||
-      taskId === undefined
-    )
-      return false;
-    const task = (yield* getThreadRecords(lineage.parentThreadId, ["subagents"], {
-      subagentIds: [taskId],
-    })).subagents.find((candidate) => candidate.id === taskId);
-    // A settled task no longer owns later work in its thread.
-    if (
-      task === undefined ||
-      task.runId === null ||
-      task.result !== null ||
-      !isOrchestrationV2WorkActive(task.status)
-    )
-      return false;
-    return (
-      (yield* getThreadRecords(lineage.parentThreadId, ["turnItems"], {
-        turnItemTypes: ["run_interrupt_request"],
-        turnItemRunIds: [task.runId],
-      })).turnItems.length > 0
-    );
+    const visited = new Set<ThreadId>([thread.id]);
+    let currentThread:
+      | Pick<ProjectionRuntimeRecoveryState["thread"], "id" | "lineage" | "forkedFrom">
+      | undefined = thread;
+    let currentTaskId =
+      source.delegatedTaskId ??
+      (thread.forkedFrom?.type === "node" ? thread.forkedFrom.nodeId : undefined);
+    let linkedByDelegatedRun = source.delegatedTaskId !== undefined;
+    while (
+      currentThread !== undefined &&
+      currentThread.lineage.relationshipToParent === "subagent" &&
+      currentThread.lineage.parentThreadId !== null &&
+      currentTaskId !== undefined
+    ) {
+      const parentThreadId: ThreadId = currentThread.lineage.parentThreadId;
+      if (visited.has(parentThreadId)) return false;
+      visited.add(parentThreadId);
+      const parentRecords: ProjectionRecords<"subagents"> = yield* getThreadRecords(
+        parentThreadId,
+        ["subagents"],
+        { subagentIds: [currentTaskId] },
+      );
+      const task = parentRecords.subagents.find((candidate) => candidate.id === currentTaskId);
+      if (task !== undefined) {
+        const owner = (yield* getThreadRecords(parentThreadId, ["subagents"], {
+          subagentIds: [task.parentNodeId],
+        })).subagents.find((candidate) => candidate.id === task.parentNodeId);
+        // Server workflows never survive a server restart; fail closed even if cleanup has not marked them yet.
+        if (
+          owner?.origin === "app_owned" &&
+          owner.childThreadId === null &&
+          owner.workflow !== undefined &&
+          (options?.serverRestart === true ||
+            owner.workflow.stopRequestedAt !== undefined ||
+            !isOrchestrationV2WorkActive(owner.status))
+        )
+          return true;
+      }
+      if (task === undefined) return false;
+      const taskActive = task.result === null && isOrchestrationV2WorkActive(task.status);
+      // A settled task no longer owns later non-delegated turns in its thread.
+      if (!taskActive && !linkedByDelegatedRun) return false;
+      if (
+        taskActive &&
+        task.runId !== null &&
+        (yield* getThreadRecords(parentThreadId, ["turnItems"], {
+          turnItemTypes: ["run_interrupt_request"],
+          turnItemRunIds: [task.runId],
+        })).turnItems.length > 0
+      )
+        return true;
+
+      const parentThread:
+        | Pick<ProjectionRuntimeRecoveryState["thread"], "id" | "lineage" | "forkedFrom">
+        | undefined = parentRecords.thread;
+      if (
+        parentThread === undefined ||
+        parentThread.lineage.relationshipToParent !== "subagent" ||
+        parentThread.lineage.parentThreadId === null
+      )
+        return false;
+      const parentRun =
+        task.runId === null
+          ? undefined
+          : (yield* getThreadRecords(parentThreadId, ["runs"], {
+              runIds: [task.runId],
+            })).runs.find((candidate) => candidate.id === task.runId);
+      currentThread = parentThread;
+      linkedByDelegatedRun = parentRun?.delegatedTaskId !== undefined;
+      currentTaskId =
+        parentRun?.delegatedTaskId ??
+        (parentThread.forkedFrom?.type === "node" ? parentThread.forkedFrom.nodeId : undefined);
+    }
+    return false;
   },
 );
 
@@ -307,7 +356,12 @@ export const continueRestartedRun = Effect.fn("RestartContinuation.continueResta
       });
       return;
     }
-    if (yield* restartStopRequested(threads.getThreadRecords, projection.thread, source)) return;
+    if (
+      yield* restartStopRequested(threads.getThreadRecords, projection.thread, source, {
+        serverRestart: input.cause === "server_restart",
+      })
+    )
+      return;
     const sourceMessage = (yield* threads.getThreadRecords(input.threadId, ["messages"], {
       messageIds: [source.userMessageId],
     })).messages.find((message) => message.id === source.userMessageId);
