@@ -8,6 +8,7 @@ import { describe, expect, it } from "vite-plus/test";
 import {
   MAX_PHASE_MESSAGE_BYTES,
   MAX_VALUE_MESSAGE_BYTES,
+  MIN_WORKER_STDOUT_BUFFERED_BYTES,
   WORKFLOW_LIMITS,
   WORKFLOW_MESSAGE_LIMITS,
   WORKFLOW_PROGRESS_LIMITS,
@@ -1192,10 +1193,12 @@ describe("sandbox", () => {
         }),
       ).rejects.toThrow(/startup handshake/i);
 
-      // A kill failure other than ESRCH must not claim the child exited.
+      // A kill failure other than ESRCH must not claim the child exited and must release retry-delay exit waiters.
       let destroyed = 0;
       let confirmedExit = false;
       let killAttempts = 0;
+      const activeEpermListeners = new Set<() => void>();
+      let peakEpermListeners = 0;
       const epermOutcome = await terminateSandboxChild({
         child: {
           pid: 999_999,
@@ -1227,17 +1230,27 @@ describe("sandbox", () => {
         markExited: () => {
           confirmedExit = true;
         },
-        waitForExit: () => new Promise<void>(() => {}),
-        maxKillAttempts: 2,
-        retryDelayMs: 0,
+        onExit: (listener) => {
+          activeEpermListeners.add(listener);
+          if (activeEpermListeners.size > peakEpermListeners) {
+            peakEpermListeners = activeEpermListeners.size;
+          }
+          return () => {
+            activeEpermListeners.delete(listener);
+          };
+        },
+        maxKillAttempts: 3,
+        retryDelayMs: 5,
       });
       expect(destroyed).toBe(3);
-      expect(killAttempts).toBe(2);
+      expect(killAttempts).toBe(3);
       expect(confirmedExit).toBe(false);
+      expect(peakEpermListeners).toBe(1);
+      expect(activeEpermListeners.size).toBe(0);
       expect(epermOutcome).toMatchObject({
         status: "kill_failed",
         pid: 999_999,
-        attempts: 2,
+        attempts: 3,
       });
 
       // ESRCH means the process is already gone and confirms exit.
@@ -1260,16 +1273,65 @@ describe("sandbox", () => {
         markExited: () => {
           esrchConfirmed = true;
         },
-        waitForExit: () => new Promise<void>(() => {}),
+        onExit: () => () => {},
         retryDelayMs: 0,
       });
       expect(esrchConfirmed).toBe(true);
       expect(esrchOutcome).toEqual({ status: "exited" });
+
+      // A successful kill("SIGKILL") that never emits exit/close must be bounded, return kill_failed,
+      // and release every exit-wait subscription when the timer wins so listeners never accumulate.
+      let hangKillAttempts = 0;
+      let hangConfirmed = false;
+      const activeHangListeners = new Set<() => void>();
+      let peakHangListeners = 0;
+      const hangOutcome = await terminateSandboxChild({
+        child: {
+          pid: 999_998,
+          exitCode: null,
+          signalCode: null,
+          stdin: { destroy: () => {} },
+          stdout: { destroy: () => {} },
+          stderr: { destroy: () => {} },
+          kill: () => {
+            hangKillAttempts += 1;
+            return true;
+          },
+        },
+        isExited: () => hangConfirmed,
+        markExited: () => {
+          hangConfirmed = true;
+        },
+        onExit: (listener) => {
+          activeHangListeners.add(listener);
+          if (activeHangListeners.size > peakHangListeners) {
+            peakHangListeners = activeHangListeners.size;
+          }
+          return () => {
+            activeHangListeners.delete(listener);
+          };
+        },
+        maxKillAttempts: 3,
+        retryDelayMs: 0,
+        exitConfirmTimeoutMs: 5,
+      });
+      expect(hangKillAttempts).toBe(3);
+      expect(hangConfirmed).toBe(false);
+      expect(peakHangListeners).toBe(1);
+      expect(activeHangListeners.size).toBe(0);
+      expect(hangOutcome).toMatchObject({
+        status: "kill_failed",
+        pid: 999_998,
+        attempts: 3,
+      });
     });
 
     it("retries transient kill failures in runWorkflowScript, keeps ownership on persistent kill failures, and distinguishes spawn errors from live-PID errors", async () => {
-      // 1. Transient EPERM kill failure succeeds on bounded retry and confirms exit on real child exit/close.
+      // 1. Transient EPERM kill failure succeeds on bounded retry and confirms exit on real child exit/close,
+      //    and worker.onExit unsubscribes cancelled listeners cleanly.
       let transientAttempts = 0;
+      let cancelledListenerCalls = 0;
+      let activeListenerCalls = 0;
       await expect(
         runWorkflowScript({
           script: makeScript("return 1;"),
@@ -1279,6 +1341,15 @@ describe("sandbox", () => {
           handshakeTimeoutMs: 80,
           maxKillAttempts: 4,
           killRetryDelayMs: 0,
+          onWorkerSpawned: (worker) => {
+            const unsub = worker.onExit(() => {
+              cancelledListenerCalls += 1;
+            });
+            unsub();
+            worker.onExit(() => {
+              activeListenerCalls += 1;
+            });
+          },
           spawnCommand: {
             command: process.execPath,
             args: ["-e", "setInterval(() => {}, 60_000);"],
@@ -1301,6 +1372,8 @@ describe("sandbox", () => {
         }),
       ).rejects.toThrow(/startup handshake/i);
       expect(transientAttempts).toBe(3);
+      expect(cancelledListenerCalls).toBe(0);
+      expect(activeListenerCalls).toBe(1);
 
       // 2. Persistent EPERM kill failure retries boundedly, keeps PID ownership, reports cleanup failure,
       //    and rejects with WorkflowSandboxCleanupError until real exit releases ownership.
@@ -1808,13 +1881,22 @@ describe("sandbox", () => {
       const corkedWorkerScript = `
         const origWrite = process.stdout.write.bind(process.stdout);
         let readySent = false;
+        let uncorkScheduled = false;
         process.stdout.write = (chunk, ...rest) => {
           const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+          if (readySent && text === "" && !uncorkScheduled) {
+            uncorkScheduled = true;
+            setImmediate(() => process.stdout.uncork());
+            return origWrite(chunk, ...rest);
+          }
           if (text.includes('"type":"error"') || text.includes('"type":"done"')) {
             process.stdout.uncork();
             return origWrite(chunk, ...rest);
           }
           const ok = origWrite(chunk, ...rest);
+          if (readySent && process.stdout.writableLength > 1024) {
+            process.exit(42);
+          }
           if (!readySent && text.includes('"type":"ready"')) {
             readySent = true;
             process.stdout.cork();
@@ -1846,7 +1928,7 @@ describe("sandbox", () => {
       ).rejects.toThrow(/output backlog exceeded/i);
     });
 
-    it("flushes queued worker stdout before writing the final done frame", async () => {
+    it("flushes queued worker stdout before writing terminal done and error frames and enforces framing + newline within the backlog cap", async () => {
       const workerModuleUrl = new URL("./sandboxWorker.ts", import.meta.url).href;
       const cap = 1024;
       const guardedCorkWorkerScript = `
@@ -1890,6 +1972,177 @@ describe("sandbox", () => {
         },
       });
       expect(result).toBe("y".repeat(600));
+
+      // Terminal error frames must also drain queued stdout instead of overflowing the backlog cap.
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            log("x".repeat(600));
+            throw new Error("boom-" + "e".repeat(500));
+          `),
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+          maxStdoutBufferedBytes: cap,
+          spawnCommand: {
+            command: process.execPath,
+            args: ["-e", guardedCorkWorkerScript],
+            env: { ELECTRON_RUN_AS_NODE: "1" },
+          },
+        }),
+      ).rejects.toThrow(/boom-e+/);
+
+      // Even with an empty queue, a done frame that fits before framing but exceeds the cap with framing + newline is rejected.
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`
+            return "z".repeat(1010);
+          `),
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+          maxStdoutBufferedBytes: cap,
+          spawnCommand: {
+            command: process.execPath,
+            args: ["-e", guardedCorkWorkerScript],
+            env: { ELECTRON_RUN_AS_NODE: "1" },
+          },
+        }),
+      ).rejects.toThrow(/exceeds.*limit/i);
+
+      // Boundary below the minimum error-frame size: runner rejects before spawning, and the worker writer refuses oversized frames even on an empty queue.
+      const minErrorFrameBytes =
+        Buffer.byteLength(
+          JSON.stringify({ type: "error", kind: "WorkflowScriptError", message: "" }),
+          "utf8",
+        ) + 1;
+      expect(MIN_WORKER_STDOUT_BUFFERED_BYTES).toBe(minErrorFrameBytes);
+      let spawnedBelowMin = false;
+      await expect(
+        runWorkflowScript({
+          script: makeScript("return 1;"),
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+          maxStdoutBufferedBytes: minErrorFrameBytes - 1,
+          spawnChild: (...args) => {
+            spawnedBelowMin = true;
+            return NodeChildProcess.spawn(...args);
+          },
+        }),
+      ).rejects.toThrow(new RegExp(`at least ${minErrorFrameBytes}`));
+      expect(spawnedBelowMin).toBe(false);
+
+      expect(() =>
+        createWorkflowHostMessageReceiver({
+          script: makeScript("return 1;"),
+          argsJson: undefined,
+          host: makeHost(),
+          concurrency: 1,
+          syncTimeoutMs: 5_000,
+          initialSpent: 0,
+          maxStdoutBufferedBytes: minErrorFrameBytes - 1,
+          postToChild: () => true,
+          onIdleSettled: () => {},
+          onSucceed: () => {},
+          onFail: () => {},
+          isSettled: () => false,
+        }),
+      ).toThrow(new RegExp(`at least ${minErrorFrameBytes}`));
+
+      // Exact minimum error-frame cap is accepted and keeps terminal error frames within the cap.
+      const exactMinCapScript = `
+        const origWrite = process.stdout.write.bind(process.stdout);
+        let readySent = false;
+        process.stdout.write = (chunk, ...rest) => {
+          const text = typeof chunk === "string" ? chunk : chunk.toString("utf8");
+          if (readySent && Buffer.byteLength(text, "utf8") > ${minErrorFrameBytes}) {
+            process.exit(43);
+          }
+          const ok = origWrite(chunk, ...rest);
+          if (!readySent && text.includes('"type":"ready"')) {
+            readySent = true;
+          }
+          return ok;
+        };
+        import(${JSON.stringify(workerModuleUrl)}).then((m) => m.runWorkflowSandboxWorker());
+      `;
+      await expect(
+        runWorkflowScript({
+          script: makeScript(`return "z".repeat(200);`),
+          args: undefined,
+          host: makeHost(),
+          concurrency: 1,
+          maxStdoutBufferedBytes: minErrorFrameBytes,
+          spawnCommand: {
+            command: process.execPath,
+            args: ["-e", exactMinCapScript],
+            env: { ELECTRON_RUN_AS_NODE: "1" },
+          },
+        }),
+      ).rejects.toBeInstanceOf(WorkflowScriptError);
+
+      // Direct worker with a cap below the empty error envelope must not write an oversized frame even on an empty queue.
+      const belowMinCap = minErrorFrameBytes - 1;
+      const directWorker = NodeChildProcess.spawn(
+        process.execPath,
+        [
+          "-e",
+          `import(${JSON.stringify(workerModuleUrl)}).then((m) => m.runWorkflowSandboxWorker());`,
+        ],
+        { stdio: ["pipe", "pipe", "pipe"], env: { ELECTRON_RUN_AS_NODE: "1" } },
+      );
+      const directStdoutLines: Array<string> = [];
+      let directStdoutBuf = "";
+      const directReady = Promise.withResolvers<void>();
+      directWorker.stdout.on("data", (chunk: Buffer) => {
+        directStdoutBuf += chunk.toString("utf8");
+        let idx = directStdoutBuf.indexOf("\n");
+        while (idx !== -1) {
+          const line = directStdoutBuf.slice(0, idx);
+          directStdoutBuf = directStdoutBuf.slice(idx + 1);
+          directStdoutLines.push(line);
+          if (line.includes('"type":"ready"')) {
+            directReady.resolve();
+          }
+          idx = directStdoutBuf.indexOf("\n");
+        }
+      });
+      const directClosed = new Promise<number | null>((resolve) => {
+        directWorker.once("close", (code) => resolve(code));
+      });
+      try {
+        await directReady.promise;
+        directWorker.stdin.write(
+          `${JSON.stringify({
+            type: "start",
+            seq: 1,
+            script: makeScript(`return "z".repeat(200);`),
+            hasArgs: false,
+            concurrency: 1,
+            syncTimeoutMs: 5_000,
+            budgetTotal: null,
+            budgetSpent: 0,
+            maxAgents: WORKFLOW_LIMITS.maxAgents,
+            maxItems: WORKFLOW_LIMITS.maxItems,
+            maxPromptBytes: WORKFLOW_MESSAGE_LIMITS.maxPromptBytes,
+            maxValueBytes: WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
+            maxLogChars: WORKFLOW_MESSAGE_LIMITS.maxLogChars,
+            progressLimits: WORKFLOW_PROGRESS_LIMITS,
+            maxStdoutBufferedBytes: belowMinCap,
+          })}\n`,
+        );
+        const exitCode = await directClosed;
+        expect(exitCode).not.toBe(0);
+        const postReadyLines = directStdoutLines.slice(1);
+        for (const line of postReadyLines) {
+          expect(Buffer.byteLength(`${line}\n`, "utf8")).toBeLessThanOrEqual(belowMinCap);
+        }
+      } finally {
+        if (directWorker.exitCode === null && directWorker.signalCode === null) {
+          directWorker.kill("SIGKILL");
+        }
+      }
     });
 
     it("limits in-flight nested loadScript requests on the host before opening files", async () => {

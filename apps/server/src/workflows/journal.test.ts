@@ -1,18 +1,26 @@
 import { describe, expect, it } from "@effect/vitest";
+import * as Cause from "effect/Cause";
 import * as Deferred from "effect/Deferred";
 import * as Effect from "effect/Effect";
+import * as Exit from "effect/Exit";
 import * as Fiber from "effect/Fiber";
 
 import {
   JournalEncodeError,
+  JournalRecordTooLargeError,
+  MAX_JOURNAL_LINE_BYTES,
   MAX_PENDING_JOURNAL_BYTES,
   MAX_PENDING_JOURNAL_ENTRIES,
   agentCallKey,
+  createIndexedReplayCursor,
+  createReplayIndexAccumulator,
   decodeJournal,
   encodeJournalEntry,
   makeJournalWriter,
+  parseJournalLine,
   replayCursor,
   type JournalEntry,
+  type ReplayIndexEntry,
 } from "./journal.ts";
 
 describe("journal", () => {
@@ -188,6 +196,125 @@ describe("journal", () => {
       expect(() => cursor.take(0, "k0")).toThrow(/expected index 1, got 0/i);
       expect(() => cursor.take(2, "k2")).toThrow(/expected index 1, got 2/i);
     });
+
+    it.effect(
+      "builds a compact replay index retaining zero result bodies and loads matching values on demand with a bounded cache",
+      () =>
+        Effect.gen(function* () {
+          const accumulator = createReplayIndexAccumulator();
+          const lines: Array<Buffer> = [];
+          let fileOffset = 0;
+
+          const pushRecorded = (entry: JournalEntry) => {
+            const encoded = Buffer.from(encodeJournalEntry(entry), "utf8");
+            const spanLength = encoded.byteLength - 1;
+            accumulator.push(entry, { offset: fileOffset, length: spanLength });
+            lines.push(encoded);
+            fileOffset += encoded.byteLength;
+          };
+
+          const totalResults = 200;
+          const payloadSize = 4_000;
+          for (let i = 0; i < totalResults; i += 1) {
+            if (i === 2) {
+              pushRecorded({
+                type: "result",
+                index: i,
+                key: `k-${i}`,
+                outcome: "null",
+                value: null,
+              });
+            } else if (i === 3) {
+              pushRecorded({
+                type: "result",
+                index: i,
+                key: `k-${i}`,
+                outcome: "usage_limited",
+                value: null,
+              });
+            } else {
+              pushRecorded({
+                type: "result",
+                index: i,
+                key: `k-${i}`,
+                outcome: "ok",
+                value: `val-${i}-${"p".repeat(payloadSize)}`,
+              });
+            }
+          }
+
+          const journalBuf = Buffer.concat(lines);
+          const index = accumulator.build();
+
+          // Replay preparation retains only compact metadata (no result values).
+          expect(index.entries.size).toBe(totalResults);
+          for (const entry of index.entries.values()) {
+            expect("value" in entry).toBe(false);
+            expect(entry.length).toBeGreaterThan(0);
+          }
+
+          const loadedIndices: Array<number> = [];
+          let brokenNotified = false;
+          const maxCacheEntries = 3;
+          const maxCacheBytes = 10_000;
+          const cursor = createIndexedReplayCursor({
+            index,
+            maxCacheEntries,
+            maxCacheBytes,
+            onBreak: () => {
+              brokenNotified = true;
+            },
+            loadValue: (entry: ReplayIndexEntry, expectedIndex: number) =>
+              Effect.sync(() => {
+                loadedIndices.push(expectedIndex);
+                const slice = journalBuf
+                  .subarray(entry.offset, entry.offset + entry.length)
+                  .toString("utf8");
+                const parsed = parseJournalLine(slice);
+                if (parsed?.type !== "result") {
+                  throw new Error(`Unexpected entry at index ${expectedIndex}`);
+                }
+                return parsed.value;
+              }),
+          });
+
+          // Zero result bodies are cached before any take() runs.
+          expect(cursor.stats()).toEqual({
+            indexedCount: totalResults,
+            cachedCount: 0,
+            cachedBytes: 0,
+          });
+          expect(loadedIndices).toHaveLength(0);
+
+          // Take indices 0..7: ok entries load on demand; null & usage_limited do not read from disk.
+          for (let i = 0; i < 8; i += 1) {
+            const taken = yield* cursor.take(i, `k-${i}`);
+            if (i === 2) {
+              expect(taken).toEqual({ cached: true, value: null });
+            } else if (i === 3) {
+              expect(taken).toEqual({ cached: false });
+            } else {
+              expect(taken).toEqual({
+                cached: true,
+                value: `val-${i}-${"p".repeat(payloadSize)}`,
+              });
+            }
+            expect(cursor.stats().cachedCount).toBeLessThanOrEqual(maxCacheEntries);
+            expect(cursor.stats().cachedBytes).toBeLessThanOrEqual(maxCacheBytes);
+          }
+          expect(loadedIndices).toEqual([0, 1, 4, 5, 6, 7]);
+          // With ~4 KiB entries and a 10 KiB byte cap, at most 2 entries stay cached at once.
+          expect(cursor.stats().cachedCount).toBeLessThanOrEqual(2);
+
+          // Diverging at index 8 breaks the prefix, clears the cache, and never loads indices 9..199.
+          expect(yield* cursor.take(8, "k-8-changed")).toEqual({ cached: false });
+          expect(brokenNotified).toBe(true);
+          expect(cursor.stats().cachedCount).toBe(0);
+          expect(cursor.stats().cachedBytes).toBe(0);
+          expect(yield* cursor.take(9, "k-9")).toEqual({ cached: false });
+          expect(loadedIndices).toEqual([0, 1, 4, 5, 6, 7]);
+        }),
+    );
   });
 
   describe("makeJournalWriter", () => {
@@ -392,6 +519,82 @@ describe("journal", () => {
         expect(errors[1]).toBeInstanceOf(JournalEncodeError);
         expect(yield* writer.pendingBytes).toBe(0);
       }),
+    );
+
+    it.effect(
+      "refuses oversized records at write time for every record type and accepts records at the exact 8 MiB limit",
+      () =>
+        Effect.gen(function* () {
+          const limit = MAX_JOURNAL_LINE_BYTES;
+          const makeExactEntry = (
+            build: (filler: string) => JournalEntry,
+            extraBytes: number,
+          ): JournalEntry => {
+            const base = build("");
+            const overhead = Buffer.byteLength(JSON.stringify(base), "utf8");
+            const fillerLen = limit - overhead + extraBytes;
+            const entry = build("x".repeat(fillerLen));
+            expect(Buffer.byteLength(JSON.stringify(entry), "utf8")).toBe(limit + extraBytes);
+            return entry;
+          };
+
+          const builders: ReadonlyArray<readonly [string, (filler: string) => JournalEntry]> = [
+            [
+              "started",
+              (filler) => ({
+                type: "started",
+                index: 0,
+                key: "k0",
+                label: filler,
+                phase: null,
+                agentId: null,
+                childThreadId: null,
+              }),
+            ],
+            [
+              "result",
+              (filler) => ({
+                type: "result",
+                index: 0,
+                key: "k0",
+                outcome: "ok",
+                value: filler,
+              }),
+            ],
+            ["phase", (filler) => ({ type: "phase", title: filler })],
+            ["log", (filler) => ({ type: "log", message: filler })],
+            ["end", (filler) => ({ type: "end", status: "failed", error: filler })],
+          ];
+
+          const written: Array<string> = [];
+          const writer = yield* makeJournalWriter({
+            writeLine: (line) => Effect.sync(() => void written.push(line)),
+          });
+
+          for (const [entryType, build] of builders) {
+            const oversized = makeExactEntry(build, 1);
+            expect(() => encodeJournalEntry(oversized)).toThrow(JournalRecordTooLargeError);
+            expect(() => writer.tryAppend(oversized)).toThrow(JournalRecordTooLargeError);
+            const appendExit = yield* writer.append(oversized).pipe(Effect.exit);
+            expect(Exit.isFailure(appendExit)).toBe(true);
+            if (Exit.isFailure(appendExit)) {
+              const err = Cause.squash(appendExit.cause);
+              expect(err).toBeInstanceOf(JournalRecordTooLargeError);
+              expect((err as JournalRecordTooLargeError).entryType).toBe(entryType);
+              expect((err as JournalRecordTooLargeError).bytes).toBe(limit + 1);
+              expect((err as JournalRecordTooLargeError).maxBytes).toBe(limit);
+            }
+          }
+          yield* writer.flush;
+          expect(written).toHaveLength(0);
+
+          const atLimitResult = makeExactEntry(builders[1]![1], 0);
+          expect(encodeJournalEntry(atLimitResult).endsWith("\n")).toBe(true);
+          expect(yield* writer.append(atLimitResult)).toBe(true);
+          yield* writer.flush;
+          expect(written).toHaveLength(1);
+          expect(decodeJournal(written[0]!)).toEqual([atLimitResult]);
+        }),
     );
   });
 });

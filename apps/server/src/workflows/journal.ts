@@ -8,8 +8,11 @@ import * as Queue from "effect/Queue";
 import * as Schema from "effect/Schema";
 import type * as Scope from "effect/Scope";
 
+export const MAX_JOURNAL_LINE_BYTES = 8 * 1024 * 1024;
 export const MAX_PENDING_JOURNAL_ENTRIES = 1_024;
 export const MAX_PENDING_JOURNAL_BYTES = 16 * 1024 * 1024;
+export const DEFAULT_REPLAY_CACHE_MAX_ENTRIES = 8;
+export const DEFAULT_REPLAY_CACHE_MAX_BYTES = 8 * 1024 * 1024;
 
 export class JournalEncodeError extends Schema.TaggedError<JournalEncodeError>()(
   "JournalEncodeError",
@@ -17,6 +20,21 @@ export class JournalEncodeError extends Schema.TaggedError<JournalEncodeError>()
     cause: Schema.Defect(),
   },
 ) {}
+
+export class JournalRecordTooLargeError extends Schema.TaggedError<JournalRecordTooLargeError>()(
+  "JournalRecordTooLargeError",
+  {
+    entryType: Schema.String,
+    bytes: Schema.Number,
+    maxBytes: Schema.Number,
+  },
+) {
+  override get message(): string {
+    return `Workflow journal "${this.entryType}" record (${this.bytes} bytes) exceeds the ${this.maxBytes}-byte limit.`;
+  }
+}
+
+export const isJournalRecordTooLargeError = Schema.is(JournalRecordTooLargeError);
 
 export type JournalEntry =
   | {
@@ -50,6 +68,45 @@ export interface ReplayCursor {
     index: number,
     key: string,
   ) => { readonly cached: true; readonly value: unknown } | { readonly cached: false };
+}
+
+export interface JournalLineSpan {
+  readonly offset: number;
+  readonly length: number;
+}
+
+export interface ReplayIndexEntry {
+  readonly key: string;
+  readonly outcome: "ok" | "null" | "usage_limited" | "cancelled";
+  readonly offset: number;
+  readonly length: number;
+}
+
+export interface ReplayIndex {
+  readonly entries: ReadonlyMap<number, ReplayIndexEntry>;
+}
+
+export interface ReplayIndexAccumulator {
+  readonly push: (entry: JournalEntry, span: JournalLineSpan) => void;
+  readonly build: () => ReplayIndex;
+}
+
+export interface ReplayCacheStats {
+  readonly indexedCount: number;
+  readonly cachedCount: number;
+  readonly cachedBytes: number;
+}
+
+export interface IndexedReplayCursor<E = never> {
+  readonly take: (
+    index: number,
+    key: string,
+  ) => Effect.Effect<
+    { readonly cached: true; readonly value: unknown } | { readonly cached: false },
+    E
+  >;
+  readonly stats: () => ReplayCacheStats;
+  readonly clear: () => void;
 }
 
 function unwrapToJson(value: unknown): unknown {
@@ -115,12 +172,24 @@ export function agentCallKey(prompt: string, opts: unknown): string {
   return NodeCrypto.createHash("sha256").update(payload).digest("hex");
 }
 
-export function encodeJournalEntry(entry: JournalEntry): string {
+function encodeJournalEntryWithLimit(entry: JournalEntry, maxLineBytes: number): string {
   const line = JSON.stringify(entry);
   if (typeof line !== "string") {
     throw new TypeError("Journal entry is not JSON-serializable");
   }
+  const bytes = Buffer.byteLength(line, "utf8");
+  if (bytes > maxLineBytes) {
+    throw new JournalRecordTooLargeError({
+      entryType: entry.type,
+      bytes,
+      maxBytes: maxLineBytes,
+    });
+  }
   return `${line}\n`;
+}
+
+export function encodeJournalEntry(entry: JournalEntry): string {
+  return encodeJournalEntryWithLimit(entry, MAX_JOURNAL_LINE_BYTES);
 }
 
 function isNonNegativeInt(value: unknown): value is number {
@@ -168,6 +237,15 @@ function isJournalEntry(value: unknown): value is JournalEntry {
   }
 }
 
+export function parseJournalLine(trimmedLine: string): JournalEntry | undefined {
+  try {
+    const parsed: unknown = JSON.parse(trimmedLine);
+    return isJournalEntry(parsed) ? parsed : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 export function decodeJournal(text: string): ReadonlyArray<JournalEntry> {
   const rawLines = text.split("\n");
   let lastNonEmpty = -1;
@@ -183,20 +261,22 @@ export function decodeJournal(text: string): ReadonlyArray<JournalEntry> {
 
   const entries: Array<JournalEntry> = [];
   for (let i = 0; i <= lastNonEmpty; i += 1) {
-    const trimmed = rawLines[i]!.trim();
+    const rawLine = rawLines[i]!;
+    const trimmed = rawLine.trim();
     if (trimmed.length === 0) continue;
 
-    let parsed: unknown;
-    let valid = false;
-    try {
-      parsed = JSON.parse(trimmed);
-      valid = isJournalEntry(parsed);
-    } catch {
-      valid = false;
+    const bytes = Buffer.byteLength(rawLine, "utf8");
+    if (bytes > MAX_JOURNAL_LINE_BYTES) {
+      throw new JournalRecordTooLargeError({
+        entryType: "unknown",
+        bytes,
+        maxBytes: MAX_JOURNAL_LINE_BYTES,
+      });
     }
 
-    if (valid) {
-      entries.push(parsed as JournalEntry);
+    const parsed = parseJournalLine(trimmed);
+    if (parsed !== undefined) {
+      entries.push(parsed);
       continue;
     }
 
@@ -207,6 +287,136 @@ export function decodeJournal(text: string): ReadonlyArray<JournalEntry> {
     throw new Error(`Corrupt journal entry at line ${i + 1}`);
   }
   return entries;
+}
+
+export function createReplayIndexAccumulator(): ReplayIndexAccumulator {
+  const entries = new Map<number, ReplayIndexEntry>();
+  return {
+    push(entry: JournalEntry, span: JournalLineSpan) {
+      if (entry.type === "result") {
+        entries.set(entry.index, {
+          key: entry.key,
+          outcome: entry.outcome,
+          offset: span.offset,
+          length: span.length,
+        });
+      }
+    },
+    build() {
+      return { entries };
+    },
+  };
+}
+
+export function createIndexedReplayCursor<E = never>(input: {
+  readonly index: ReplayIndex;
+  readonly loadValue: (entry: ReplayIndexEntry, expectedIndex: number) => Effect.Effect<unknown, E>;
+  readonly maxCacheEntries?: number;
+  readonly maxCacheBytes?: number;
+  readonly onBreak?: () => void;
+}): IndexedReplayCursor<E> {
+  const maxCacheEntries = Math.max(
+    0,
+    Math.trunc(input.maxCacheEntries ?? DEFAULT_REPLAY_CACHE_MAX_ENTRIES),
+  );
+  const maxCacheBytes = Math.max(
+    0,
+    Math.trunc(input.maxCacheBytes ?? DEFAULT_REPLAY_CACHE_MAX_BYTES),
+  );
+  const cache = new Map<number, { readonly value: unknown; readonly bytes: number }>();
+  let cachedBytes = 0;
+  let nextIndex = 0;
+  let broken = false;
+
+  const clear = (): void => {
+    cache.clear();
+    cachedBytes = 0;
+  };
+
+  const remember = (index: number, value: unknown, bytes: number): void => {
+    if (maxCacheEntries === 0 || bytes > maxCacheBytes) return;
+    const existing = cache.get(index);
+    if (existing !== undefined) {
+      cachedBytes = Math.max(0, cachedBytes - existing.bytes);
+      cache.delete(index);
+    }
+    while (
+      cache.size > 0 &&
+      (cache.size >= maxCacheEntries || cachedBytes + bytes > maxCacheBytes)
+    ) {
+      const oldestKey = cache.keys().next().value;
+      if (oldestKey === undefined) break;
+      const oldest = cache.get(oldestKey);
+      cache.delete(oldestKey);
+      if (oldest !== undefined) {
+        cachedBytes = Math.max(0, cachedBytes - oldest.bytes);
+      }
+    }
+    cache.set(index, { value, bytes });
+    cachedBytes += bytes;
+  };
+
+  return {
+    take(index: number, key: string) {
+      return Effect.suspend(
+        (): Effect.Effect<
+          { readonly cached: true; readonly value: unknown } | { readonly cached: false },
+          E
+        > => {
+          if (index !== nextIndex) {
+            return Effect.die(new Error(`Replay cursor expected index ${nextIndex}, got ${index}`));
+          }
+          nextIndex += 1;
+
+          if (broken) {
+            return Effect.succeed({ cached: false } as const);
+          }
+
+          const previousResult = input.index.entries.get(index);
+          if (
+            previousResult === undefined ||
+            previousResult.key !== key ||
+            previousResult.outcome === "cancelled"
+          ) {
+            broken = true;
+            clear();
+            input.onBreak?.();
+            return Effect.succeed({ cached: false } as const);
+          }
+
+          if (previousResult.outcome === "usage_limited") {
+            return Effect.succeed({ cached: false } as const);
+          }
+
+          if (previousResult.outcome === "null") {
+            return Effect.succeed({ cached: true, value: null } as const);
+          }
+
+          const hit = cache.get(index);
+          if (hit !== undefined) {
+            cache.delete(index);
+            cache.set(index, hit);
+            return Effect.succeed({ cached: true, value: hit.value } as const);
+          }
+
+          return input.loadValue(previousResult, index).pipe(
+            Effect.map((value) => {
+              remember(index, value, previousResult.length);
+              return { cached: true, value } as const;
+            }),
+          );
+        },
+      );
+    },
+    stats() {
+      return {
+        indexedCount: input.index.entries.size,
+        cachedCount: cache.size,
+        cachedBytes,
+      };
+    },
+    clear,
+  };
 }
 
 interface RecordedResult {
@@ -222,11 +432,10 @@ export function replayCursor(previous: ReadonlyArray<JournalEntry>): ReplayCurso
       results.set(entry.index, {
         key: entry.key,
         outcome: entry.outcome,
-        value: entry.value,
+        value: entry.outcome === "ok" ? entry.value : null,
       });
     }
   }
-
   let nextIndex = 0;
   let broken = false;
 
@@ -269,7 +478,7 @@ type JournalQueueItem =
   | { readonly _tag: "flush"; readonly done: Deferred.Deferred<void> };
 
 export interface JournalWriter {
-  readonly append: (entry: JournalEntry) => Effect.Effect<boolean>;
+  readonly append: (entry: JournalEntry) => Effect.Effect<boolean, JournalRecordTooLargeError>;
   readonly tryAppend: (entry: JournalEntry) => boolean;
   readonly flush: Effect.Effect<void>;
   readonly close: Effect.Effect<void>;
@@ -279,13 +488,17 @@ export interface JournalWriter {
 
 function tryEncode(
   entry: JournalEntry,
+  maxRecordBytes: number,
 ):
   | { readonly ok: true; readonly line: string; readonly bytes: number }
-  | { readonly ok: false; readonly error: JournalEncodeError } {
+  | { readonly ok: false; readonly error: JournalEncodeError | JournalRecordTooLargeError } {
   try {
-    const line = encodeJournalEntry(entry);
+    const line = encodeJournalEntryWithLimit(entry, maxRecordBytes);
     return { ok: true, line, bytes: Buffer.byteLength(line, "utf8") };
   } catch (cause) {
+    if (isJournalRecordTooLargeError(cause)) {
+      return { ok: false, error: cause };
+    }
     return { ok: false, error: new JournalEncodeError({ cause }) };
   }
 }
@@ -297,12 +510,14 @@ export const makeJournalWriter = Effect.fn("WorkflowJournal.makeJournalWriter")(
   readonly onWriteError?: (error: E | JournalEncodeError) => Effect.Effect<void>;
   readonly maxPending?: number;
   readonly maxPendingBytes?: number;
+  readonly maxRecordBytes?: number;
 }): Effect.fn.Return<JournalWriter, never, Scope.Scope> {
   const capacity = Math.max(1, Math.trunc(input.maxPending ?? MAX_PENDING_JOURNAL_ENTRIES));
   const maxPendingBytes = Math.max(
     1,
     Math.trunc(input.maxPendingBytes ?? MAX_PENDING_JOURNAL_BYTES),
   );
+  const maxRecordBytes = Math.max(1, Math.trunc(input.maxRecordBytes ?? MAX_JOURNAL_LINE_BYTES));
   const queue = yield* Queue.bounded<JournalQueueItem>(capacity);
   let closed = false;
   let inFlight = 0;
@@ -432,11 +647,14 @@ export const makeJournalWriter = Effect.fn("WorkflowJournal.makeJournalWriter")(
 
   yield* Effect.addFinalizer(() => close);
 
-  const append = (entry: JournalEntry): Effect.Effect<boolean> =>
+  const append = (entry: JournalEntry): Effect.Effect<boolean, JournalRecordTooLargeError> =>
     Effect.suspend(() => {
       if (closed) return Effect.succeed(false);
-      const encoded = tryEncode(entry);
+      const encoded = tryEncode(entry, maxRecordBytes);
       if (!encoded.ok) {
+        if (encoded.error._tag === "JournalRecordTooLargeError") {
+          return Effect.fail(encoded.error);
+        }
         return Queue.offer(queue, { _tag: "encodeError", error: encoded.error });
       }
       return Effect.uninterruptibleMask((restore) =>
@@ -467,8 +685,11 @@ export const makeJournalWriter = Effect.fn("WorkflowJournal.makeJournalWriter")(
 
   const tryAppend = (entry: JournalEntry): boolean => {
     if (closed) return false;
-    const encoded = tryEncode(entry);
+    const encoded = tryEncode(entry, maxRecordBytes);
     if (!encoded.ok) {
+      if (encoded.error._tag === "JournalRecordTooLargeError") {
+        throw encoded.error;
+      }
       return Queue.offerUnsafe(queue, { _tag: "encodeError", error: encoded.error });
     }
     if (byteWaiters.length > 0 || waitingBytes + encoded.bytes > maxPendingBytes) {

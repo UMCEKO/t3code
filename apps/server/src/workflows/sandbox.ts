@@ -13,6 +13,7 @@ import {
   MAX_START_MESSAGE_BYTES,
   MAX_VALUE_MESSAGE_BYTES,
   MAX_WORKER_STDOUT_BUFFERED_BYTES,
+  MIN_WORKER_STDOUT_BUFFERED_BYTES,
   makeWorkflowProgressBudget,
   WORKFLOW_MESSAGE_LIMITS,
   WORKFLOW_PROGRESS_LIMITS,
@@ -25,6 +26,7 @@ import {
 export {
   MAX_PHASE_MESSAGE_BYTES,
   MAX_VALUE_MESSAGE_BYTES,
+  MIN_WORKER_STDOUT_BUFFERED_BYTES,
   WORKFLOW_MESSAGE_LIMITS,
   WORKFLOW_PROGRESS_LIMITS,
   WORKFLOW_SANDBOX_PROCESS_LIMITS,
@@ -802,15 +804,55 @@ export type TerminateSandboxChildOutcome =
 
 const DEFAULT_KILL_MAX_ATTEMPTS = 4;
 const DEFAULT_KILL_RETRY_DELAY_MS = 25;
+const DEFAULT_EXIT_CONFIRM_TIMEOUT_MS = 1_000;
+
+export interface WorkflowSandboxWorker {
+  readonly pid: number | undefined;
+  readonly isExited: () => boolean;
+  readonly isConfirmedDone: () => boolean;
+  readonly onExit: (listener: () => void) => () => void;
+  readonly terminate: () => Promise<TerminateSandboxChildOutcome>;
+}
+
+function waitForExitBounded(
+  onExit: (listener: () => void) => () => void,
+  timeoutMs: number,
+): Promise<"exited" | "timeout"> {
+  return new Promise<"exited" | "timeout">((resolve) => {
+    let done = false;
+    let unsubscribe: (() => void) | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (outcome: "exited" | "timeout"): void => {
+      if (done) return;
+      done = true;
+      if (timer !== undefined) {
+        clearTimeout(timer);
+        timer = undefined;
+      }
+      const unsub = unsubscribe;
+      unsubscribe = undefined;
+      unsub?.();
+      resolve(outcome);
+    };
+    unsubscribe = onExit(() => finish("exited"));
+    if (done) {
+      unsubscribe();
+      unsubscribe = undefined;
+      return;
+    }
+    timer = setTimeout(() => finish("timeout"), timeoutMs);
+  });
+}
 
 export async function terminateSandboxChild(input: {
   readonly child: TerminableSandboxChild;
   readonly isExited: () => boolean;
   readonly markExited: () => void;
-  readonly waitForExit: () => Promise<void>;
+  readonly onExit: (listener: () => void) => () => void;
   readonly onReset?: () => void;
   readonly maxKillAttempts?: number;
   readonly retryDelayMs?: number;
+  readonly exitConfirmTimeoutMs?: number;
 }): Promise<TerminateSandboxChildOutcome> {
   input.onReset?.();
   input.child.stdin.destroy();
@@ -834,6 +876,10 @@ export async function terminateSandboxChild(input: {
     input.retryDelayMs !== undefined && Number.isFinite(input.retryDelayMs)
       ? Math.max(0, Math.trunc(input.retryDelayMs))
       : DEFAULT_KILL_RETRY_DELAY_MS;
+  const exitConfirmTimeoutMs =
+    input.exitConfirmTimeoutMs !== undefined && Number.isFinite(input.exitConfirmTimeoutMs)
+      ? Math.max(0, Math.trunc(input.exitConfirmTimeoutMs))
+      : DEFAULT_EXIT_CONFIRM_TIMEOUT_MS;
 
   let lastCause: unknown;
   for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
@@ -853,8 +899,15 @@ export async function terminateSandboxChild(input: {
       lastCause = err;
     }
     if (signaled) {
-      await input.waitForExit();
-      return { status: "exited" };
+      const waited = await waitForExitBounded(input.onExit, exitConfirmTimeoutMs);
+      if (waited === "exited" || hasExited()) {
+        input.markExited();
+        return { status: "exited" };
+      }
+      lastCause = new Error(
+        `Workflow sandbox child (pid ${pid}) did not confirm exit within ${exitConfirmTimeoutMs} ms after SIGKILL`,
+      );
+      continue;
     }
     if (hasExited()) {
       input.markExited();
@@ -862,17 +915,11 @@ export async function terminateSandboxChild(input: {
     }
     if (attempt < maxAttempts) {
       const delayMs = baseDelayMs * 2 ** (attempt - 1);
-      await new Promise<void>((resolve) => {
-        let done = false;
-        const finish = (): void => {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          resolve();
-        };
-        const timer = setTimeout(finish, delayMs);
-        void input.waitForExit().then(finish);
-      });
+      const waited = await waitForExitBounded(input.onExit, delayMs);
+      if (waited === "exited" || hasExited()) {
+        input.markExited();
+        return { status: "exited" };
+      }
     }
   }
   if (hasExited()) {
@@ -898,8 +945,12 @@ export function getUnconfirmedSandboxChildPids(): ReadonlyArray<number> {
   return [...unconfirmedSandboxChildren.keys()];
 }
 
-export async function reapUnconfirmedSandboxChildren(): Promise<void> {
-  const entries = [...unconfirmedSandboxChildren.values()];
+export async function reapUnconfirmedSandboxChildren(
+  skipPids?: ReadonlySet<number>,
+): Promise<void> {
+  const entries = [...unconfirmedSandboxChildren.values()].filter(
+    (entry) => skipPids === undefined || !skipPids.has(entry.pid),
+  );
   await Promise.allSettled(
     entries.map(async (entry) => {
       const outcome = await entry.retryTerminate();
@@ -1000,9 +1051,20 @@ export interface WorkflowHostMessageReceiverOptions {
   readonly maxInFlightScriptLoads?: number;
 }
 
+function resolveMaxStdoutBufferedBytes(value: number | undefined): number {
+  if (value === undefined) return MAX_WORKER_STDOUT_BUFFERED_BYTES;
+  if (!Number.isFinite(value) || Math.trunc(value) < MIN_WORKER_STDOUT_BUFFERED_BYTES) {
+    throw new WorkflowScriptError(
+      `Workflow sandbox stdout backlog cap must be at least ${MIN_WORKER_STDOUT_BUFFERED_BYTES} bytes.`,
+    );
+  }
+  return Math.trunc(value);
+}
+
 export function createWorkflowHostMessageReceiver(
   options: WorkflowHostMessageReceiverOptions,
 ): BoundedLineSplitter {
+  const maxStdoutBufferedBytes = resolveMaxStdoutBufferedBytes(options.maxStdoutBufferedBytes);
   const progressLimits = options.progressLimits ?? WORKFLOW_PROGRESS_LIMITS;
   const maxPhaseMessageBytes = progressLimits.maxPhaseTitleBytes * JSON_STRING_MAX_EXPANSION + 256;
   const maxInFlightScriptLoads =
@@ -1057,7 +1119,7 @@ export function createWorkflowHostMessageReceiver(
         maxValueBytes: WORKFLOW_MESSAGE_LIMITS.maxValueBytes,
         maxLogChars: WORKFLOW_MESSAGE_LIMITS.maxLogChars,
         progressLimits,
-        maxStdoutBufferedBytes: options.maxStdoutBufferedBytes ?? MAX_WORKER_STDOUT_BUFFERED_BYTES,
+        maxStdoutBufferedBytes,
       });
       const startMsg =
         options.argsJson === undefined ? base : `${base.slice(0, -1)},"args":${options.argsJson}}`;
@@ -1431,6 +1493,9 @@ export async function runWorkflowScript(input: {
   readonly maxInFlightScriptLoads?: number;
   readonly maxKillAttempts?: number;
   readonly killRetryDelayMs?: number;
+  readonly exitConfirmTimeoutMs?: number;
+  readonly onWorkerSpawned?: (worker: WorkflowSandboxWorker) => void;
+  readonly onWorkerDone?: () => void;
   readonly onCleanupFailure?: (failure: WorkflowSandboxCleanupFailure) => void;
   readonly spawnCommand?: WorkflowSandboxCommand;
   readonly spawnChild?: (
@@ -1457,6 +1522,7 @@ export async function runWorkflowScript(input: {
     throw new WorkflowScriptError("Workflow args exceed the 4 MiB limit.");
   }
 
+  const maxStdoutBufferedBytes = resolveMaxStdoutBufferedBytes(input.maxStdoutBufferedBytes);
   const limit = Number.isFinite(input.concurrency) ? Math.max(1, Math.trunc(input.concurrency)) : 1;
   const syncTimeoutMs =
     input.syncTimeoutMs !== undefined && Number.isFinite(input.syncTimeoutMs)
@@ -1479,7 +1545,7 @@ export async function runWorkflowScript(input: {
   child.stderr.resume();
 
   const runDeferred = Promise.withResolvers<unknown>();
-  const exitDeferred = Promise.withResolvers<void>();
+  const exitListeners = new Set<() => void>();
   let spawned = child.pid !== undefined;
   let exited = false;
   let settled = false;
@@ -1491,13 +1557,36 @@ export async function runWorkflowScript(input: {
     { readonly status: "exited" | "not_started" }
   > | null = null;
 
+  let workerDoneNotified = false;
+  const notifyWorkerDone = (): void => {
+    if (workerDoneNotified) return;
+    workerDoneNotified = true;
+    input.onWorkerDone?.();
+  };
+
+  const onExit = (listener: () => void): (() => void) => {
+    if (exited || child.exitCode !== null || child.signalCode !== null) {
+      listener();
+      return () => {};
+    }
+    exitListeners.add(listener);
+    return () => {
+      exitListeners.delete(listener);
+    };
+  };
+
   const markExited = (): void => {
     if (exited) return;
     exited = true;
     if (child.pid !== undefined) {
       unconfirmedSandboxChildren.delete(child.pid);
     }
-    exitDeferred.resolve();
+    const listeners = [...exitListeners];
+    exitListeners.clear();
+    for (const listener of listeners) {
+      listener();
+    }
+    notifyWorkerDone();
   };
 
   const clearDeadline = (): void => {
@@ -1602,9 +1691,7 @@ export async function runWorkflowScript(input: {
     onSucceed: succeedRun,
     onFail: failRun,
     isSettled: () => settled,
-    ...(input.maxStdoutBufferedBytes === undefined
-      ? {}
-      : { maxStdoutBufferedBytes: input.maxStdoutBufferedBytes }),
+    maxStdoutBufferedBytes,
     ...(input.maxInFlightScriptLoads === undefined
       ? {}
       : { maxInFlightScriptLoads: input.maxInFlightScriptLoads }),
@@ -1621,10 +1708,13 @@ export async function runWorkflowScript(input: {
       child,
       isExited: () => exited,
       markExited,
-      waitForExit: () => exitDeferred.promise,
+      onExit,
       onReset: () => receiver.reset(),
       ...(input.maxKillAttempts === undefined ? {} : { maxKillAttempts: input.maxKillAttempts }),
       ...(input.killRetryDelayMs === undefined ? {} : { retryDelayMs: input.killRetryDelayMs }),
+      ...(input.exitConfirmTimeoutMs === undefined
+        ? {}
+        : { exitConfirmTimeoutMs: input.exitConfirmTimeoutMs }),
     }).then((outcome) => {
       inFlightTermination = null;
       if (outcome.status === "exited" || outcome.status === "not_started") {
@@ -1632,12 +1722,30 @@ export async function runWorkflowScript(input: {
         if (child.pid !== undefined) {
           unconfirmedSandboxChildren.delete(child.pid);
         }
+        notifyWorkerDone();
+      } else if (!exited) {
+        unconfirmedSandboxChildren.set(outcome.pid, {
+          pid: outcome.pid,
+          retryTerminate: terminateChild,
+        });
       }
       return outcome;
     });
     inFlightTermination = attempt;
     return attempt;
   };
+
+  const workerHandle: WorkflowSandboxWorker = {
+    get pid() {
+      return child.pid;
+    },
+    isExited: () => exited || child.exitCode !== null || child.signalCode !== null,
+    isConfirmedDone: () =>
+      exited || child.exitCode !== null || child.signalCode !== null || finalTermination !== null,
+    onExit,
+    terminate: terminateChild,
+  };
+  input.onWorkerSpawned?.(workerHandle);
 
   const onStreamError =
     (streamName: "stdin" | "stdout") =>
