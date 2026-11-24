@@ -6,6 +6,7 @@ import type {
   OrchestrationV2Subagent,
   OrchestrationV2SubagentWorkflow,
   OrchestrationV2TurnItem,
+  ProviderInstanceId,
 } from "@t3tools/contracts";
 import { isOrchestrationV2WorkActive, isProviderNativeSubagentThread } from "@t3tools/contracts";
 import { mFallback, msg } from "gt-i18n";
@@ -54,6 +55,8 @@ export interface RuntimeSubagent {
   readonly title: string;
   readonly role: string | null;
   readonly model: string | null;
+  /** The instance a workflow member's own thread runs on; unknown for other kinds. */
+  readonly providerInstanceId?: ProviderInstanceId | undefined;
   readonly effort: string | null;
   readonly speed?: string | undefined;
   readonly status: RuntimeSubagentStatus;
@@ -159,6 +162,51 @@ export function excludeWorkflowMemberSubagents<T extends WorkflowMemberCandidate
   return subagents.filter((subagent) => !isWorkflowMemberSubagent(subagent, workflowIds));
 }
 
+/**
+ * Drops the parent timeline's turn items of workflow members: they belong to the workflow card,
+ * not to whichever tool call the parent was on when they appeared. Memoized on its inputs.
+ */
+export function createWorkflowMemberRowFilter<
+  Row extends { readonly item: { readonly type: string; readonly subagentId?: string } },
+>() {
+  let previousRows: ReadonlyArray<Row> | undefined;
+  let previousSubagents: ReadonlyArray<WorkflowMemberFilterSubagent> | undefined;
+  let previousResult: ReadonlyArray<Row> = [];
+  return (
+    rows: ReadonlyArray<Row>,
+    subagents: ReadonlyArray<WorkflowMemberFilterSubagent>,
+  ): ReadonlyArray<Row> => {
+    if (rows === previousRows && subagents === previousSubagents) return previousResult;
+    const workflowIds = new Set<string>();
+    for (const subagent of subagents) {
+      if (subagent.workflow !== undefined) workflowIds.add(subagent.id);
+    }
+    const memberIds = new Set<string>();
+    for (const subagent of subagents) {
+      if (subagent.completionWake === "never" || isWorkflowMemberSubagent(subagent, workflowIds)) {
+        memberIds.add(subagent.id);
+      }
+    }
+    const kept =
+      memberIds.size === 0
+        ? rows
+        : rows.filter(
+            (row) =>
+              row.item.type !== "subagent" ||
+              row.item.subagentId === undefined ||
+              !memberIds.has(row.item.subagentId),
+          );
+    previousRows = rows;
+    previousSubagents = subagents;
+    previousResult = kept.length === rows.length ? rows : kept;
+    return previousResult;
+  };
+}
+
+type WorkflowMemberFilterSubagent = WorkflowMemberCandidate & {
+  readonly completionWake?: OrchestrationV2Subagent["completionWake"] | undefined;
+};
+
 export function waitingOnSubagentsLabel(count: number, resolve: MFunctionType = mFallback): string {
   return resolve(
     msg("{count, plural, =1 {Waiting on a subagent} other {Waiting on {count} subagents}}", {
@@ -224,6 +272,7 @@ function workflowMembersToRuntime(
       kind: "workflow_agent" as const,
       title: agent.label,
       model: agent.model ?? null,
+      providerInstanceId: agent.providerInstanceId,
       effort: agent.effort ?? null,
       ...(agent.speed === undefined ? {} : { speed: agent.speed }),
       status,

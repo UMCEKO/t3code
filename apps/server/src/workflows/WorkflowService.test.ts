@@ -831,6 +831,39 @@ describe("WorkflowService and workflow MCP tools", () => {
   );
 
   it.effect(
+    "records why an agent on an unavailable provider failed, in status and the journal",
+    () =>
+      Effect.gen(function* () {
+        const harness = yield* makeWorkflowHarness({ name: "agent-failure-reason" });
+        yield* Effect.gen(function* () {
+          const orchestrator = yield* Orchestrator.OrchestratorV2;
+          const fs = yield* FileSystem.FileSystem;
+          yield* startParentThreadAndRun(harness.turnQueue, harness.cwd, "agent-failure-reason");
+          const beforeSeq = yield* orchestrator.getThreadEventSequence(parentThreadId);
+
+          const script = `
+            export const meta = { name: "Unavailable", description: "One agent on a missing provider." };
+            const a = await agent("Go", { label: "probe", target: { providerInstanceId: "missing-provider" } });
+            return { a };
+          `;
+          const runCall = yield* callTool("t3_workflow_run", { script });
+          const started = yield* decodeRunResult(runCall.structuredContent);
+          const terminal = yield* awaitWorkflowTerminal(started.taskId, beforeSeq);
+          expect(terminal.status).toBe("completed");
+
+          const statusCall = yield* callTool("t3_workflow_status", { runId: started.runId });
+          const status = yield* decodeStatusResult(statusCall.structuredContent);
+          expect(status.agents.failed).toBe(1);
+          expect(status.failures).toEqual([
+            { index: 0, label: "probe", error: expect.stringContaining("missing-provider") },
+          ]);
+          const journal = yield* fs.readFileString(status.journalPath);
+          expect(journal).toContain('"error":"Provider instance missing-provider');
+        }).pipe(Effect.provide(harness.layerToolkit));
+      }),
+  );
+
+  it.effect(
     "allows agents spawned after the parent turn completes to run under the workflow node",
     () =>
       Effect.gen(function* () {

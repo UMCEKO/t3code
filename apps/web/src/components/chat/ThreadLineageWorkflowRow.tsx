@@ -62,25 +62,32 @@ function phaseStatusLabel(phase: SubagentWorkflowGroup["phases"][number]) {
 
 function WorkflowMemberRow({
   member,
-  providerInstanceId,
-  provider,
+  workflowProviderInstanceId,
+  workflowProvider,
   providers,
   providerEntries,
-  driver,
+  workflowDriver,
   onOpen,
 }: {
   member: RuntimeSubagent;
-  providerInstanceId: ProviderInstanceId;
-  provider: ServerProvider | undefined;
+  workflowProviderInstanceId: ProviderInstanceId;
+  workflowProvider: ServerProvider | undefined;
   providers: ReadonlyArray<ServerProvider> | undefined;
   providerEntries: ReadonlyArray<ProviderInstanceEntry>;
-  driver: ProviderDriverKind | undefined;
+  workflowDriver: ProviderDriverKind | undefined;
   onOpen: (threadId: string, intent: SideThreadOpenIntent) => void;
 }) {
   const gt = useGT();
   const trigger = useSideThreadTrigger();
   const threadId = member.childThreadId;
   const canOpen = threadId !== null;
+  // A server workflow's member runs on its own provider; a provider-native one shares the workflow's.
+  const providerInstanceId = member.providerInstanceId ?? workflowProviderInstanceId;
+  const provider =
+    providerInstanceId === workflowProviderInstanceId
+      ? workflowProvider
+      : providers?.find((entry) => entry.instanceId === providerInstanceId);
+  const driver = provider?.driver ?? (provider === workflowProvider ? workflowDriver : undefined);
   return (
     <li>
       <Tooltip>
@@ -130,6 +137,11 @@ function WorkflowMemberRow({
   );
 }
 
+export interface WorkflowDisclosure {
+  readonly expanded: boolean;
+  readonly toggle: () => void;
+}
+
 export function ThreadLineageWorkflowRow({
   group,
   header,
@@ -144,7 +156,8 @@ export function ThreadLineageWorkflowRow({
   stopDisabled,
 }: {
   readonly group: SubagentWorkflowGroup;
-  readonly header: ReactNode;
+  /** A function gets the card's disclosure, for a header that opens the workflow's view. */
+  readonly header: ReactNode | ((disclosure: WorkflowDisclosure) => ReactNode);
   readonly providerInstanceId: ProviderInstanceId;
   readonly provider: ServerProvider | undefined;
   readonly providers: ReadonlyArray<ServerProvider> | undefined;
@@ -164,7 +177,9 @@ export function ThreadLineageWorkflowRow({
   return (
     <li className="group" data-workflow-expanded={expanded ? "" : undefined}>
       <div className={cn("relative", THREAD_DETAILS_PANEL_SPLIT_GROUP_CLASS)}>
-        {header}
+        {typeof header === "function"
+          ? header({ expanded, toggle: () => setExpanded((value) => !value) })
+          : header}
         {onStop ? (
           <div className="pointer-events-none absolute right-9 top-1/2 -translate-y-1/2 opacity-0 group-hover:pointer-events-auto group-hover:opacity-100 group-focus-within:pointer-events-auto group-focus-within:opacity-100 pointer-coarse:pointer-events-auto pointer-coarse:opacity-100 [@media(hover:none)]:pointer-events-auto [@media(hover:none)]:opacity-100">
             <Tooltip>
@@ -263,11 +278,11 @@ export function ThreadLineageWorkflowRow({
                       <WorkflowMemberRow
                         key={member.id}
                         member={member}
-                        providerInstanceId={providerInstanceId}
-                        provider={provider}
+                        workflowProviderInstanceId={providerInstanceId}
+                        workflowProvider={provider}
                         providers={providers}
                         providerEntries={providerEntries}
-                        driver={driver}
+                        workflowDriver={driver}
                         onOpen={onOpenThread}
                       />
                     ))}
@@ -280,11 +295,11 @@ export function ThreadLineageWorkflowRow({
             <WorkflowMemberRow
               key={member.id}
               member={member}
-              providerInstanceId={providerInstanceId}
-              provider={provider}
+              workflowProviderInstanceId={providerInstanceId}
+              workflowProvider={provider}
               providers={providers}
               providerEntries={providerEntries}
-              driver={driver}
+              workflowDriver={driver}
               onOpen={onOpenThread}
             />
           ))}

@@ -954,6 +954,8 @@ export const OrchestrationV2WorkflowAgent = Schema.Struct({
   label: TrimmedNonEmptyString,
   agentId: Schema.optional(TrimmedNonEmptyString),
   childThreadId: Schema.optional(ThreadId),
+  /** The provider instance the agent's own thread runs on, which may differ from the workflow's. */
+  providerInstanceId: Schema.optional(ProviderInstanceId),
   state: Schema.Literals(["queued", "running", "completed", "failed"]),
   phaseIndex: Schema.optional(NonNegativeInt),
   phaseTitle: Schema.optional(TrimmedNonEmptyString),
